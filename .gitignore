@@ -1,0 +1,29 @@
+# 虚拟环境
+.venv/
+venv/
+env/
+
+# Python 缓存
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# 测试与打包
+.pytest_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# 计算输出产物
+计算报告_*
+计算明细_*
+验证输出/
+
+# 编辑器与系统文件
+.DS_Store
+.idea/
+.vscode/
+*.swp

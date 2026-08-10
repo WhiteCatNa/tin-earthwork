@@ -1,0 +1,370 @@
+<title>TIN 土方自动算量系统 · 运行流程</title>
+<style>
+  :root {
+    /* 取自程序自身的挖填配色，降饱和后用于纸面阅读 */
+    --sheet:   #EEF1F2;   /* 图纸底色，两种主题下恒定 */
+    --sheet-ink:#172029;
+    --sheet-line:#C4CDD2;
+
+    --bg:      #F4F6F7;
+    --surface: #FFFFFF;
+    --ink:     #172029;
+    --ink-dim: #5C6B78;
+    --rule:    #D6DDE1;
+
+    --cut:     #C6453C;   /* 挖方 */
+    --fill:    #1F8C82;   /* 填方 */
+    --zero:    #A8770D;   /* 零填挖线 */
+    --edge:    #2C3E50;   /* 计算边界 */
+
+    --display: "Songti SC", "STSong", "Source Han Serif SC", "Noto Serif CJK SC", Georgia, serif;
+    --body: "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", -apple-system, "Segoe UI", sans-serif;
+    --mono: ui-monospace, "SF Mono", Menlo, "JetBrains Mono", Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg:      #101720;
+      --surface: #18212B;
+      --ink:     #E3EAEF;
+      --ink-dim: #93A3B0;
+      --rule:    #2A3742;
+      --cut:     #EE8378;
+      --fill:    #4ECDC4;
+      --zero:    #E2BB50;
+      --edge:    #8FA8BE;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg:      #101720;
+    --surface: #18212B;
+    --ink:     #E3EAEF;
+    --ink-dim: #93A3B0;
+    --rule:    #2A3742;
+    --cut:     #EE8378;
+    --fill:    #4ECDC4;
+    --zero:    #E2BB50;
+    --edge:    #8FA8BE;
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font-family: var(--body);
+    font-size: 16px;
+    line-height: 1.7;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap {
+    max-width: 60rem;
+    margin: 0 auto;
+    padding: 3.5rem 1.5rem 5rem;
+    display: flex;
+    flex-direction: column;
+    gap: 3rem;
+  }
+
+  /* ---- 页眉：下方一道图纸刻度线 ---- */
+  header { display: flex; flex-direction: column; gap: .75rem; }
+  .eyebrow {
+    font-family: var(--mono);
+    font-size: .75rem;
+    letter-spacing: .14em;
+    text-transform: uppercase;
+    color: var(--ink-dim);
+  }
+  h1 {
+    font-family: var(--display);
+    font-weight: 600;
+    font-size: clamp(1.9rem, 4.5vw, 2.9rem);
+    line-height: 1.25;
+    letter-spacing: .01em;
+    margin: 0;
+    text-wrap: balance;
+  }
+  .lede { margin: 0; max-width: 44ch; color: var(--ink-dim); }
+  .graticule {
+    height: 10px;
+    margin-top: .5rem;
+    background-image:
+      linear-gradient(to right, var(--rule) 0 1px, transparent 1px 100%),
+      linear-gradient(to bottom, var(--rule) 0 1px, transparent 1px 100%);
+    background-size: 12px 10px, 100% 1px;
+    background-position: bottom left, bottom left;
+    background-repeat: repeat-x, no-repeat;
+  }
+
+  h2 {
+    font-family: var(--display);
+    font-weight: 600;
+    font-size: 1.4rem;
+    letter-spacing: .01em;
+    margin: 0 0 .35rem;
+  }
+  h2 .n {
+    font-family: var(--mono);
+    font-size: .8rem;
+    font-weight: 400;
+    color: var(--ink-dim);
+    margin-right: .6rem;
+    letter-spacing: .08em;
+  }
+  section { display: flex; flex-direction: column; gap: 1.1rem; }
+  section > p { margin: 0; max-width: 66ch; }
+  .cap { font-size: .875rem; color: var(--ink-dim); max-width: 66ch; margin: 0; }
+
+  /* ---- 图纸插页：两种主题下都保持纸面色，保证 mermaid 恒定可读 ---- */
+  .sheet {
+    background: var(--sheet);
+    border: 1px solid var(--sheet-line);
+    border-radius: 2px;
+    padding: 1.75rem 1rem;
+    overflow-x: auto;
+  }
+  .sheet pre.mermaid {
+    margin: 0;
+    display: flex;
+    justify-content: center;
+    min-width: min-content;
+  }
+  .sheet-tag {
+    display: block;
+    font-family: var(--mono);
+    font-size: .7rem;
+    letter-spacing: .12em;
+    text-transform: uppercase;
+    color: #6B7A85;
+    padding: 0 .5rem .9rem;
+  }
+
+  /* ---- 命令块：左侧色条标明所属通道 ---- */
+  .cmds { display: flex; flex-direction: column; gap: .9rem; }
+  .cmd {
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    border-left: 3px solid var(--lane, var(--edge));
+    border-radius: 2px;
+    padding: .9rem 1.1rem;
+    display: flex;
+    flex-direction: column;
+    gap: .45rem;
+  }
+  .cmd .label {
+    font-size: .8rem;
+    font-weight: 600;
+    letter-spacing: .02em;
+    color: var(--lane, var(--ink));
+  }
+  .cmd code {
+    font-family: var(--mono);
+    font-size: .82rem;
+    line-height: 1.6;
+    white-space: pre;
+    overflow-x: auto;
+    display: block;
+    color: var(--ink);
+  }
+  .cmd .out {
+    font-family: var(--mono);
+    font-size: .76rem;
+    color: var(--ink-dim);
+  }
+  .lane-test { --lane: var(--fill); }
+  .lane-e2e  { --lane: var(--zero); }
+  .lane-gui  { --lane: var(--cut); }
+  .lane-run  { --lane: var(--edge); }
+
+  /* ---- 表格 ---- */
+  .scroll { overflow-x: auto; }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: .875rem;
+    min-width: 30rem;
+  }
+  th, td {
+    text-align: left;
+    padding: .6rem .75rem;
+    border-bottom: 1px solid var(--rule);
+    vertical-align: top;
+  }
+  th {
+    font-family: var(--mono);
+    font-size: .72rem;
+    letter-spacing: .1em;
+    text-transform: uppercase;
+    color: var(--ink-dim);
+    font-weight: 500;
+  }
+  td.num {
+    font-family: var(--mono);
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+  }
+  td code, p code, li code {
+    font-family: var(--mono);
+    font-size: .82em;
+    background: color-mix(in srgb, var(--ink) 7%, transparent);
+    padding: .1em .35em;
+    border-radius: 2px;
+  }
+  .gain { color: var(--fill); font-weight: 600; }
+
+  .note {
+    background: color-mix(in srgb, var(--zero) 9%, var(--surface));
+    border: 1px solid color-mix(in srgb, var(--zero) 34%, transparent);
+    border-radius: 2px;
+    padding: .9rem 1.1rem;
+    font-size: .9rem;
+  }
+  .note strong { color: var(--zero); }
+  ul { margin: 0; padding-left: 1.2rem; }
+  li { margin-bottom: .3rem; }
+  footer {
+    border-top: 1px solid var(--rule);
+    padding-top: 1.25rem;
+    font-family: var(--mono);
+    font-size: .75rem;
+    color: var(--ink-dim);
+    letter-spacing: .04em;
+  }
+</style>
+
+<div class="wrap">
+
+  <header>
+    <span class="eyebrow">tin_earthwork · 系统说明</span>
+    <h1>TIN 土方自动算量系统<br>运行流程</h1>
+    <p class="lede">从环境准备到三条验证通道，再到应用内的三步作业向导。</p>
+    <div class="graticule"></div>
+  </header>
+
+  <section>
+    <h2><span class="n">一</span>验证与启动</h2>
+    <p>先跑验证再开界面：单元测试确认逻辑，端到端确认全链路，点击压测确认交互不崩、不卡。三条都过了再启动 GUI。</p>
+    <div class="sheet">
+      <span class="sheet-tag">图 1 · 命令路径</span>
+      <pre class="mermaid">
+%%{init: {"theme":"base","themeVariables":{"fontFamily":"PingFang SC, Hiragino Sans GB, sans-serif","fontSize":"13px","primaryColor":"#E2E7EA","primaryTextColor":"#172029","primaryBorderColor":"#8C9BA5","lineColor":"#6E7D88","tertiaryColor":"#E2E7EA","clusterBkg":"#E6EAEC","clusterBorder":"#B4BFC6"}}}%%
+flowchart TB
+  S["进入项目目录<br/>tin_earthwork"] --> E{"依赖已安装？"}
+  E -->|否| I["pip install -r requirements.txt<br/>pip install -r requirements-dev.txt"]
+  E -->|是| V["选择验证通道"]
+  I --> V
+
+  subgraph 验证 [" "]
+    direction LR
+    T1["① 单元测试<br/>pytest tests/ -v"]
+    T2["② 端到端全流程<br/>run_full_test.py"]
+    T3["③ GUI 点击压测<br/>tests/gui_stress_test.py"]
+  end
+
+  V --> T1
+  V --> T2
+  V --> T3
+
+  T1 --> Q{"全部通过？"}
+  T2 --> Q
+  T3 --> Q
+  Q -->|有报错| F["按 traceback 定位<br/>修复后重跑"]
+  F --> V
+  Q -->|通过| R["启动应用<br/>python main.py"]
+
+  style S fill:#DCE3E7,stroke:#7C8B96
+  style R fill:#CFE6E3,stroke:#1F8C82,color:#123F3A
+  style F fill:#F2D9D6,stroke:#C6453C,color:#5E1F1A
+  style T1 fill:#D8E9E7,stroke:#1F8C82
+  style T2 fill:#EFE4C8,stroke:#A8770D
+  style T3 fill:#F2DCD9,stroke:#C6453C
+      </pre>
+    </div>
+
+    <div class="cmds">
+      <div class="cmd lane-run">
+        <span class="label">0 · 进入目录并激活环境</span>
+        <code>cd tin_earthwork
+source .venv/bin/activate</code>
+        <span class="out">Python 3.13 · 依赖见 requirements.txt</span>
+      </div>
+      <div class="cmd lane-test">
+        <span class="label">① 单元测试</span>
+        <code>python -m pytest tests/ -v</code>
+        <span class="out">覆盖 calculator / data_handler / plotter / boundary / calculation_frame</span>
+      </div>
+      <div class="cmd lane-e2e">
+        <span class="label">② 端到端全流程（无需界面）</span>
+        <code>python run_full_test.py --output-dir ./验证输出</code>
+        <span class="out">导入 → 建网 → 计算 → Excel / CSV / TXT 三份报告落盘</span>
+      </div>
+      <div class="cmd lane-gui">
+        <span class="label">③ GUI 自动点击压测</span>
+        <code>python tests/gui_stress_test.py</code>
+        <span class="out">模拟鼠标点击遍历全流程，逐步计时并捕获异常</span>
+      </div>
+      <div class="cmd lane-run">
+        <span class="label">④ 启动应用</span>
+        <code>python main.py</code>
+        <span class="out">1400×900 主窗口 · 三步作业向导</span>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2><span class="n">二</span>应用内三步向导</h2>
+    <p>界面按工作流锁定顺序：后一页在前一页确认前是禁用的。计算跑在后台线程，主线程用队列轮询取结果，所以计算过程中界面不会假死。</p>
+    <div class="sheet">
+      <span class="sheet-tag">图 2 · 数据流与页面状态</span>
+      <pre class="mermaid">
+%%{init: {"theme":"base","themeVariables":{"fontFamily":"PingFang SC, Hiragino Sans GB, sans-serif","fontSize":"13px","primaryColor":"#E2E7EA","primaryTextColor":"#172029","primaryBorderColor":"#8C9BA5","lineColor":"#6E7D88","clusterBkg":"#E6EAEC","clusterBorder":"#B4BFC6"}}}%%
+flowchart TB
+  subgraph P1 ["① 数据导入与检查"]
+    direction TB
+    A1["浏览并选择<br/>xlsx / csv / txt"] --> A2["自动识别列映射<br/>点号 · X · Y · 高程"]
+    A2 --> A3["质量检查<br/>缺失 · 重复 · 3σ 离群"]
+    A3 --> A4{"数据无误？"}
+    A4 -->|需改映射| A2
+  end
+
+  A4 -->|确认| B1
+
+  subgraph P2 ["② 计算边界设置"]
+    direction TB
+    B1["三种取边界方式"]
+    B1 --> B2["自动生成数据范围"]
+    B1 --> B3["画布左键逐点点选<br/>自动吸附最近测点"]
+    B1 --> B4["导入 CSV / TXT"]
+    B2 --> B5{"≥3 点<br/>不重复 · 不自交？"}
+    B3 --> B5
+    B4 --> B5
+    B5 -->|无效| B6["撤销上一点 / 右键回退"]
+    B6 --> B1
+  end
+
+  B5 -->|确认边界| C1
+
+  subgraph P3 ["③ 计算设置与结果"]
+    direction TB
+    C1["设计高程<br/>统一值 或 分区值"] --> C2["开始计算<br/>后台线程 + 队列轮询"]
+    C2 --> C3["Delaunay 建 TIN<br/>混合三角形按零填挖线分割"]
+    C3 --> C4["结果四页<br/>图 · 汇总 · 明细 · 三角形详情"]
+    C4 --> C5["导出<br/>Excel · CSV · PNG · TXT"]
+  end
+
+  C4 -.->|"回到 ② 改边界<br/>旧结果作废，须重算"| B1
+
+  style A1 fill:#DCE3E7,stroke:#7C8B96
+  style C5 fill:#CFE6E3,stroke:#1F8C82,color:#123F3A
+  style C2 fill:#EFE4C8,stroke:#A8770D
+  style B5 fill:#E2E7EA,stroke:#2C3E50
+      </pre>
+    </div>
+    <div class="note">
+      <strong>注意</strong> ：确认边界会重置计算页。边界改变后，既有挖填结果不再对应当前计算范围，系统会清空结果并要求重新执行「开始计算」，以保证导出的成果与边界一致。
+    </div>
+  </section>
+
+
+  <footer>技术栈 Python 3.13 · numpy · scipy · pandas · matplotlib · tkinter　|　适用于 macOS / Windows / Linux</footer>
+
+</div>
