@@ -2,7 +2,7 @@
 核心计算模块：TIN 三角网构建、挖填方计算、混合三角形分割
 """
 import numpy as np
-from scipy.spatial import Delaunay
+from scipy.spatial import Delaunay, QhullError
 from dataclasses import dataclass
 from typing import List, Tuple, Optional, Dict, Any
 import math
@@ -17,6 +17,7 @@ class SurveyPoint:
     z: float  # 实测高程
     design_z: float = 0.0  # 设计高程
     delta_z: float = 0.0   # 高差 (实测 - 设计)
+    has_design_z: bool = False  # 是否从文件带来逐点设计高程
 
 
 @dataclass
@@ -84,9 +85,19 @@ class TINEarthworkCalculator:
             pt.delta_z = pt.z - pt.design_z
     
     def add_points(self, points: List[SurveyPoint]):
-        """添加测量点，并初始化统一设计高程下的高差。"""
+        """添加测量点。
+
+        若测点已带逐点设计高程，则保留并刷新高差；否则套用统一设计高程。
+        """
         self.points = points
-        self.set_design_elevation(self.design_elevation)
+        if any(pt.has_design_z for pt in points):
+            for pt in self.points:
+                pt.delta_z = pt.z - pt.design_z
+            unique = {round(pt.design_z, 6) for pt in points if pt.has_design_z}
+            if len(unique) == 1:
+                self.design_elevation = next(iter(unique))
+        else:
+            self.set_design_elevation(self.design_elevation)
         
     def set_boundary(self, boundary: List[Tuple[float, float]]):
         """设置计算边界"""
@@ -117,7 +128,12 @@ class TINEarthworkCalculator:
             raise ValueError("至少需要 3 个测量点才能构建三角网")
             
         coords = np.array([[p.x, p.y] for p in self.points])
-        self.delaunay = Delaunay(coords)
+        try:
+            self.delaunay = Delaunay(coords)
+        except QhullError as exc:
+            raise ValueError(
+                "无法构建三角网：测量点共线、重复或分布不足以构成三角形，请检查坐标"
+            ) from exc
         
         self.triangles = []
         for i, simplex in enumerate(self.delaunay.simplices):
@@ -266,13 +282,99 @@ class TINEarthworkCalculator:
         return result
     
     def run_full_calculation(self, design_elevation: float = None) -> CalculationResult:
-        """运行完整计算流程"""
+        """运行完整计算流程。
+
+        仅在显式传入 design_elevation 时覆盖点上的设计高程，
+        避免把 set_design_elevations() 的分区高程冲掉。
+        """
         if design_elevation is not None:
             self.set_design_elevation(design_elevation)
-        elif self.design_elevation != 0.0:
-            self.set_design_elevation(self.design_elevation)
         self.build_tin()
         return self.calculate_volumes()
+
+
+def extract_zero_contour_segments(
+    result: CalculationResult,
+) -> List[Tuple[Tuple[float, float], Tuple[float, float]]]:
+    """从混合三角形共享边提取零填挖线段（去重）。"""
+    segments: List[Tuple[Tuple[float, float], Tuple[float, float]]] = []
+    seen = set()
+    for tri in result.triangles:
+        if tri.is_boundary or not tri.is_mixed or not tri.sub_triangles:
+            continue
+        for i, sub1 in enumerate(tri.sub_triangles):
+            if not sub1.vertex_points:
+                continue
+            pts1 = [(p.x, p.y) for p in sub1.vertex_points]
+            for sub2 in tri.sub_triangles[i + 1:]:
+                if not sub2.vertex_points:
+                    continue
+                pts2 = [(p.x, p.y) for p in sub2.vertex_points]
+                shared = set(pts1) & set(pts2)
+                if len(shared) != 2:
+                    continue
+                a, b = list(shared)
+                key = tuple(sorted(((round(a[0], 8), round(a[1], 8)), (round(b[0], 8), round(b[1], 8)))))
+                if key in seen:
+                    continue
+                seen.add(key)
+                segments.append((a, b))
+    return segments
+
+
+def chain_segments(
+    segments: List[Tuple[Tuple[float, float], Tuple[float, float]]],
+) -> List[List[Tuple[float, float]]]:
+    """把端点相接的线段连成多段线。"""
+    if not segments:
+        return []
+
+    def rk(point: Tuple[float, float]) -> Tuple[float, float]:
+        return (round(float(point[0]), 8), round(float(point[1]), 8))
+
+    raw = []
+    adj: Dict[Tuple[float, float], List[Tuple[float, float]]] = {}
+    for start, end in segments:
+        a, b = rk(start), rk(end)
+        if a == b:
+            continue
+        raw.append((a, b))
+        adj.setdefault(a, []).append(b)
+        adj.setdefault(b, []).append(a)
+
+    visited = set()
+
+    def walk(origin: Tuple[float, float], first: Tuple[float, float]) -> List[Tuple[float, float]]:
+        path = [origin, first]
+        visited.add(tuple(sorted((origin, first))))
+        while True:
+            current = path[-1]
+            prev = path[-2]
+            nxt = None
+            for cand in adj.get(current, []):
+                edge = tuple(sorted((current, cand)))
+                if edge in visited:
+                    continue
+                if cand == prev:
+                    continue
+                nxt = cand
+                break
+            if nxt is None:
+                break
+            visited.add(tuple(sorted((current, nxt))))
+            path.append(nxt)
+        return path
+
+    polylines: List[List[Tuple[float, float]]] = []
+    endpoints = [node for node, nbrs in adj.items() if len(nbrs) == 1]
+    ordered_starts = endpoints + [node for node in adj if node not in endpoints]
+    for node in ordered_starts:
+        for nbr in adj.get(node, []):
+            edge = tuple(sorted((node, nbr)))
+            if edge in visited:
+                continue
+            polylines.append(walk(node, nbr))
+    return polylines
 
 
 def create_sample_data() -> List[SurveyPoint]:

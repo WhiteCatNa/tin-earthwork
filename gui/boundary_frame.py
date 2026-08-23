@@ -27,8 +27,8 @@ class BoundaryFrame(ttk.Frame):
         
     def _create_widgets(self):
         # 左侧：绘图区
-        plot_frame = ttk.LabelFrame(self, text="边界编辑 (左键添加点，右键结束/删除最后一点)", padding=5)
-        plot_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=5, pady=5)
+        plot_frame = ttk.LabelFrame(self, text="边界编辑 (左键添加点，右键结束/删除最后一点)", padding=8)
+        plot_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(10, 6), pady=10)
         
         self.plotter = EarthworkPlotter(figsize=(8, 6))
         self.canvas = FigureCanvasTkAgg(self.plotter.fig, master=plot_frame)
@@ -42,21 +42,21 @@ class BoundaryFrame(ttk.Frame):
         ]
         
         # 右侧：控制面板
-        ctrl_frame = ttk.LabelFrame(self, text="边界控制", padding=10)
-        ctrl_frame.pack(side=tk.RIGHT, fill=tk.Y, padx=5, pady=5)
+        ctrl_frame = ttk.LabelFrame(self, text="边界控制", padding=12)
+        ctrl_frame.pack(side=tk.RIGHT, fill=tk.Y, padx=(6, 10), pady=10)
         
         # 模式选择
         mode_frame = ttk.Frame(ctrl_frame)
-        mode_frame.pack(fill=tk.X, pady=5)
+        mode_frame.pack(fill=tk.X, pady=(0, 4))
         self.edit_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(mode_frame, text="编辑模式（左键添加）", variable=self.edit_var,
                        command=self._toggle_edit_mode).pack(anchor=tk.W)
         
         # 边界点列表
-        ttk.Label(ctrl_frame, text="边界点坐标:").pack(anchor=tk.W, pady=(10, 0))
+        ttk.Label(ctrl_frame, text="边界点坐标:", style="Title.TLabel").pack(anchor=tk.W, pady=(10, 0))
         
         list_frame = ttk.Frame(ctrl_frame)
-        list_frame.pack(fill=tk.BOTH, expand=True, pady=5)
+        list_frame.pack(fill=tk.BOTH, expand=True, pady=8)
         
         self.tree_boundary = ttk.Treeview(list_frame, columns=('idx', 'x', 'y'), show='headings', height=15)
         self.tree_boundary.heading('idx', text='序号')
@@ -73,20 +73,20 @@ class BoundaryFrame(ttk.Frame):
         
         # 编辑按钮
         btn_frame = ttk.Frame(ctrl_frame)
-        btn_frame.pack(fill=tk.X, pady=5)
+        btn_frame.pack(fill=tk.X, pady=4)
         ttk.Button(btn_frame, text="自动生成数据范围边界", command=self._create_auto_boundary).pack(fill=tk.X, pady=2)
         ttk.Button(btn_frame, text="导入边界文件", command=self._import_boundary).pack(fill=tk.X, pady=2)
         ttk.Button(btn_frame, text="撤销上一点", command=self._undo_last_point).pack(fill=tk.X, pady=2)
         ttk.Button(btn_frame, text="清空边界", command=self._clear_boundary).pack(fill=tk.X, pady=2)
         ttk.Button(btn_frame, text="删除选中点", command=self._delete_selected).pack(fill=tk.X, pady=2)
-        ttk.Separator(btn_frame, orient='horizontal').pack(fill=tk.X, pady=5)
+        ttk.Separator(btn_frame, orient='horizontal').pack(fill=tk.X, pady=8)
         ttk.Button(btn_frame, text="确认边界", command=self._confirm_boundary, 
                   style='Accent.TButton').pack(fill=tk.X, pady=2)
         
         self.coord_var = tk.StringVar(value="X: --  Y: --")
-        ttk.Label(ctrl_frame, textvariable=self.coord_var, font=('', 10)).pack(anchor=tk.W, pady=(10, 2))
+        ttk.Label(ctrl_frame, textvariable=self.coord_var, style="Muted.TLabel").pack(anchor=tk.W, pady=(10, 2))
         self.boundary_status_var = tk.StringVar(value="待添加边界点")
-        ttk.Label(ctrl_frame, textvariable=self.boundary_status_var, foreground='#4472C4').pack(anchor=tk.W)
+        ttk.Label(ctrl_frame, textvariable=self.boundary_status_var, style="Accent.TLabel").pack(anchor=tk.W)
         self._update_boundary_status()
 
         # 信息提示
@@ -95,9 +95,8 @@ class BoundaryFrame(ttk.Frame):
                     "2. 手工边界按顺时针或逆时针逐点左键点击\n"
                     "3. 点会自动吸附到附近测量点；右键或“撤销”可回退\n"
                     "4. 至少 3 个点，系统会自动闭合；确认前检查状态提示\n"
-                    "5. 也可导入 CSV/TXT（前两列为 X、Y 坐标）")
-        ttk.Label(ctrl_frame, text=info_text, justify=tk.LEFT, 
-                 foreground='gray', font=('', 9)).pack(anchor=tk.W, pady=10)
+                    "5. 也可导入 DXF（LWPOLYLINE/POLYLINE）或 CSV/TXT（前两列为 X、Y）")
+        ttk.Label(ctrl_frame, text=info_text, justify=tk.LEFT, style="Hint.TLabel").pack(anchor=tk.W, pady=(10, 0))
         
     def _toggle_edit_mode(self):
         self.edit_mode = self.edit_var.get()
@@ -215,25 +214,37 @@ class BoundaryFrame(ttk.Frame):
             
     def _import_boundary(self):
         filepath = filedialog.askopenfilename(
-            title="导入边界坐标文件",
-            filetypes=[("CSV文件", "*.csv"), ("文本文件", "*.txt"), ("所有文件", "*.*")]
+            title="导入边界文件",
+            filetypes=[
+                ("DXF图形", "*.dxf"),
+                ("CSV文件", "*.csv"),
+                ("文本文件", "*.txt"),
+                ("所有文件", "*.*"),
+            ],
         )
         if not filepath:
             return
-            
+
         try:
-            # 尝试读取，支持逗号、空格、制表符分隔
-            import pandas as pd
-            df = pd.read_csv(filepath, sep=None, engine='python', header=None)
-            if df.shape[1] >= 2:
-                self.boundary = [(float(row[0]), float(row[1])) for _, row in df.iterrows()]
-                self._refresh_plot()
-                self._update_boundary_list()
-                messagebox.showinfo("成功", f"导入边界点 {len(self.boundary)} 个")
+            if filepath.lower().endswith(".dxf"):
+                from utils.dxf_io import import_boundary_from_dxf
+                self.boundary = import_boundary_from_dxf(filepath)
             else:
-                messagebox.showwarning("提示", "文件列数不足，需要至少X、Y两列")
-        except Exception as e:
-            messagebox.showerror("错误", f"导入失败: {e}")
+                import pandas as pd
+                df = pd.read_csv(filepath, sep=None, engine="python", header=None)
+                if df.shape[1] < 2:
+                    messagebox.showwarning("提示", "文件列数不足，需要至少X、Y两列")
+                    return
+                self.boundary = [(float(row[0]), float(row[1])) for _, row in df.iterrows()]
+            if len(self.boundary) < 3:
+                messagebox.showwarning("提示", "边界至少需要 3 个点")
+                return
+            self.current_point = None
+            self._refresh_plot()
+            self._update_boundary_list()
+            messagebox.showinfo("成功", f"导入边界点 {len(self.boundary)} 个")
+        except Exception as error:
+            messagebox.showerror("错误", f"导入失败: {error}")
             
     def _clear_boundary(self):
         self.boundary = []

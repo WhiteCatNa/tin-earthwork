@@ -99,6 +99,9 @@ def run(point_count):
     print("GUI 自动化点击测试")
     print("=" * 70)
 
+    import tempfile
+    os.environ["TIN_EARTHWORK_RECENT"] = os.path.join(tempfile.mkdtemp(prefix="tin_recent_"), "recent.json")
+
     points = generate_test_data()[:point_count]
     print(f"\n测试数据: {len(points)} 点\n")
 
@@ -255,6 +258,8 @@ def run(point_count):
     for label, method, fname in (
         ("导出 Excel 报告", cf._export_excel, "r.xlsx"),
         ("导出 CSV 明细", cf._export_csv, "r.csv"),
+        ("导出 DXF", cf._export_dxf, "r.dxf"),
+        ("导出 PDF 计算书", cf._export_pdf, "r.pdf"),
         ("导出高清图片", cf._export_image, "r.png"),
         ("生成文本报告", cf._export_text, "r.txt"),
     ):

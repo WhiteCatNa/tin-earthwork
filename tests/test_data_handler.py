@@ -2,7 +2,8 @@ import pandas as pd
 import openpyxl
 
 from core.calculator import SurveyPoint, TINEarthworkCalculator
-from utils.data_handler import DataExporter, DataImporter, DataValidator
+from utils.data_handler import DataExporter, DataImporter, DataValidator, load_project, save_project
+from utils.dxf_io import import_boundary_from_dxf
 
 
 def _result():
@@ -37,6 +38,176 @@ def test_validator_reports_duplicate_ids_and_coordinates():
     ])
     assert issues["duplicate_ids"]
     assert issues["duplicate_coords"]
+
+
+def test_import_reports_unparseable_rows(tmp_path):
+    source = tmp_path / "bad.csv"
+    source.write_text("id,x,y,z\nA,0,0,10\nB,bad,1,11\nC,0,1,12\n", encoding="utf-8")
+
+    points, issues, _ = DataImporter.import_file(source)
+
+    assert [point.id for point in points] == ["A", "C"]
+    assert any("第2行" in item for item in issues["format_errors"])
+
+
+def test_import_chinese_headers_out_of_order(tmp_path):
+    source = tmp_path / "points.xlsx"
+    pd.DataFrame({
+        "实测高程": [10, 11, 12],
+        "X坐标": [0, 1, 0],
+        "Y坐标": [0, 0, 1],
+        "点号": ["A", "B", "C"],
+    }).to_excel(source, index=False)
+
+    points, issues, _ = DataImporter.import_file(source)
+
+    by_id = {point.id: point for point in points}
+    assert by_id["A"].x == 0
+    assert by_id["B"].x == 1
+    assert by_id["C"].z == 12
+    assert not issues["format_errors"]
+
+
+def test_import_design_elevation_column(tmp_path):
+    source = tmp_path / "design.csv"
+    pd.DataFrame({
+        "点号": ["A", "B", "C"],
+        "X坐标": [0, 1, 0],
+        "Y坐标": [0, 0, 1],
+        "实测高程": [12, 8, 10],
+        "设计高程": [11, 9, 10],
+    }).to_csv(source, index=False)
+
+    points, issues, _ = DataImporter.import_file(source)
+    by_id = {point.id: point for point in points}
+
+    assert by_id["A"].has_design_z
+    assert by_id["A"].design_z == 11
+    assert by_id["B"].design_z == 9
+    assert by_id["C"].delta_z == 0
+    assert not issues["format_errors"]
+
+
+def test_project_file_roundtrip_restores_points_boundary_and_design(tmp_path):
+    points = [
+        SurveyPoint("A", 0, 0, 12, design_z=11, delta_z=1, has_design_z=True),
+        SurveyPoint("B", 1, 0, 8, design_z=9, delta_z=-1, has_design_z=True),
+        SurveyPoint("C", 0, 1, 10, design_z=10, delta_z=0, has_design_z=True),
+    ]
+    boundary = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)]
+    path = tmp_path / "job.tinproj.json"
+
+    save_project(
+        path,
+        points,
+        boundary,
+        design_elevation=10,
+        use_partition=True,
+        partition={"A": 11, "B": 9, "C": 10},
+        project_name="现场试验段",
+    )
+    loaded = load_project(path)
+
+    assert loaded["project_name"] == "现场试验段"
+    assert loaded["boundary"] == boundary
+    assert loaded["use_partition"] is True
+    assert loaded["partition"]["A"] == 11
+    by_id = {point.id: point for point in loaded["points"]}
+    assert by_id["B"].design_z == 9
+    assert by_id["B"].has_design_z
+
+
+def test_export_dxf_writes_boundary_and_zero_contour(tmp_path):
+    points = [
+        SurveyPoint("A", 0, 0, 1),
+        SurveyPoint("B", 1, 0, -1),
+        SurveyPoint("C", 0, 1, -1),
+    ]
+    calculator = TINEarthworkCalculator(0)
+    calculator.add_points(points)
+    calculator.set_boundary([(0, 0), (1, 0), (0, 1)])
+    result = calculator.run_full_calculation()
+    path = tmp_path / "earthwork.dxf"
+
+    assert DataExporter().export_boundary_dxf(result, path)
+    text = path.read_text(encoding="utf-8")
+    assert "LWPOLYLINE" in text
+    assert "BOUNDARY" in text
+    assert "ZERO_CONTOUR" in text
+    assert "0.5" in text
+
+
+def test_import_boundary_from_dxf_lwpolyline_and_polyline(tmp_path):
+    lwpolyline = tmp_path / "lw.dxf"
+    lwpolyline.write_text(
+        "0\nSECTION\n2\nENTITIES\n"
+        "0\nLWPOLYLINE\n8\nROAD\n90\n3\n70\n1\n10\n0\n20\n0\n10\n1\n20\n0\n10\n1\n20\n1\n"
+        "0\nLWPOLYLINE\n8\nBOUNDARY\n90\n4\n70\n1\n"
+        "10\n0\n20\n0\n10\n10\n20\n0\n10\n10\n20\n10\n10\n0\n20\n10\n"
+        "0\nENDSEC\n0\nEOF\n",
+        encoding="utf-8",
+    )
+    assert import_boundary_from_dxf(lwpolyline) == [(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)]
+
+    polyline = tmp_path / "pl.dxf"
+    polyline.write_text(
+        "0\nSECTION\n2\nENTITIES\n"
+        "0\nPOLYLINE\n8\n红线\n66\n1\n70\n1\n10\n0\n20\n0\n"
+        "0\nVERTEX\n8\n红线\n10\n2\n20\n2\n"
+        "0\nVERTEX\n8\n红线\n10\n8\n20\n2\n"
+        "0\nVERTEX\n8\n红线\n10\n8\n20\n8\n"
+        "0\nVERTEX\n8\n红线\n10\n2\n20\n8\n"
+        "0\nSEQEND\n"
+        "0\nENDSEC\n0\nEOF\n",
+        encoding="utf-8",
+    )
+    assert import_boundary_from_dxf(polyline) == [(2.0, 2.0), (8.0, 2.0), (8.0, 8.0), (2.0, 8.0)]
+
+    exported = tmp_path / "roundtrip.dxf"
+    result, _ = _result()
+    result.boundary_points = [(0.0, 0.0), (5.0, 0.0), (5.0, 4.0), (0.0, 4.0)]
+    assert DataExporter().export_boundary_dxf(result, exported)
+    assert import_boundary_from_dxf(exported) == result.boundary_points
+
+
+def test_import_cass_dat_and_delimited_txt(tmp_path):
+    dat = tmp_path / "site.dat"
+    dat.write_text("1,DMD,100.5,200.5,12.0\n2,,101.5,201.5,11.0\n", encoding="gbk")
+    points, issues, _ = DataImporter.import_file(dat)
+    by_id = {point.id: point for point in points}
+    assert by_id["1"].x == 100.5
+    assert by_id["1"].y == 200.5
+    assert by_id["1"].z == 12.0
+    assert by_id["2"].x == 101.5
+    assert not issues["format_errors"]
+
+    space_txt = tmp_path / "points.txt"
+    space_txt.write_text("A 0 0 12\nB 1 0 8\nC 0 1 10\n", encoding="utf-8")
+    space_points, _, _ = DataImporter.import_file(space_txt)
+    assert [(p.id, p.x, p.y, p.z) for p in space_points] == [
+        ("A", 0.0, 0.0, 12.0),
+        ("B", 1.0, 0.0, 8.0),
+        ("C", 0.0, 1.0, 10.0),
+    ]
+
+    comma_txt = tmp_path / "comma.txt"
+    comma_txt.write_text("点号,X,Y,Z\nA,0,0,12\nB,1,0,8\n", encoding="utf-8")
+    comma_points, _, _ = DataImporter.import_file(comma_txt)
+    assert comma_points[0].id == "A"
+    assert comma_points[1].x == 1.0
+
+
+def test_export_pdf_report_has_summary_and_figure(tmp_path):
+    result, points = _result()
+    result.boundary_points = [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0)]
+    path = tmp_path / "report.pdf"
+    assert DataExporter("试验段").export_pdf_report(
+        result, 10, len(points), points, result.boundary_points, path
+    )
+    data = path.read_bytes()
+    assert data.startswith(b"%PDF")
+    assert path.stat().st_size > 1000
+    assert data.count(b"/Type /Page") >= 2 or b"/Count 2" in data
 
 
 def test_exports_are_created_and_readable(tmp_path):

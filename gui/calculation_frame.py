@@ -7,6 +7,7 @@ from typing import List, Callable, Optional, Dict, Tuple
 from core.calculator import SurveyPoint, CalculationResult, TINEarthworkCalculator
 from utils.plotter import EarthworkPlotter
 from utils.data_handler import DataExporter
+from gui.theme import COLORS, style_text_widget
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import threading
 import queue
@@ -23,9 +24,13 @@ class CalculationFrame(ttk.Frame):
         self.calculator.add_points(points)
         self.calculator.set_boundary(boundary)
         self.result: Optional[CalculationResult] = None
-        self.design_elevation_var = tk.DoubleVar(value=0.0)
-        self.use_partition_var = tk.BooleanVar(value=False)
-        self.partition_data: Dict[str, float] = {}  # 点号 -> 设计高程
+        self.design_elevation_var = tk.DoubleVar(value=self.calculator.design_elevation)
+        imported_design = [point for point in points if point.has_design_z]
+        unique_design = {round(point.design_z, 6) for point in imported_design}
+        self.use_partition_var = tk.BooleanVar(value=len(unique_design) > 1)
+        self.partition_data: Dict[str, float] = (
+            {point.id: point.design_z for point in imported_design} if len(unique_design) > 1 else {}
+        )
         self._detail_rows = []
         self._detail_load_after_id = None
         self._detail_batch_size = 200
@@ -39,15 +44,15 @@ class CalculationFrame(ttk.Frame):
         
     def _create_widgets(self):
         # 左侧：设置面板
-        left_frame = ttk.LabelFrame(self, text="计算设置", padding=10)
-        left_frame.pack(side=tk.LEFT, fill=tk.Y, padx=5, pady=5)
+        left_frame = ttk.LabelFrame(self, text="计算设置", padding=12)
+        left_frame.pack(side=tk.LEFT, fill=tk.Y, padx=(10, 6), pady=10)
         
         # 统一设计高程
-        ttk.Label(left_frame, text="统一设计高程 (m):").pack(anchor=tk.W, pady=(0, 5))
+        ttk.Label(left_frame, text="统一设计高程 (m):", style="Title.TLabel").pack(anchor=tk.W, pady=(0, 6))
         elev_frame = ttk.Frame(left_frame)
-        elev_frame.pack(fill=tk.X, pady=5)
+        elev_frame.pack(fill=tk.X, pady=(0, 4))
         ttk.Entry(elev_frame, textvariable=self.design_elevation_var, width=15).pack(side=tk.LEFT)
-        ttk.Button(elev_frame, text="从数据估算", command=self._estimate_elevation).pack(side=tk.LEFT, padx=5)
+        ttk.Button(elev_frame, text="从数据估算", command=self._estimate_elevation).pack(side=tk.LEFT, padx=8)
         
         # 分区设计高程
         ttk.Separator(left_frame, orient='horizontal').pack(fill=tk.X, pady=10)
@@ -55,15 +60,20 @@ class CalculationFrame(ttk.Frame):
                        command=self._toggle_partition).pack(anchor=tk.W)
         
         self.partition_frame = ttk.Frame(left_frame)
-        self.partition_frame.pack(fill=tk.X, pady=5)
+        self.partition_frame.pack(fill=tk.X, pady=6)
         ttk.Button(self.partition_frame, text="编辑分区高程", command=self._edit_partition).pack(fill=tk.X)
-        self.partition_label = ttk.Label(self.partition_frame, text="未设置", foreground='gray')
-        self.partition_label.pack(anchor=tk.W, pady=5)
+        self.partition_label = ttk.Label(self.partition_frame, text="未设置", style="Muted.TLabel")
+        self.partition_label.pack(anchor=tk.W, pady=6)
         self._toggle_partition()
+        if self.partition_data:
+            self.partition_label.config(
+                text=f"已从文件导入 {len(self.partition_data)} 个分区高程",
+                foreground=COLORS["ink"],
+            )
         
         # 计算选项
         ttk.Separator(left_frame, orient='horizontal').pack(fill=tk.X, pady=10)
-        ttk.Label(left_frame, text="计算选项:").pack(anchor=tk.W)
+        ttk.Label(left_frame, text="计算选项:", style="Title.TLabel").pack(anchor=tk.W, pady=(0, 4))
         
         self.show_tin_var = tk.BooleanVar(value=True)
         self.show_contour_var = tk.BooleanVar(value=True)
@@ -92,13 +102,13 @@ class CalculationFrame(ttk.Frame):
         # 进度条
         self.progress_var = tk.DoubleVar()
         self.progress = ttk.Progressbar(left_frame, variable=self.progress_var, maximum=100)
-        self.progress.pack(fill=tk.X, pady=5)
+        self.progress.pack(fill=tk.X, pady=8)
         self.status_var = tk.StringVar(value="就绪")
-        ttk.Label(left_frame, textvariable=self.status_var).pack(anchor=tk.W)
+        ttk.Label(left_frame, textvariable=self.status_var, style="Muted.TLabel").pack(anchor=tk.W)
         
         # 右侧：结果显示
         right_frame = ttk.Frame(self)
-        right_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=5, pady=5)
+        right_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=(6, 10), pady=10)
         
         # 结果选项卡
         self.notebook = ttk.Notebook(right_frame)
@@ -106,7 +116,7 @@ class CalculationFrame(ttk.Frame):
         
         # 选项卡1：图形显示
         self.plot_frame = ttk.Frame(self.notebook)
-        self.notebook.add(self.plot_frame, text="📊 计算结果图")
+        self.notebook.add(self.plot_frame, text="计算结果图")
         
         self.plotter = EarthworkPlotter(figsize=(10, 7))
         self.canvas = FigureCanvasTkAgg(self.plotter.fig, master=self.plot_frame)
@@ -116,26 +126,28 @@ class CalculationFrame(ttk.Frame):
         
         # 选项卡2：汇总表
         self.summary_frame = ttk.Frame(self.notebook)
-        self.notebook.add(self.summary_frame, text="📋 汇总表")
+        self.notebook.add(self.summary_frame, text="汇总表")
         self._create_summary_table()
         
         # 选项卡3：明细表
         self.detail_frame = ttk.Frame(self.notebook)
-        self.notebook.add(self.detail_frame, text="📝 计算明细")
+        self.notebook.add(self.detail_frame, text="计算明细")
         self._create_detail_table()
         
         # 选项卡4：三角形信息 (点击三角形后显示)
         self.info_frame = ttk.Frame(self.notebook)
-        self.notebook.add(self.info_frame, text="🔍 三角形详情")
+        self.notebook.add(self.info_frame, text="三角形详情")
         self._create_triangle_info()
         
         # 底部导出按钮
         export_frame = ttk.Frame(right_frame)
-        export_frame.pack(fill=tk.X, pady=5)
-        ttk.Button(export_frame, text="导出 Excel 报告", command=self._export_excel).pack(side=tk.LEFT, padx=2)
-        ttk.Button(export_frame, text="导出 CSV 明细", command=self._export_csv).pack(side=tk.LEFT, padx=2)
-        ttk.Button(export_frame, text="导出高清图片", command=self._export_image).pack(side=tk.LEFT, padx=2)
-        ttk.Button(export_frame, text="生成文本报告", command=self._export_text).pack(side=tk.LEFT, padx=2)
+        export_frame.pack(fill=tk.X, pady=(8, 0))
+        ttk.Button(export_frame, text="导出 Excel 报告", command=self._export_excel).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(export_frame, text="导出 CSV 明细", command=self._export_csv).pack(side=tk.LEFT, padx=6)
+        ttk.Button(export_frame, text="导出 DXF", command=self._export_dxf).pack(side=tk.LEFT, padx=6)
+        ttk.Button(export_frame, text="导出 PDF 计算书", command=self._export_pdf).pack(side=tk.LEFT, padx=6)
+        ttk.Button(export_frame, text="导出高清图片", command=self._export_image).pack(side=tk.LEFT, padx=6)
+        ttk.Button(export_frame, text="生成文本报告", command=self._export_text).pack(side=tk.LEFT, padx=6)
         
     def _create_summary_table(self):
         """创建汇总表"""
@@ -144,7 +156,7 @@ class CalculationFrame(ttk.Frame):
         for col in columns:
             self.tree_summary.heading(col, text=col)
             self.tree_summary.column(col, width=150, anchor='center')
-        self.tree_summary.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        self.tree_summary.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
         
     def _create_detail_table(self):
         """创建明细表"""
@@ -166,8 +178,9 @@ class CalculationFrame(ttk.Frame):
         
     def _create_triangle_info(self):
         """创建三角形详情面板"""
-        self.info_text = tk.Text(self.info_frame, wrap=tk.WORD, font=('Consolas', 10))
-        self.info_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        self.info_text = tk.Text(self.info_frame, wrap=tk.WORD)
+        style_text_widget(self.info_text)
+        self.info_text.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
         self.info_text.insert('1.0', '点击左侧图形中的三角形查看详细信息...')
         self.info_text.config(state=tk.DISABLED)
         
@@ -191,15 +204,17 @@ class CalculationFrame(ttk.Frame):
         dialog = tk.Toplevel(self)
         dialog.title("分区设计高程设置")
         dialog.geometry("500x400")
+        dialog.configure(bg=COLORS["bg"])
         dialog.transient(self)
         dialog.grab_set()
         
-        ttk.Label(dialog, text="为选定点号设置不同的设计高程 (点号,高程 每行一条):").pack(anchor=tk.W, padx=10, pady=5)
+        ttk.Label(dialog, text="为选定点号设置不同的设计高程 (点号,高程 每行一条):").pack(anchor=tk.W, padx=12, pady=8)
         
         text_frame = ttk.Frame(dialog)
-        text_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+        text_frame.pack(fill=tk.BOTH, expand=True, padx=12, pady=4)
         
-        text = tk.Text(text_frame, font=('Consolas', 10))
+        text = tk.Text(text_frame)
+        style_text_widget(text)
         text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         vsb = ttk.Scrollbar(text_frame, orient="vertical", command=text.yview)
         text.configure(yscrollcommand=vsb.set)
@@ -220,10 +235,10 @@ class CalculationFrame(ttk.Frame):
                             self.partition_data[parts[0].strip()] = float(parts[1].strip())
                         except ValueError:
                             pass
-            self.partition_label.config(text=f"已设置 {len(self.partition_data)} 个分区高程", foreground='black')
+            self.partition_label.config(text=f"已设置 {len(self.partition_data)} 个分区高程", foreground=COLORS["ink"])
             dialog.destroy()
             
-        ttk.Button(dialog, text="保存", command=save).pack(pady=10)
+        ttk.Button(dialog, text="保存", command=save, style="Accent.TButton").pack(pady=10)
         
     def _run_calculation(self):
         """运行计算 (在后台线程)"""
@@ -493,6 +508,47 @@ class CalculationFrame(ttk.Frame):
         exporter = DataExporter()
         if exporter.export_triangles_csv(self.result, filepath):
             messagebox.showinfo("成功", "CSV 明细导出成功")
+        else:
+            messagebox.showerror("错误", "导出失败")
+
+    def _export_dxf(self):
+        if not self.result:
+            messagebox.showwarning("提示", "请先进行计算")
+            return
+
+        filepath = filedialog.asksaveasfilename(
+            title="导出 DXF",
+            defaultextension=".dxf",
+            filetypes=[("DXF图形", "*.dxf")],
+        )
+        if not filepath:
+            return
+
+        exporter = DataExporter()
+        if exporter.export_boundary_dxf(self.result, filepath):
+            messagebox.showinfo("成功", "DXF 已导出（BOUNDARY 边界 / ZERO_CONTOUR 零填挖线）")
+        else:
+            messagebox.showerror("错误", "导出失败")
+
+    def _export_pdf(self):
+        if not self.result:
+            messagebox.showwarning("提示", "请先进行计算")
+            return
+
+        filepath = filedialog.asksaveasfilename(
+            title="导出 PDF 计算书",
+            defaultextension=".pdf",
+            filetypes=[("PDF文件", "*.pdf")],
+        )
+        if not filepath:
+            return
+
+        exporter = DataExporter("TIN土方计算项目")
+        design_elev = self.design_elevation_var.get()
+        if exporter.export_pdf_report(
+            self.result, design_elev, len(self.points), self.points, self.boundary, filepath
+        ):
+            messagebox.showinfo("成功", "PDF 计算书已导出（汇总页 + 成果图）")
         else:
             messagebox.showerror("错误", "导出失败")
             

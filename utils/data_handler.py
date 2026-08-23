@@ -9,6 +9,7 @@ import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 from core.calculator import SurveyPoint, Triangle, CalculationResult
+from utils.dxf_io import read_text_with_encodings
 import json
 from datetime import datetime
 
@@ -88,21 +89,26 @@ class DataValidator:
                 break
                 
         # X坐标列
-        for key in ['x', '横坐标', '东向', 'easting', '经度', 'lon', 'longitude']:
+        for key in ['x', 'x坐标', '横坐标', '东向', 'easting', '经度', 'lon', 'longitude']:
             if key in cols:
                 mapping['x'] = cols[key]
                 break
                 
         # Y坐标列
-        for key in ['y', '纵坐标', '北向', 'northing', '纬度', 'lat', 'latitude']:
+        for key in ['y', 'y坐标', '纵坐标', '北向', 'northing', '纬度', 'lat', 'latitude']:
             if key in cols:
                 mapping['y'] = cols[key]
                 break
                 
         # 高程列
-        for key in ['z', '高程', 'elevation', 'alt', 'altitude', 'h']:
+        for key in ['z', '实测高程', '高程', 'elevation', 'alt', 'altitude', 'h']:
             if key in cols:
                 mapping['z'] = cols[key]
+                break
+
+        for key in ['设计高程', '设计标高', 'design_z', 'designz', 'designelev', 'design_elev']:
+            if key in cols:
+                mapping['design_z'] = cols[key]
                 break
                 
         return mapping
@@ -110,6 +116,55 @@ class DataValidator:
 
 class DataImporter:
     """数据导入器"""
+
+    @staticmethod
+    def complete_column_mapping(df: pd.DataFrame, mapping: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+        """补齐缺失的 id/x/y/z 映射，不覆盖已经识别出的列。"""
+        completed = dict(mapping or {})
+        cols = df.columns.tolist()
+        defaults = {"id": 0, "x": 1, "y": 2, "z": 3}
+        for key, idx in defaults.items():
+            if key not in completed and idx < len(cols):
+                completed[key] = cols[idx]
+        return completed
+
+    @staticmethod
+    def points_from_dataframe(
+        df: pd.DataFrame, mapping: Dict[str, str]
+    ) -> Tuple[List[SurveyPoint], List[str]]:
+        """按列映射解析测点；无法解析的行记入 format_errors，不静默丢弃。"""
+        points: List[SurveyPoint] = []
+        format_errors: List[str] = []
+        id_column = mapping.get("id")
+        x_column = mapping.get("x")
+        y_column = mapping.get("y")
+        z_column = mapping.get("z")
+        design_column = mapping.get("design_z")
+
+        for row_number, (index, row) in enumerate(df.iterrows(), start=1):
+            try:
+                point_id = str(row[id_column]) if id_column is not None else f"P{index + 1}"
+                design_z = 0.0
+                has_design_z = False
+                if design_column is not None:
+                    raw_design = row[design_column]
+                    if pd.notna(raw_design) and str(raw_design).strip() != "":
+                        design_z = float(raw_design)
+                        has_design_z = True
+                z_value = float(row[z_column]) if z_column is not None else 0.0
+                pt = SurveyPoint(
+                    id=point_id,
+                    x=float(row[x_column]) if x_column is not None else 0.0,
+                    y=float(row[y_column]) if y_column is not None else 0.0,
+                    z=z_value,
+                    design_z=design_z,
+                    delta_z=(z_value - design_z) if has_design_z else 0.0,
+                    has_design_z=has_design_z,
+                )
+                points.append(pt)
+            except (ValueError, TypeError, KeyError):
+                format_errors.append(f"第{row_number}行: 坐标或高程无法解析")
+        return points, format_errors
     
     @staticmethod
     def import_file(filepath: str) -> Tuple[List[SurveyPoint], Dict[str, Any], pd.DataFrame]:
@@ -131,8 +186,12 @@ class DataImporter:
                 else:
                     raise ValueError("无法识别CSV编码")
             elif suffix in ['.txt', '.dat']:
-                # 尝试自动分隔符
-                df = pd.read_csv(filepath, sep=None, engine='python')
+                points, format_errors, df = DataImporter.import_survey_text(
+                    filepath, cass=(suffix == '.dat')
+                )
+                issues = DataValidator.validate_points(points)
+                issues["format_errors"].extend(format_errors)
+                return points, issues, df
             else:
                 raise ValueError(f"不支持的文件格式: {suffix}")
                 
@@ -142,36 +201,157 @@ class DataImporter:
         if df.empty:
             raise ValueError("文件为空")
             
-        # 自动识别列
-        mapping = DataValidator.auto_detect_columns(df)
-        
-        # 如果自动识别失败，使用前4列
-        if len(mapping) < 3:
-            cols = df.columns.tolist()
-            mapping = {}
-            if len(cols) >= 1: mapping['id'] = cols[0]
-            if len(cols) >= 2: mapping['x'] = cols[1]
-            if len(cols) >= 3: mapping['y'] = cols[2]
-            if len(cols) >= 4: mapping['z'] = cols[3]
-            
-        # 构建点列表
-        points = []
-        for idx, row in df.iterrows():
-            try:
-                pt = SurveyPoint(
-                    id=str(row[mapping.get('id', df.columns[0])]) if 'id' in mapping else f"P{idx+1}",
-                    x=float(row[mapping['x']]) if 'x' in mapping else 0.0,
-                    y=float(row[mapping['y']]) if 'y' in mapping else 0.0,
-                    z=float(row[mapping['z']]) if 'z' in mapping else 0.0
-                )
-                points.append(pt)
-            except (ValueError, KeyError) as e:
-                continue  # 跳过格式错误的行
-                
-        # 验证数据
+        mapping = DataImporter.complete_column_mapping(
+            df, DataValidator.auto_detect_columns(df)
+        )
+        points, format_errors = DataImporter.points_from_dataframe(df, mapping)
         issues = DataValidator.validate_points(points)
-        
+        issues["format_errors"].extend(format_errors)
         return points, issues, df
+
+    @staticmethod
+    def _split_survey_fields(line: str) -> List[str]:
+        if "," in line:
+            return [part.strip() for part in line.split(",")]
+        return line.split()
+
+    @staticmethod
+    def _is_survey_header(fields: List[str]) -> bool:
+        joined = "".join(fields).lower()
+        if any(keyword in joined for keyword in ("点号", "点名", "编号", "实测", "高程", "坐标", "northing", "easting")):
+            return True
+        if len(fields) >= 5:
+            try:
+                float(fields[2])
+                float(fields[3])
+                float(fields[4])
+                return False
+            except ValueError:
+                return True
+        if len(fields) >= 4:
+            try:
+                float(fields[1])
+                float(fields[2])
+                float(fields[-1])
+                return False
+            except ValueError:
+                return True
+        if len(fields) == 3:
+            try:
+                float(fields[0])
+                float(fields[1])
+                float(fields[2])
+                return False
+            except ValueError:
+                return True
+        return False
+
+    @staticmethod
+    def _looks_like_cass(fields: List[str]) -> bool:
+        if len(fields) < 5:
+            return False
+        try:
+            float(fields[2])
+            float(fields[3])
+            float(fields[4])
+        except (TypeError, ValueError):
+            return False
+        try:
+            float(fields[1])
+            return False
+        except (TypeError, ValueError):
+            return True
+
+    @staticmethod
+    def _points_to_dataframe(points: List[SurveyPoint]) -> pd.DataFrame:
+        rows = {
+            "点号": [point.id for point in points],
+            "X坐标": [point.x for point in points],
+            "Y坐标": [point.y for point in points],
+            "实测高程": [point.z for point in points],
+        }
+        if any(point.has_design_z for point in points):
+            rows["设计高程"] = [point.design_z for point in points]
+        return pd.DataFrame(rows)
+
+    @staticmethod
+    def import_survey_text(
+        filepath: str, cass: bool = False
+    ) -> Tuple[List[SurveyPoint], List[str], pd.DataFrame]:
+        """导入 CASS .dat 或点号/X/Y/Z 的空格、逗号分隔文本。"""
+        text = read_text_with_encodings(filepath)
+        lines = []
+        for raw in text.splitlines():
+            line = raw.strip()
+            if not line or line.startswith(("#", "*", "//")):
+                continue
+            if line.upper() in {"BEGIN", "END"}:
+                continue
+            lines.append(line)
+        if not lines:
+            raise ValueError("文件为空")
+
+        first_fields = DataImporter._split_survey_fields(lines[0])
+        header = DataImporter._is_survey_header(first_fields)
+        body = lines[1:] if header else lines
+        if not body:
+            raise ValueError("文件为空")
+        sample = DataImporter._split_survey_fields(body[0])
+        use_cass = cass or DataImporter._looks_like_cass(sample)
+
+        if header and not use_cass:
+            rows = [DataImporter._split_survey_fields(line) for line in body]
+            width = max(len(first_fields), max((len(row) for row in rows), default=0))
+            columns = list(first_fields) + [f"col{i}" for i in range(len(first_fields), width)]
+            padded = [row + [""] * (width - len(row)) for row in rows]
+            df = pd.DataFrame(padded, columns=columns[:width])
+            mapping = DataImporter.complete_column_mapping(df, DataValidator.auto_detect_columns(df))
+            points, format_errors = DataImporter.points_from_dataframe(df, mapping)
+            return points, format_errors, df
+
+        points: List[SurveyPoint] = []
+        format_errors: List[str] = []
+        for row_number, line in enumerate(body, start=1):
+            fields = DataImporter._split_survey_fields(line)
+            try:
+                if use_cass:
+                    if len(fields) >= 5:
+                        point_id, easting, northing, height = fields[0], fields[2], fields[3], fields[4]
+                    elif len(fields) == 4:
+                        point_id, easting, northing, height = fields[0], fields[1], fields[2], fields[3]
+                    elif len(fields) == 3:
+                        point_id, easting, northing, height = f"P{row_number}", fields[0], fields[1], fields[2]
+                    else:
+                        raise ValueError("字段不足")
+                    point = SurveyPoint(
+                        id=str(point_id),
+                        x=float(easting),
+                        y=float(northing),
+                        z=float(height),
+                    )
+                else:
+                    if len(fields) >= 4:
+                        point = SurveyPoint(
+                            id=str(fields[0]),
+                            x=float(fields[1]),
+                            y=float(fields[2]),
+                            z=float(fields[3]),
+                        )
+                    elif len(fields) == 3:
+                        point = SurveyPoint(
+                            id=f"P{row_number}",
+                            x=float(fields[0]),
+                            y=float(fields[1]),
+                            z=float(fields[2]),
+                        )
+                    else:
+                        raise ValueError("字段不足")
+                points.append(point)
+            except (ValueError, TypeError):
+                format_errors.append(f"第{row_number}行: 坐标或高程无法解析")
+        if not points:
+            raise ValueError("没有可解析的测量点")
+        return points, format_errors, DataImporter._points_to_dataframe(points)
 
 
 class DataExporter:
@@ -364,29 +544,39 @@ class DataExporter:
             return False
     
     def export_boundary_dxf(self, result: CalculationResult, filepath: str) -> bool:
-        """导出简单的边界和零填挖线 DXF (简化版)"""
+        """导出计算边界（闭合多段线）和零填挖线到 DXF。"""
+        from core.calculator import chain_segments, extract_zero_contour_segments
+
         try:
-            with open(filepath, 'w', encoding='utf-8') as f:
-                f.write("0\nSECTION\n2\nHEADER\n0\nENDSEC\n0\nSECTION\n2\nENTITIES\n")
-                
-                # 边界线
+            with open(filepath, "w", encoding="utf-8") as handle:
+                handle.write("0\nSECTION\n2\nHEADER\n0\nENDSEC\n")
+                handle.write("0\nSECTION\n2\nENTITIES\n")
                 if result.boundary_points:
-                    f.write("0\nLWPOLYLINE\n8\nBOUNDARY\n90\n{}\n70\n1\n".format(len(result.boundary_points)))
-                    for x, y in result.boundary_points:
-                        f.write("10\n{}\n20\n{}\n".format(x, y))
-                    f.write("0\n")
-                    
-                # 零填挖线 (从混合三角形提取)
-                for tri in result.triangles:
-                    if tri.is_mixed and tri.sub_triangles:
-                        # 简化：导出子三角形边界
-                        pass
-                        
-                f.write("0\nENDSEC\n0\nEOF\n")
+                    self._write_dxf_lwpolyline(
+                        handle, "BOUNDARY", result.boundary_points, closed=True
+                    )
+                for polyline in chain_segments(extract_zero_contour_segments(result)):
+                    if len(polyline) >= 2:
+                        self._write_dxf_lwpolyline(handle, "ZERO_CONTOUR", polyline, closed=False)
+                handle.write("0\nENDSEC\n0\nEOF\n")
             return True
-        except Exception as e:
-            print(f"DXF导出失败: {e}")
+        except Exception as error:
+            print(f"DXF导出失败: {error}")
             return False
+
+    @staticmethod
+    def _write_dxf_lwpolyline(handle, layer: str, points, closed: bool) -> None:
+        coords = [(float(x), float(y)) for x, y in points]
+        if closed and coords and coords[0] != coords[-1]:
+            vertex_count = len(coords)
+        else:
+            vertex_count = len(coords)
+        handle.write("0\nLWPOLYLINE\n")
+        handle.write(f"8\n{layer}\n")
+        handle.write(f"90\n{vertex_count}\n")
+        handle.write(f"70\n{1 if closed else 0}\n")
+        for x, y in coords:
+            handle.write(f"10\n{x}\n20\n{y}\n")
     
     def generate_report_text(self, result: CalculationResult, 
                              design_elevation: float,
@@ -421,6 +611,121 @@ class DataExporter:
 ============================================================
 """
         return report
+
+    def export_pdf_report(
+        self,
+        result: CalculationResult,
+        design_elevation: float,
+        point_count: int,
+        points: List[SurveyPoint],
+        boundary: List[Tuple[float, float]],
+        filepath: str,
+    ) -> bool:
+        """导出含挖填汇总与成果图的 PDF 计算书。"""
+        import matplotlib.pyplot as plt
+        from matplotlib.backends.backend_pdf import PdfPages
+        from matplotlib.figure import Figure
+        from utils.plotter import create_standalone_figure, setup_chinese_font
+
+        setup_chinese_font()
+        try:
+            with PdfPages(filepath) as pdf:
+                summary = Figure(figsize=(8.27, 11.69))
+                axis = summary.add_subplot(111)
+                axis.axis("off")
+                axis.text(
+                    0.08,
+                    0.96,
+                    self.generate_report_text(result, design_elevation, point_count).strip(),
+                    va="top",
+                    ha="left",
+                    fontsize=10,
+                    family=plt.rcParams["font.family"],
+                    wrap=True,
+                    transform=axis.transAxes,
+                )
+                pdf.savefig(summary)
+                plt.close(summary)
+
+                figure = create_standalone_figure(
+                    result, points, boundary, design_elevation, self.project_name
+                )
+                figure.suptitle(f"{self.project_name} 计算结果图", fontsize=14)
+                pdf.savefig(figure)
+                plt.close(figure)
+            return True
+        except Exception as error:
+            print(f"PDF导出失败: {error}")
+            return False
+
+
+def save_project(
+    filepath: str,
+    points: List[SurveyPoint],
+    boundary: List[Tuple[float, float]],
+    design_elevation: float = 0.0,
+    use_partition: bool = False,
+    partition: Optional[Dict[str, float]] = None,
+    project_name: str = "TIN土方计算项目",
+) -> None:
+    """保存可再次打开的工程文件（测点、边界、设计高程）。"""
+    payload = {
+        "format": "tin-earthwork-project",
+        "format_version": 1,
+        "app_version": "1.3.0",
+        "project_name": project_name,
+        "design_elevation": float(design_elevation),
+        "use_partition": bool(use_partition),
+        "partition": {str(key): float(value) for key, value in (partition or {}).items()},
+        "boundary": [[float(x), float(y)] for x, y in boundary],
+        "points": [
+            {
+                "id": point.id,
+                "x": point.x,
+                "y": point.y,
+                "z": point.z,
+                "design_z": point.design_z,
+                "has_design_z": bool(point.has_design_z),
+            }
+            for point in points
+        ],
+    }
+    with open(filepath, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2)
+
+
+def load_project(filepath: str) -> Dict[str, Any]:
+    """读取工程文件，返回测点对象和计算设置。"""
+    with open(filepath, "r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    if payload.get("format") not in (None, "tin-earthwork-project"):
+        raise ValueError("不是 TIN 土方工程文件")
+    points = []
+    for row in payload.get("points") or []:
+        design_z = float(row.get("design_z", 0.0))
+        has_design_z = bool(row.get("has_design_z", "design_z" in row))
+        z_value = float(row["z"])
+        points.append(
+            SurveyPoint(
+                id=str(row["id"]),
+                x=float(row["x"]),
+                y=float(row["y"]),
+                z=z_value,
+                design_z=design_z,
+                delta_z=z_value - design_z if has_design_z else 0.0,
+                has_design_z=has_design_z,
+            )
+        )
+    boundary = [(float(x), float(y)) for x, y in (payload.get("boundary") or [])]
+    partition = {str(key): float(value) for key, value in (payload.get("partition") or {}).items()}
+    return {
+        "project_name": payload.get("project_name") or "TIN土方计算项目",
+        "design_elevation": float(payload.get("design_elevation") or 0.0),
+        "use_partition": bool(payload.get("use_partition")),
+        "partition": partition,
+        "boundary": boundary,
+        "points": points,
+    }
 
 
 def save_project_config(config: Dict[str, Any], filepath: str):

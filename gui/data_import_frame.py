@@ -6,42 +6,52 @@ from tkinter import ttk, filedialog, messagebox
 import pandas as pd
 from typing import List, Optional, Callable
 from core.calculator import SurveyPoint
+from gui.theme import COLORS
 from utils.data_handler import DataImporter, DataValidator
+from utils.survey_edit import (
+    add_survey_point as append_survey_point,
+    delete_survey_point_at as remove_survey_point_at,
+    offset_survey_data,
+    update_survey_point as mutate_survey_point,
+)
 
 
 class DataImportFrame(ttk.Frame):
     """数据导入与检查页面"""
     
-    def __init__(self, parent, on_points_loaded: Callable[[List[SurveyPoint]], None]):
+    def __init__(self, parent, on_points_loaded: Callable[[List[SurveyPoint]], None],
+                 on_points_mutated: Optional[Callable] = None):
         super().__init__(parent)
         self.on_points_loaded = on_points_loaded
+        self.on_points_mutated = on_points_mutated
         self.points: List[SurveyPoint] = []
         self.raw_df: Optional[pd.DataFrame] = None
         self.column_mapping = {}
+        self._edit_entry = None
         
         self._create_widgets()
         
     def _create_widgets(self):
         # 左侧：文件操作和列映射
-        left_frame = ttk.LabelFrame(self, text="数据导入", padding=10)
-        left_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=5, pady=5)
+        left_frame = ttk.LabelFrame(self, text="数据导入", padding=12)
+        left_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(10, 6), pady=10)
         
         # 文件选择
         self.file_frame = ttk.Frame(left_frame)
-        self.file_frame.pack(fill=tk.X, pady=5)
+        self.file_frame.pack(fill=tk.X, pady=(0, 8))
 
         ttk.Label(self.file_frame, text="数据文件:").pack(side=tk.LEFT)
         self.file_var = tk.StringVar()
-        ttk.Entry(self.file_frame, textvariable=self.file_var, width=40).pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
+        ttk.Entry(self.file_frame, textvariable=self.file_var, width=40).pack(side=tk.LEFT, padx=8, fill=tk.X, expand=True)
         ttk.Button(self.file_frame, text="浏览...", command=self._browse_file).pack(side=tk.LEFT)
-        self.import_btn = ttk.Button(self.file_frame, text="导入", command=self._import_file)
-        self.import_btn.pack(side=tk.LEFT, padx=5)
+        self.import_btn = ttk.Button(self.file_frame, text="导入", command=self._import_file, style="Accent.TButton")
+        self.import_btn.pack(side=tk.LEFT, padx=(8, 0))
         # 进度条占位（不创建，仅在导入时动态添加）
         self.progress_bar: Optional[ttk.Progressbar] = None
         
         # 列映射
-        map_frame = ttk.LabelFrame(left_frame, text="列映射 (自动识别，可手动调整)", padding=5)
-        map_frame.pack(fill=tk.BOTH, expand=True, pady=5)
+        map_frame = ttk.LabelFrame(left_frame, text="列映射 (自动识别，可手动调整)", padding=8)
+        map_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
         
         self.tree_map = ttk.Treeview(map_frame, columns=('source', 'target'), show='headings', height=8)
         self.tree_map.heading('source', text='源列名')
@@ -52,13 +62,13 @@ class DataImportFrame(ttk.Frame):
         
         # 映射编辑按钮
         map_btn_frame = ttk.Frame(map_frame)
-        map_btn_frame.pack(fill=tk.X, pady=5)
+        map_btn_frame.pack(fill=tk.X, pady=(8, 0))
         ttk.Button(map_btn_frame, text="应用映射", command=self._apply_mapping).pack(side=tk.LEFT)
-        ttk.Button(map_btn_frame, text="重置自动识别", command=self._auto_detect_mapping).pack(side=tk.LEFT, padx=5)
+        ttk.Button(map_btn_frame, text="重置自动识别", command=self._auto_detect_mapping).pack(side=tk.LEFT, padx=8)
         
-        # 数据预览
-        preview_frame = ttk.LabelFrame(left_frame, text="数据预览 (前20行)", padding=5)
-        preview_frame.pack(fill=tk.BOTH, expand=True, pady=5)
+        # 数据预览（可编辑）
+        preview_frame = ttk.LabelFrame(left_frame, text="测点表（双击单元格修改）", padding=8)
+        preview_frame.pack(fill=tk.BOTH, expand=True)
         
         self.tree_preview = ttk.Treeview(preview_frame, show='headings', height=10)
         vsb = ttk.Scrollbar(preview_frame, orient="vertical", command=self.tree_preview.yview)
@@ -69,10 +79,34 @@ class DataImportFrame(ttk.Frame):
         hsb.grid(row=1, column=0, sticky='ew')
         preview_frame.grid_rowconfigure(0, weight=1)
         preview_frame.grid_columnconfigure(0, weight=1)
+        self.tree_preview.bind("<Double-1>", self._on_preview_double_click)
+
+        edit_bar = ttk.Frame(preview_frame)
+        edit_bar.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        ttk.Button(edit_bar, text="添加测点", command=self._add_point_dialog).pack(side=tk.LEFT)
+        ttk.Button(edit_bar, text="删除选中", command=self._delete_selected).pack(side=tk.LEFT, padx=6)
+        ttk.Label(edit_bar, text="定位点号").pack(side=tk.LEFT, padx=(12, 4))
+        self.find_id_var = tk.StringVar()
+        ttk.Entry(edit_bar, textvariable=self.find_id_var, width=10).pack(side=tk.LEFT)
+        ttk.Button(edit_bar, text="定位", command=self._focus_point_id).pack(side=tk.LEFT, padx=4)
+
+        offset_bar = ttk.Frame(preview_frame)
+        offset_bar.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(4, 0))
+        ttk.Label(offset_bar, text="坐标平移").pack(side=tk.LEFT)
+        self.dx_var = tk.StringVar(value="0")
+        self.dy_var = tk.StringVar(value="0")
+        self.dz_var = tk.StringVar(value="0")
+        ttk.Label(offset_bar, text="ΔX").pack(side=tk.LEFT, padx=(8, 2))
+        ttk.Entry(offset_bar, textvariable=self.dx_var, width=8).pack(side=tk.LEFT)
+        ttk.Label(offset_bar, text="ΔY").pack(side=tk.LEFT, padx=(8, 2))
+        ttk.Entry(offset_bar, textvariable=self.dy_var, width=8).pack(side=tk.LEFT)
+        ttk.Label(offset_bar, text="ΔZ").pack(side=tk.LEFT, padx=(8, 2))
+        ttk.Entry(offset_bar, textvariable=self.dz_var, width=8).pack(side=tk.LEFT)
+        ttk.Button(offset_bar, text="应用平移", command=self._apply_offset_clicked).pack(side=tk.LEFT, padx=8)
         
         # 右侧：数据检查结果
-        right_frame = ttk.LabelFrame(self, text="数据质量检查", padding=10)
-        right_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=5, pady=5)
+        right_frame = ttk.LabelFrame(self, text="数据质量检查", padding=12)
+        right_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=(6, 10), pady=10)
         
         # 检查结果列表
         self.tree_issues = ttk.Treeview(right_frame, columns=('type', 'detail'), show='headings', height=20)
@@ -84,15 +118,20 @@ class DataImportFrame(ttk.Frame):
         
         # 统计信息
         stats_frame = ttk.Frame(right_frame)
-        stats_frame.pack(fill=tk.X, pady=5)
+        stats_frame.pack(fill=tk.X, pady=8)
         self.stats_var = tk.StringVar(value="等待导入数据...")
-        ttk.Label(stats_frame, textvariable=self.stats_var, font=('', 10, 'bold')).pack()
+        ttk.Label(stats_frame, textvariable=self.stats_var, style="Title.TLabel").pack(anchor=tk.W)
         
         # 底部按钮
         btn_frame = ttk.Frame(right_frame)
-        btn_frame.pack(fill=tk.X, pady=5)
-        ttk.Button(btn_frame, text="确认无误，进入下一步", command=self._confirm_points).pack(side=tk.RIGHT)
-        ttk.Button(btn_frame, text="导出检查报告", command=self._export_issues).pack(side=tk.RIGHT, padx=5)
+        btn_frame.pack(fill=tk.X, pady=(4, 0))
+        ttk.Button(
+            btn_frame,
+            text="确认无误，进入下一步",
+            command=self._confirm_points,
+            style="Accent.TButton",
+        ).pack(side=tk.RIGHT)
+        ttk.Button(btn_frame, text="导出检查报告", command=self._export_issues).pack(side=tk.RIGHT, padx=8)
         
     def _browse_file(self):
         filepath = filedialog.askopenfilename(
@@ -153,14 +192,9 @@ class DataImportFrame(ttk.Frame):
         """更新列映射显示"""
         self.tree_map.delete(*self.tree_map.get_children())
         if self.raw_df is not None:
-            from utils.data_handler import DataValidator
-            self.column_mapping = DataValidator.auto_detect_columns(self.raw_df)
-            # 如果自动识别不全，补充前4列
-            cols = self.raw_df.columns.tolist()
-            defaults = {'id': 0, 'x': 1, 'y': 2, 'z': 3}
-            for key, idx in defaults.items():
-                if key not in self.column_mapping and idx < len(cols):
-                    self.column_mapping[key] = cols[idx]
+            self.column_mapping = DataImporter.complete_column_mapping(
+                self.raw_df, DataValidator.auto_detect_columns(self.raw_df)
+            )
                     
             for target, source in self.column_mapping.items():
                 self.tree_map.insert('', 'end', values=(source, target), tags=(target,))
@@ -183,20 +217,9 @@ class DataImportFrame(ttk.Frame):
         
         # 重新解析
         try:
-            self.points = []
-            for idx, row in self.raw_df.iterrows():
-                try:
-                    pt = SurveyPoint(
-                        id=str(row[mapping.get('id', self.raw_df.columns[0])]) if 'id' in mapping else f"P{idx+1}",
-                        x=float(row[mapping['x']]) if 'x' in mapping else 0.0,
-                        y=float(row[mapping['y']]) if 'y' in mapping else 0.0,
-                        z=float(row[mapping['z']]) if 'z' in mapping else 0.0
-                    )
-                    self.points.append(pt)
-                except (ValueError, KeyError):
-                    continue
-                    
+            self.points, format_errors = DataImporter.points_from_dataframe(self.raw_df, mapping)
             issues = DataValidator.validate_points(self.points)
+            issues["format_errors"].extend(format_errors)
             self._update_preview()
             self._update_issues(issues)
             self._update_stats()
@@ -205,25 +228,205 @@ class DataImportFrame(ttk.Frame):
             messagebox.showerror("错误", f"映射应用失败: {e}")
             
     def _update_preview(self):
-        """更新数据预览（限制 500 行）"""
+        """刷新测点表。"""
+        self._destroy_edit_entry()
         self.tree_preview.delete(*self.tree_preview.get_children())
         if self.points:
             cols = ['点号', 'X坐标', 'Y坐标', '实测高程']
+            if any(pt.has_design_z for pt in self.points):
+                cols.append('设计高程')
             self.tree_preview['columns'] = cols
             for c in cols:
                 self.tree_preview.heading(c, text=c)
                 self.tree_preview.column(c, width=100, anchor='center')
 
-            # 只显示前 500 行
-            preview_count = min(500, len(self.points))
-            for pt in self.points[:preview_count]:
-                self.tree_preview.insert('', 'end', values=(pt.id, f"{pt.x:.3f}", f"{pt.y:.3f}", f"{pt.z:.3f}"))
+            preview_count = min(2000, len(self.points))
+            for index, pt in enumerate(self.points[:preview_count]):
+                values = [pt.id, f"{pt.x:.3f}", f"{pt.y:.3f}", f"{pt.z:.3f}"]
+                if '设计高程' in cols:
+                    values.append(f"{pt.design_z:.3f}" if pt.has_design_z else "")
+                self.tree_preview.insert('', 'end', iid=str(index), values=values)
 
-            # 如果数据超过 500 行，在表格下方显示提示
             if len(self.points) > preview_count:
-                # 添加一个占位行显示"..."
-                self.tree_preview.insert('', 'end', values=('...', f'（共 {len(self.points)} 行，仅显示前 {preview_count} 行）', '', ''), tags=('info',))
-                self.tree_preview.tag_configure('info', foreground='gray')
+                placeholder = ['...', f'（共 {len(self.points)} 行，仅显示前 {preview_count} 行，可用定位点号）', '', '']
+                if '设计高程' in cols:
+                    placeholder.append('')
+                self.tree_preview.insert('', 'end', iid="info", values=placeholder, tags=('info',))
+                self.tree_preview.tag_configure('info', foreground=COLORS['dim'])
+
+    def _refresh_after_edit(self, kind: str = "edit", dx: float = 0.0, dy: float = 0.0, dz: float = 0.0):
+        issues = DataValidator.validate_points(self.points) if self.points else {
+            "missing_values": [], "duplicate_coords": [], "duplicate_ids": [],
+            "coord_outliers": [], "elevation_outliers": [], "format_errors": [],
+        }
+        self._update_preview()
+        self._update_issues(issues)
+        self._update_stats()
+        if self.on_points_mutated:
+            self.on_points_mutated(kind, dx, dy, dz)
+
+    def add_survey_point(self, point: SurveyPoint) -> SurveyPoint:
+        append_survey_point(self.points, point)
+        self._refresh_after_edit("edit")
+        return point
+
+    def delete_survey_point_at(self, index: int) -> SurveyPoint:
+        removed = remove_survey_point_at(self.points, index)
+        self._refresh_after_edit("edit")
+        return removed
+
+    def update_survey_point_at(self, index: int, **changes) -> SurveyPoint:
+        updated = mutate_survey_point(self.points, index, **changes)
+        self._refresh_after_edit("edit")
+        return updated
+
+    def apply_coordinate_offset(self, dx: float, dy: float, dz: float) -> None:
+        if not self.points:
+            raise ValueError("没有可平移的测量点")
+        offset_survey_data(self.points, dx, dy, dz)
+        self._refresh_after_edit("offset", dx, dy, dz)
+
+    def _destroy_edit_entry(self):
+        if self._edit_entry is not None:
+            try:
+                self._edit_entry.destroy()
+            except tk.TclError:
+                pass
+            self._edit_entry = None
+
+    def _on_preview_double_click(self, event):
+        if self.tree_preview.identify("region", event.x, event.y) != "cell":
+            return
+        item = self.tree_preview.identify_row(event.y)
+        column = self.tree_preview.identify_column(event.x)
+        if not item or item == "info" or "info" in self.tree_preview.item(item, "tags"):
+            return
+        bbox = self.tree_preview.bbox(item, column)
+        if not bbox:
+            return
+        col_index = int(column.replace("#", "")) - 1
+        columns = list(self.tree_preview["columns"])
+        field = columns[col_index]
+        self._destroy_edit_entry()
+        x, y, width, height = bbox
+        entry = ttk.Entry(self.tree_preview)
+        entry.place(x=x, y=y, width=width, height=height)
+        entry.insert(0, self.tree_preview.set(item, field))
+        entry.select_range(0, tk.END)
+        entry.focus()
+        self._edit_entry = entry
+
+        def commit(_event=None):
+            if self._edit_entry is not entry:
+                return
+            text = entry.get().strip()
+            self._destroy_edit_entry()
+            try:
+                self._commit_cell_edit(int(item), field, text)
+            except (ValueError, IndexError) as error:
+                messagebox.showerror("错误", str(error))
+
+        def cancel(_event=None):
+            self._destroy_edit_entry()
+
+        entry.bind("<Return>", commit)
+        entry.bind("<FocusOut>", commit)
+        entry.bind("<Escape>", cancel)
+
+    def _commit_cell_edit(self, index: int, field: str, text: str):
+        if field == "点号":
+            self.update_survey_point_at(index, point_id=text)
+        elif field == "X坐标":
+            self.update_survey_point_at(index, x=float(text))
+        elif field == "Y坐标":
+            self.update_survey_point_at(index, y=float(text))
+        elif field == "实测高程":
+            self.update_survey_point_at(index, z=float(text))
+        elif field == "设计高程":
+            if text == "":
+                self.update_survey_point_at(index, clear_design_z=True)
+            else:
+                self.update_survey_point_at(index, design_z=float(text))
+
+    def _add_point_dialog(self):
+        if self.points:
+            last = self.points[-1]
+            default = SurveyPoint(id=f"P{len(self.points) + 1}", x=last.x, y=last.y, z=last.z)
+        else:
+            default = SurveyPoint(id="P1", x=0.0, y=0.0, z=0.0)
+        dialog = tk.Toplevel(self)
+        dialog.title("添加测点")
+        dialog.transient(self.winfo_toplevel())
+        values = {
+            "点号": tk.StringVar(value=default.id),
+            "X": tk.StringVar(value=str(default.x)),
+            "Y": tk.StringVar(value=str(default.y)),
+            "Z": tk.StringVar(value=str(default.z)),
+        }
+        for row, (label, var) in enumerate(values.items()):
+            ttk.Label(dialog, text=label).grid(row=row, column=0, padx=8, pady=4, sticky=tk.W)
+            ttk.Entry(dialog, textvariable=var, width=16).grid(row=row, column=1, padx=8, pady=4)
+
+        def save():
+            try:
+                self.add_survey_point(SurveyPoint(
+                    id=values["点号"].get().strip(),
+                    x=float(values["X"].get()),
+                    y=float(values["Y"].get()),
+                    z=float(values["Z"].get()),
+                ))
+                dialog.destroy()
+            except ValueError as error:
+                messagebox.showerror("错误", f"无法添加测点: {error}")
+
+        ttk.Button(dialog, text="确定", command=save, style="Accent.TButton").grid(
+            row=len(values), column=0, columnspan=2, pady=8
+        )
+
+    def _delete_selected(self):
+        selection = self.tree_preview.selection()
+        if not selection:
+            messagebox.showwarning("提示", "请先选中要删除的测点")
+            return
+        indexes = sorted(
+            (int(item) for item in selection if item != "info" and item.isdigit()),
+            reverse=True,
+        )
+        if not indexes:
+            return
+        for index in indexes:
+            remove_survey_point_at(self.points, index)
+        self._refresh_after_edit("edit")
+
+    def _focus_point_id(self):
+        target = self.find_id_var.get().strip()
+        if not target:
+            return
+        for index, point in enumerate(self.points):
+            if point.id == target:
+                iid = str(index)
+                if self.tree_preview.exists(iid):
+                    self.tree_preview.see(iid)
+                    self.tree_preview.selection_set(iid)
+                    self.tree_preview.focus(iid)
+                else:
+                    messagebox.showinfo("提示", f"已找到点 {target}（第 {index + 1} 行），当前表只显示前 2000 行，请用删除/修改接口或缩小数据后编辑")
+                return
+        messagebox.showwarning("提示", f"没有点号 {target}")
+
+    def _apply_offset_clicked(self):
+        try:
+            dx = float(self.dx_var.get() or 0)
+            dy = float(self.dy_var.get() or 0)
+            dz = float(self.dz_var.get() or 0)
+        except ValueError:
+            messagebox.showerror("错误", "平移量必须是数字")
+            return
+        if not self.points:
+            messagebox.showwarning("提示", "请先导入测量点")
+            return
+        self.apply_coordinate_offset(dx, dy, dz)
+        messagebox.showinfo("成功", f"已平移 ΔX={dx}  ΔY={dy}  ΔZ={dz}")
                 
     def _update_issues(self, issues: dict):
         """更新检查结果"""
@@ -245,7 +448,7 @@ class DataImportFrame(ttk.Frame):
                 
         if total == 0:
             self.tree_issues.insert('', 'end', values=('✓ 通过', '未发现异常数据'), tags=('ok',))
-        self.tree_issues.tag_configure('ok', foreground='green')
+        self.tree_issues.tag_configure('ok', foreground=COLORS['fill'])
         
     def _update_stats(self):
         if self.points:
@@ -257,6 +460,11 @@ class DataImportFrame(ttk.Frame):
                 f"X范围: {min(xs):.2f}~{max(xs):.2f}  |  "
                 f"Y范围: {min(ys):.2f}~{max(ys):.2f}  |  "
                 f"高程: {min(zs):.2f}~{max(zs):.2f}"
+                + (
+                    f"  |  设计高程: {min(designs):.2f}~{max(designs):.2f}"
+                    if (designs := [p.design_z for p in self.points if p.has_design_z])
+                    else ""
+                )
             )
         else:
             self.stats_var.set("无数据")

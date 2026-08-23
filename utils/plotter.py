@@ -9,50 +9,31 @@ from matplotlib.collections import PatchCollection, LineCollection
 import numpy as np
 from typing import List, Tuple, Optional, Callable
 from core.calculator import SurveyPoint, Triangle, CalculationResult
+from gui.theme import COLORS, PLOT_COLORS
 
 # 设置中文字体
 import matplotlib.font_manager as fm
 import platform
-import os
 
 def setup_chinese_font():
-    """配置 matplotlib 中文字体"""
-    system = platform.system()
-    if system == 'Darwin':  # macOS
-        font_paths = [
-            '/System/Library/Fonts/Hiragino Sans GB.ttc',
-            '/System/Library/Fonts/PingFang.ttc',
-            '/System/Library/Fonts/STHeiti Light.ttc',
-            '/Library/Fonts/Arial Unicode MS.ttf',
-        ]
-        for font_path in font_paths:
-            if os.path.exists(font_path):
-                try:
-                    fm.fontManager.addfont(font_path)
-                    prop = fm.FontProperties(fname=font_path)
-                    plt.rcParams['font.family'] = prop.get_name()
-                    plt.rcParams['axes.unicode_minus'] = False
-                    return
-                except:
-                    continue
-    elif system == 'Windows':
-        for font in ['Microsoft YaHei', 'SimHei', 'SimSun']:
-            try:
-                plt.rcParams['font.family'] = font
-                plt.rcParams['axes.unicode_minus'] = False
-                return
-            except:
-                continue
-    else:  # Linux
-        for font in ['Noto Sans CJK SC', 'WenQuanYi Micro Hei', 'Droid Sans Fallback']:
-            try:
-                plt.rcParams['font.family'] = font
-                plt.rcParams['axes.unicode_minus'] = False
-                return
-            except:
-                continue
-    # 兜底
+    """配置中文 UI 字体，并保留拉丁字体以渲染 m²/m³ 上标。"""
     plt.rcParams['axes.unicode_minus'] = False
+    system = platform.system()
+    if system == 'Darwin':
+        preferred = ['PingFang SC', 'Hiragino Sans GB', 'Heiti SC', 'Songti SC']
+    elif system == 'Windows':
+        preferred = ['Microsoft YaHei', 'SimHei', 'SimSun']
+    else:
+        preferred = ['Noto Sans CJK SC', 'WenQuanYi Micro Hei', 'Droid Sans Fallback']
+
+    available = {font.name for font in fm.fontManager.ttflist}
+    chosen = [name for name in preferred if name in available]
+    for latin in ('Arial Unicode MS', 'DejaVu Sans', 'Arial'):
+        if latin in available and latin not in chosen:
+            chosen.append(latin)
+            break
+    if chosen:
+        plt.rcParams['font.family'] = chosen
 
 setup_chinese_font()
 
@@ -62,7 +43,7 @@ class EarthworkPlotter:
     
     def __init__(self, figsize=(10, 8), dpi=100):
         # constrained_layout 替代每次手动调用 tight_layout()，性能更好
-        self.fig = Figure(figsize=figsize, dpi=dpi, constrained_layout=True)
+        self.fig = Figure(figsize=figsize, dpi=dpi, constrained_layout=True, facecolor=COLORS["sheet"])
         self.ax = self.fig.add_subplot(111)
         self.canvas = None
         self.toolbar = None
@@ -83,22 +64,16 @@ class EarthworkPlotter:
         self._artist_scatter: Optional[object] = None
         self._artist_boundary: Optional[object] = None
 
-        # 颜色配置
-        self.colors = {
-            'cut': '#FF6B6B',      # 挖方 - 红色系
-            'fill': '#4ECDC4',     # 填方 - 青色系
-            'zero': '#FFD93D',     # 零填挖线 - 黄色
-            'boundary': '#2C3E50', # 边界 - 深蓝灰
-            'tin': '#BDC3C7',      # TIN网 - 浅灰
-            'points': '#34495E',   # 测量点 - 深灰
-            'selected': '#E74C3C', # 选中 - 亮红
-            'text_bg': '#ECF0F1'   # 文字背景
-        }
+        # 颜色配置（与 GUI 主题共用挖填配色）
+        self.colors = dict(PLOT_COLORS)
+        self._style_axes()
         
     def bind_canvas(self, canvas: FigureCanvasTkAgg, toolbar_frame=None, enable_hover=True):
         """绑定画布和工具栏"""
         self.canvas = canvas
         self._last_hover_time: float = 0.0
+        widget = canvas.get_tk_widget()
+        widget.configure(background=COLORS["sheet"], highlightthickness=0)
         if toolbar_frame:
             self.toolbar = NavigationToolbar2Tk(canvas, toolbar_frame)
             self.toolbar.update()
@@ -170,6 +145,17 @@ class EarthworkPlotter:
         c = 1 - a - b
         
         return 0 <= a <= 1 and 0 <= b <= 1 and 0 <= c <= 1
+
+    def _style_axes(self):
+        """Apply survey-drawing paper colors after ax.clear()."""
+        self.fig.patch.set_facecolor(COLORS["sheet"])
+        self.ax.set_facecolor(COLORS["sheet"])
+        self.ax.tick_params(colors=COLORS["ink"], labelsize=9)
+        self.ax.xaxis.label.set_color(COLORS["ink"])
+        self.ax.yaxis.label.set_color(COLORS["ink"])
+        self.ax.title.set_color(COLORS["ink"])
+        for spine in self.ax.spines.values():
+            spine.set_edgecolor(COLORS["rule"])
     
     def _remove_colorbar(self):
         """在重建坐标轴前移除旧颜色条，避免重复创建额外坐标轴。"""
@@ -236,6 +222,7 @@ class EarthworkPlotter:
         # -------- 全量重建路径 --------
         self._remove_colorbar()
         self.ax.clear()
+        self._style_axes()
         self._current_result = result
         self._cached_points_id = id(points)
         self._artist_cut = None
@@ -387,16 +374,21 @@ class EarthworkPlotter:
         cy = np.mean(verts[:, 1])
         info = f"Δ{tri.id}\n面积:{tri.area:.1f}m²\n挖:{tri.cut_volume:.1f} 填:{tri.fill_volume:.1f}"
         self.ax.annotate(info, (cx, cy), fontsize=8, 
-                        bbox=dict(boxstyle='round,pad=0.3', facecolor='yellow', alpha=0.9, edgecolor='red'),
-                        ha='center', va='center', zorder=11)
+                        bbox=dict(boxstyle='round,pad=0.3', facecolor=COLORS["zero"],
+                                  alpha=0.9, edgecolor=self.colors['selected']),
+                        ha='center', va='center', zorder=11, color=COLORS["white"])
         
     def plot_points_only(self, points: List[SurveyPoint]):
         """仅绘制测量点 (用于数据导入预览)"""
         self._remove_colorbar()
         self.ax.clear()
+        self._style_axes()
         self._invalidate_result_cache()
         if not points:
-            self.ax.text(0.5, 0.5, '无数据', ha='center', va='center', transform=self.ax.transAxes)
+            self.ax.text(0.5, 0.5, '无数据', ha='center', va='center',
+                         transform=self.ax.transAxes, color=COLORS["dim"])
+            if self.canvas:
+                self.canvas.draw_idle()
             return
             
         xs = [p.x for p in points]
@@ -426,24 +418,37 @@ class EarthworkPlotter:
         """边界编辑模式绘制"""
         self._remove_colorbar()
         self.ax.clear()
+        self._style_axes()
         self._invalidate_result_cache()
         self._boundary_preview_artists = None
         if points:
             xs = [p.x for p in points]
             ys = [p.y for p in points]
-            self.ax.scatter(xs, ys, c='gray', s=10, alpha=0.5)
+            self.ax.scatter(xs, ys, c=self.colors['points'], s=10, alpha=0.45)
             
         # 绘制边界
         if boundary:
             bx = [p[0] for p in boundary]
             by = [p[1] for p in boundary]
-            self.ax.plot(bx, by, 'b-o', linewidth=2, markersize=6, label='边界')
+            self.ax.plot(
+                bx, by,
+                color=self.colors['boundary'],
+                marker='o',
+                linewidth=2,
+                markersize=6,
+                label='边界',
+            )
             
             # 闭合预览线
             if len(boundary) >= 2:
-                self.ax.plot([boundary[-1][0], boundary[0][0]], 
-                           [boundary[-1][1], boundary[0][1]], 
-                           'b--', linewidth=1, alpha=0.5)
+                self.ax.plot(
+                    [boundary[-1][0], boundary[0][0]],
+                    [boundary[-1][1], boundary[0][1]],
+                    color=self.colors['boundary'],
+                    linestyle='--',
+                    linewidth=1,
+                    alpha=0.5,
+                )
                            
         # 当前正在添加的点由可复用 artist 绘制，避免鼠标移动时不断创建新对象。
                            
@@ -462,8 +467,21 @@ class EarthworkPlotter:
             self.canvas.draw_idle()
 
     def _create_boundary_preview_artists(self):
-        marker, = self.ax.plot([], [], 'ro', markersize=8, visible=False)
-        guide, = self.ax.plot([], [], 'r--', linewidth=1, visible=False)
+        marker, = self.ax.plot(
+            [], [],
+            color=self.colors['cut'],
+            marker='o',
+            markersize=8,
+            linestyle='None',
+            visible=False,
+        )
+        guide, = self.ax.plot(
+            [], [],
+            color=self.colors['cut'],
+            linestyle='--',
+            linewidth=1,
+            visible=False,
+        )
         return marker, guide
 
     def update_boundary_preview(self, boundary, current_point):
@@ -498,6 +516,7 @@ class EarthworkPlotter:
         """清空绘图"""
         self._remove_colorbar()
         self.ax.clear()
+        self._style_axes()
         self._invalidate_result_cache()
         self.selected_triangle = None
         self._boundary_preview_artists = None
@@ -512,11 +531,10 @@ def create_standalone_figure(result: CalculationResult,
                              project_name: str) -> Figure:
     """创建独立的 matplotlib 图形用于导出高清图片"""
     fig, ax = plt.subplots(figsize=(12, 10), dpi=150)
+    fig.patch.set_facecolor(COLORS["sheet"])
+    ax.set_facecolor(COLORS["sheet"])
     
-    colors = {
-        'cut': '#FF6B6B', 'fill': '#4ECDC4', 'zero': '#FFD93D',
-        'boundary': '#2C3E50', 'tin': '#BDC3C7', 'points': '#34495E'
-    }
+    colors = dict(PLOT_COLORS)
     
     # 绘制挖填分色
     cut_patches, fill_patches = [], []
