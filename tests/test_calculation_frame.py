@@ -38,3 +38,11 @@ def test_worker_events_are_ignored_while_closing():
     assert frame._worker_poll_after_id is None
     assert frame._worker_events.qsize() == 1
     frame._on_calculation_done.assert_not_called()
+
+
+def test_parse_partition_text_reports_bad_lines():
+    from gui.calculation_frame import parse_partition_text
+
+    data, bad = parse_partition_text("A,15.3\nB，14.8\nC\t15\n\nD,abc\nE,1,2\n")
+    assert data == {"A": 15.3, "B": 14.8, "C": 15.0}
+    assert bad == ["D,abc", "E,1,2"]

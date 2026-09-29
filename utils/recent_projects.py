@@ -4,6 +4,8 @@ import os
 from pathlib import Path
 from typing import List
 
+from utils.fileio import atomic_write_text
+
 MAX_RECENT = 10
 
 
@@ -32,9 +34,7 @@ def remember_recent(filepath: str, limit: int = MAX_RECENT) -> List[str]:
     items = [path for path in load_recent() if path != resolved]
     items.insert(0, resolved)
     items = items[:limit]
-    target = recent_file()
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8")
+    atomic_write_text(recent_file(), json.dumps(items, ensure_ascii=False, indent=2))
     return items
 
 
@@ -45,7 +45,5 @@ def forget_recent(filepath: str) -> List[str]:
     except OSError:
         pass
     items = [path for path in load_recent() if path not in candidates]
-    target = recent_file()
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8")
+    atomic_write_text(recent_file(), json.dumps(items, ensure_ascii=False, indent=2))
     return items

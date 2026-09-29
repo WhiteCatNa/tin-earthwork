@@ -255,7 +255,7 @@ flowchart TB
 
   subgraph 验证 [" "]
     direction LR
-    T1["① 单元测试<br/>pytest tests/ -v"]
+    T1["① 单元测试<br/>pytest"]
     T2["② 端到端全流程<br/>run_full_test.py"]
     T3["③ GUI 点击压测<br/>tests/gui_stress_test.py"]
   end
@@ -289,8 +289,8 @@ source .venv/bin/activate</code>
       </div>
       <div class="cmd lane-test">
         <span class="label">① 单元测试</span>
-        <code>python -m pytest tests/ -v</code>
-        <span class="out">覆盖 calculator / data_handler / plotter / boundary / calculation_frame</span>
+        <code>python -m pytest</code>
+        <span class="out">覆盖 calculator / geometry / data_handler / plotter / 界面流程</span>
       </div>
       <div class="cmd lane-e2e">
         <span class="label">② 端到端全流程（无需界面）</span>
@@ -320,7 +320,7 @@ source .venv/bin/activate</code>
 flowchart TB
   subgraph P1 ["① 数据导入与检查"]
     direction TB
-    A1["浏览并选择<br/>xlsx / csv / txt"] --> A2["自动识别列映射<br/>点号 · X · Y · 高程"]
+    A1["浏览并选择<br/>xlsx / csv / txt / dat"] --> A2["自动识别列映射<br/>可双击改选"]
     A2 --> A3["质量检查<br/>缺失 · 重复 · 3σ 离群"]
     A3 --> A4{"数据无误？"}
     A4 -->|需改映射| A2
@@ -333,7 +333,7 @@ flowchart TB
     B1["三种取边界方式"]
     B1 --> B2["自动生成数据范围"]
     B1 --> B3["画布左键逐点点选<br/>自动吸附最近测点"]
-    B1 --> B4["导入 CSV / TXT"]
+    B1 --> B4["导入 DXF / CSV / TXT"]
     B2 --> B5{"≥3 点<br/>不重复 · 不自交？"}
     B3 --> B5
     B4 --> B5
@@ -346,9 +346,9 @@ flowchart TB
   subgraph P3 ["③ 计算设置与结果"]
     direction TB
     C1["设计高程<br/>统一值 或 分区值"] --> C2["开始计算<br/>后台线程 + 队列轮询"]
-    C2 --> C3["Delaunay 建 TIN<br/>混合三角形按零填挖线分割"]
+    C2 --> C3["Delaunay 建 TIN<br/>按边界精确裁剪 · 零填挖线分割"]
     C3 --> C4["结果四页<br/>图 · 汇总 · 明细 · 三角形详情"]
-    C4 --> C5["导出<br/>Excel · CSV · PNG · TXT"]
+    C4 --> C5["后台导出<br/>Excel · CSV · DXF · PDF · 图片 · TXT"]
   end
 
   C4 -.->|"回到 ② 改边界<br/>旧结果作废，须重算"| B1

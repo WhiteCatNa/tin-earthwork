@@ -267,6 +267,7 @@ def run(point_count):
         filedialog.asksaveasfilename = lambda *a, **k: target
         with timed(label, 20.0):
             method()
+            wait_for(app, lambda: cf._export_thread is None, timeout=60)
             pump(app, 0.05)
         if not os.path.exists(target):
             ERRORS.append((label, f"导出后文件不存在: {target}"))

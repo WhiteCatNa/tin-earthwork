@@ -7,6 +7,7 @@ from typing import List, Tuple, Callable, Optional
 from utils.plotter import EarthworkPlotter
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from core.calculator import SurveyPoint
+from core.geometry import ring_self_intersects
 import numpy as np
 
 
@@ -158,25 +159,36 @@ class BoundaryFrame(ttk.Frame):
             return False
         if len(set(self.boundary)) != len(self.boundary):
             return False
-        return not self._has_self_intersection()
+        return not ring_self_intersects(self.boundary)
 
-    def _has_self_intersection(self) -> bool:
-        segments = list(zip(self.boundary, self.boundary[1:] + self.boundary[:1]))
-        for index, (start_a, end_a) in enumerate(segments):
-            for other_index, (start_b, end_b) in enumerate(segments[index + 1:], index + 1):
-                if abs(index - other_index) <= 1 or {index, other_index} == {0, len(segments) - 1}:
-                    continue
-                if self._segments_intersect(start_a, end_a, start_b, end_b):
-                    return True
-        return False
+    def _overlaps_points(self) -> bool:
+        """边界外包矩形是否与测点范围重叠。"""
+        if not self.points or not self.boundary:
+            return True
+        xs = [point.x for point in self.points]
+        ys = [point.y for point in self.points]
+        bxs = [x for x, _ in self.boundary]
+        bys = [y for _, y in self.boundary]
+        return not (max(bxs) < min(xs) or min(bxs) > max(xs) or max(bys) < min(ys) or min(bys) > max(ys))
 
-    @staticmethod
-    def _segments_intersect(a, b, c, d) -> bool:
-        def orientation(p, q, r):
-            value = (q[0] - p[0]) * (r[1] - p[1]) - (q[1] - p[1]) * (r[0] - p[0])
-            # 显式转 int，避免 numpy float64/bool_ 做减法时抛 TypeError
-            return int(value > 0) - int(value < 0)
-        return orientation(a, b, c) * orientation(a, b, d) < 0 and orientation(c, d, a) * orientation(c, d, b) < 0
+    def set_points(self, points: List[SurveyPoint]):
+        """更新测点（使吸附坐标缓存失效）并重绘。"""
+        self.points = points
+        self._point_xy = None
+        try:
+            self._refresh_plot()
+        except tk.TclError:
+            pass
+
+    def transform_boundary(self, func: Callable[[float, float], Tuple[float, float]]):
+        """对边界每个顶点做同一变换（平移、X/Y 互换）。"""
+        self.boundary = [func(x, y) for x, y in self.boundary]
+        self.current_point = None
+        self._update_boundary_list()
+        try:
+            self._refresh_plot()
+        except tk.TclError:
+            pass
 
     def shutdown(self):
         """断开画布事件并释放嵌入式绘图资源。"""
@@ -235,7 +247,13 @@ class BoundaryFrame(ttk.Frame):
                 if df.shape[1] < 2:
                     messagebox.showwarning("提示", "文件列数不足，需要至少X、Y两列")
                     return
-                self.boundary = [(float(row[0]), float(row[1])) for _, row in df.iterrows()]
+                boundary = []
+                for _, row in df.iterrows():
+                    try:
+                        boundary.append((float(row[0]), float(row[1])))
+                    except (TypeError, ValueError):
+                        continue  # 表头或说明行
+                self.boundary = boundary
             if len(self.boundary) < 3:
                 messagebox.showwarning("提示", "边界至少需要 3 个点")
                 return
@@ -265,12 +283,19 @@ class BoundaryFrame(ttk.Frame):
         if not self._boundary_is_valid():
             messagebox.showwarning("提示", "边界至少需要 3 个不重复点，且边线不能交叉。可使用“撤销上一点”修正。")
             return
+        if not self._overlaps_points() and not messagebox.askokcancel(
+            "边界与测点不重叠",
+            "计算边界与测点范围完全不重叠，计算结果将为 0。\n"
+            "常见原因是测点的 X/Y 与图纸方向相反（测量坐标 X 为北向），"
+            "可在数据导入页点击“X/Y 互换”。\n\n仍要使用这个边界吗？",
+        ):
+            return
         self._update_boundary_list()
-        self.on_boundary_set(self.boundary)
+        self.on_boundary_set(list(self.boundary))
         messagebox.showinfo("成功", f"边界已设置，共 {len(self.boundary)} 个点")
-        
+
     def set_boundary(self, boundary: List[Tuple[float, float]]):
         """外部设置边界"""
-        self.boundary = boundary
+        self.boundary = list(boundary)
         self._refresh_plot()
         self._update_boundary_list()

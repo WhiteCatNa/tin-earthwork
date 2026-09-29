@@ -4,20 +4,24 @@
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from typing import List, Callable, Optional, Dict, Tuple
-from core.calculator import SurveyPoint, CalculationResult, TINEarthworkCalculator
-from utils.plotter import EarthworkPlotter
+from core.calculator import SurveyPoint, CalculationResult, TINEarthworkCalculator, format_id_list
+from utils.plotter import EarthworkPlotter, create_standalone_figure
 from utils.data_handler import DataExporter
 from gui.theme import COLORS, style_text_widget
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import threading
 import queue
 
+DEFAULT_PROJECT_NAME = "TIN土方计算项目"
+
 
 class CalculationFrame(ttk.Frame):
     """计算设置与结果页面"""
     
-    def __init__(self, parent, points: List[SurveyPoint], boundary: List[Tuple[float, float]]):
+    def __init__(self, parent, points: List[SurveyPoint], boundary: List[Tuple[float, float]],
+                 project_name_getter: Optional[Callable[[], str]] = None):
         super().__init__(parent)
+        self.project_name_getter = project_name_getter
         self.points = points
         self.boundary = boundary
         self.calculator = TINEarthworkCalculator()
@@ -38,9 +42,49 @@ class CalculationFrame(ttk.Frame):
         self._worker_events = queue.Queue()
         self._worker_thread = None
         self._worker_poll_after_id = None
+        self._export_events = queue.Queue()
+        self._export_thread = None
+        self._export_poll_after_id = None
+        self._export_buttons: List[ttk.Button] = []
         self._closing = False
 
         self._create_widgets()
+
+    def _project_name(self) -> str:
+        name = self.project_name_getter() if self.project_name_getter else ""
+        return (name or "").strip() or DEFAULT_PROJECT_NAME
+
+    def design_elevation_value(self) -> float:
+        """读取统一设计高程；输入框不是数字时给出明确提示。"""
+        try:
+            return float(self.design_elevation_var.get())
+        except (tk.TclError, ValueError):
+            raise ValueError("统一设计高程必须是数字") from None
+
+    def update_inputs(self, points: List[SurveyPoint], boundary: List[Tuple[float, float]]):
+        """测点或边界变化后调用：同步计算器并作废旧结果。"""
+        self.points = points
+        self.boundary = boundary
+        self.calculator.add_points(points)
+        self.calculator.set_boundary(boundary)
+        self.result = None
+        self._refresh_plot()
+
+    def apply_design_settings(self, design_elevation: float, use_partition: bool, partition: Dict[str, float]):
+        """恢复工程文件中的设计高程设置。"""
+        self.design_elevation_var.set(design_elevation)
+        self.use_partition_var.set(bool(use_partition))
+        self.partition_data = dict(partition or {})
+        self._toggle_partition()
+        if self.use_partition_var.get() and self.partition_data:
+            self.calculator.set_design_elevations(self.partition_data, default=design_elevation)
+            self.partition_label.config(
+                text=f"已设置 {len(self.partition_data)} 个分区高程", foreground=COLORS["ink"]
+            )
+        else:
+            self.calculator.set_design_elevation(design_elevation)
+        self.result = None
+        self._refresh_plot()
         
     def _create_widgets(self):
         # 左侧：设置面板
@@ -142,12 +186,17 @@ class CalculationFrame(ttk.Frame):
         # 底部导出按钮
         export_frame = ttk.Frame(right_frame)
         export_frame.pack(fill=tk.X, pady=(8, 0))
-        ttk.Button(export_frame, text="导出 Excel 报告", command=self._export_excel).pack(side=tk.LEFT, padx=(0, 6))
-        ttk.Button(export_frame, text="导出 CSV 明细", command=self._export_csv).pack(side=tk.LEFT, padx=6)
-        ttk.Button(export_frame, text="导出 DXF", command=self._export_dxf).pack(side=tk.LEFT, padx=6)
-        ttk.Button(export_frame, text="导出 PDF 计算书", command=self._export_pdf).pack(side=tk.LEFT, padx=6)
-        ttk.Button(export_frame, text="导出高清图片", command=self._export_image).pack(side=tk.LEFT, padx=6)
-        ttk.Button(export_frame, text="生成文本报告", command=self._export_text).pack(side=tk.LEFT, padx=6)
+        for index, (text, command) in enumerate((
+            ("导出 Excel 报告", self._export_excel),
+            ("导出 CSV 明细", self._export_csv),
+            ("导出 DXF", self._export_dxf),
+            ("导出 PDF 计算书", self._export_pdf),
+            ("导出高清图片", self._export_image),
+            ("生成文本报告", self._export_text),
+        )):
+            button = ttk.Button(export_frame, text=text, command=command)
+            button.pack(side=tk.LEFT, padx=(0, 6) if index == 0 else 6)
+            self._export_buttons.append(button)
         
     def _create_summary_table(self):
         """创建汇总表"""
@@ -160,7 +209,7 @@ class CalculationFrame(ttk.Frame):
         
     def _create_detail_table(self):
         """创建明细表"""
-        columns = ('三角形', '顶点1', '顶点2', '顶点3', '面积(m²)', '平均高差(m)', 
+        columns = ('三角形', '顶点1', '顶点2', '顶点3', '边界内面积(m²)', '平均高差(m)',
                   '挖方量(m³)', '填方量(m³)', '净体积(m³)', '类型')
         self.tree_detail = ttk.Treeview(self.detail_frame, columns=columns, show='headings', height=20)
         for col in columns:
@@ -225,16 +274,20 @@ class CalculationFrame(ttk.Frame):
             text.insert('end', f"{pid},{elev}\n")
             
         def save():
-            self.partition_data = {}
-            content = text.get('1.0', 'end-1c')
-            for line in content.strip().split('\n'):
-                if line.strip():
-                    parts = line.split(',')
-                    if len(parts) == 2:
-                        try:
-                            self.partition_data[parts[0].strip()] = float(parts[1].strip())
-                        except ValueError:
-                            pass
+            data, bad_lines = parse_partition_text(text.get('1.0', 'end-1c'))
+            known_ids = {point.id for point in self.points}
+            unknown = [pid for pid in data if pid not in known_ids]
+            problems = []
+            if bad_lines:
+                problems.append("以下行格式不对（应为 点号,高程），将被忽略：\n" + "\n".join(bad_lines[:10]))
+            if unknown:
+                problems.append("以下点号在测点表中不存在：" + "、".join(unknown[:10])
+                                + (f" 等共 {len(unknown)} 个" if len(unknown) > 10 else ""))
+            if problems and not messagebox.askokcancel(
+                "请核对分区高程", "\n\n".join(problems) + "\n\n仍要保存吗？", parent=dialog
+            ):
+                return
+            self.partition_data = data
             self.partition_label.config(text=f"已设置 {len(self.partition_data)} 个分区高程", foreground=COLORS["ink"])
             dialog.destroy()
             
@@ -249,7 +302,11 @@ class CalculationFrame(ttk.Frame):
         # Tkinter 控件只能由主线程访问；在线程启动前读取所需配置。
         use_partition = self.use_partition_var.get()
         partition_data = self.partition_data.copy()
-        design_elevation = self.design_elevation_var.get()
+        try:
+            design_elevation = self.design_elevation_value()
+        except ValueError as error:
+            messagebox.showerror("输入错误", str(error))
+            return
 
         self.status_var.set("正在计算...")
         self.progress_var.set(0)
@@ -259,12 +316,20 @@ class CalculationFrame(ttk.Frame):
         def calc_thread():
             try:
                 if use_partition and partition_data:
-                    self.calculator.set_design_elevations(partition_data)
+                    # 未列入分区的点使用界面上的统一设计高程
+                    self.calculator.set_design_elevations(partition_data, default=design_elevation)
                 else:
                     self.calculator.set_design_elevation(design_elevation)
 
                 self._worker_events.put(("progress", 30, "构建 TIN 三角网..."))
                 result = self.calculator.run_full_calculation()
+                if use_partition and partition_data:
+                    unlisted = [str(p.id) for p in self.calculator.points if p.id not in partition_data]
+                    if unlisted:
+                        result.warnings.insert(0, (
+                            f"有 {len(unlisted)} 个测点不在分区高程表中，按统一设计高程 "
+                            f"{design_elevation:.3f} m 计算：{format_id_list(unlisted)}"
+                        ))
                 self._worker_events.put(("progress", 90, "更新显示..."))
                 self._worker_events.put(("done", result))
             except Exception as error:
@@ -321,14 +386,22 @@ class CalculationFrame(ttk.Frame):
         self._refresh_plot()
         self._update_summary_table()
         self._start_detail_table_load()
-        messagebox.showinfo(
-            "计算完成",
+        summary = (
             f"总挖方量: {self.result.total_cut:.2f} m³\n"
             f"总填方量: {self.result.total_fill:.2f} m³\n"
             f"挖填差值: {self.result.net_volume:.2f} m³\n"
+            f"计算面积: {self.result.computed_area:.2f} m²\n"
             f"三角形数: {self.result.triangle_count}\n"
             f"混合三角形: {self.result.mixed_triangle_count}"
         )
+        if self.result.warnings:
+            self.status_var.set("计算完成（有提示，请查看）")
+            messagebox.showwarning(
+                "计算完成，请注意",
+                summary + "\n\n" + "\n\n".join(f"· {item}" for item in self.result.warnings),
+            )
+        else:
+            messagebox.showinfo("计算完成", summary)
             
     def _on_calculation_error(self, error):
         self.status_var.set("计算失败")
@@ -354,20 +427,11 @@ class CalculationFrame(ttk.Frame):
             return
 
         self.tree_summary.delete(*self.tree_summary.get_children())
-        design_elev = self.design_elevation_var.get()
-        if self.use_partition_var.get():
-            design_elev = "分区高程"
-        summary_data = [
-            ('总挖方量', f"{self.result.total_cut:.3f}", 'm³', '实测高程高于设计高程'),
-            ('总填方量', f"{self.result.total_fill:.3f}", 'm³', '实测高程低于设计高程'),
-            ('挖填差值', f"{self.result.net_volume:.3f}", 'm³', '正值需外运，负值需借方'),
-            ('三角形总数', str(self.result.triangle_count), '个', ''),
-            ('混合三角形', str(self.result.mixed_triangle_count), '个', '跨越零填挖线'),
-            ('设计高程', str(design_elev), 'm', ''),
-            ('计算边界点数', str(len(self.boundary)), '个', ''),
-        ]
-        for row in summary_data:
+        for row in DataExporter.summary_rows(self.result):
             self.tree_summary.insert('', 'end', values=row)
+        for item in self.result.warnings:
+            self.tree_summary.insert('', 'end', values=('提示', '', '', item), tags=('warn',))
+        self.tree_summary.tag_configure('warn', foreground=COLORS["cut"])
 
     def _start_detail_table_load(self):
         """分批写入明细，避免大量 Treeview 行阻塞主界面。"""
@@ -390,6 +454,8 @@ class CalculationFrame(ttk.Frame):
         for tri in self._detail_rows[start:end]:
             p0, p1, p2 = tri.vertex_points
             tri_type = "混合" if tri.is_mixed else ("挖方" if tri.volume > 0 else "填方")
+            if tri.is_clipped:
+                tri_type += "（边界裁剪）"
             self.tree_detail.insert('', 'end', values=(
                 tri.id,
                 f"{p0.id}({p0.delta_z:+.3f})",
@@ -407,11 +473,6 @@ class CalculationFrame(ttk.Frame):
         else:
             self._detail_load_after_id = None
 
-    def _update_tables(self):
-        """兼容旧调用：更新汇总并启动分批明细加载。"""
-        self._update_summary_table()
-        self._start_detail_table_load()
-
     def _on_triangle_selected(self, tri):
         """三角形被点击时显示详情"""
         self.notebook.select(self.info_frame)
@@ -422,9 +483,9 @@ class CalculationFrame(ttk.Frame):
         info = f"""三角形详细信息
 {'='*50}
 三角形编号: {tri.id}
-是否边界外: {'是' if tri.is_boundary else '否'}
+是否被边界裁剪: {'是（只计边界内部分）' if tri.is_clipped else '否'}
 是否混合挖填: {'是' if tri.is_mixed else '否'}
-水平投影面积: {tri.area:.3f} m²
+边界内水平面积: {tri.area:.3f} m²
 
 顶点信息:
   顶点1: {p0.id}  X={p0.x:.3f}  Y={p0.y:.3f}  实测={p0.z:.3f}  设计={p0.design_z:.3f}  高差={p0.delta_z:+.3f}
@@ -438,13 +499,12 @@ class CalculationFrame(ttk.Frame):
   净体积: {tri.volume:.3f} m³
 """
         if tri.is_mixed:
-            info += f"\n混合三角形分割详情 (共 {len(tri.sub_triangles)} 个子三角形):\n"
-            for i, sub in enumerate(tri.sub_triangles):
-                if sub.vertex_points:
-                    avg_dz = sum(p.delta_z for p in sub.vertex_points) / 3
-                    info += f"  子三角形{i+1}: 面积={sub.area:.3f}  平均高差={avg_dz:.3f}  "
-                    info += f"挖={sub.cut_volume:.3f}  填={sub.fill_volume:.3f}\n"
-                    
+            info += (
+                "\n按零填挖线分割:\n"
+                f"  挖方部分: 面积={tri.cut_area:.3f} m²  体积={tri.cut_volume:.3f} m³\n"
+                f"  填方部分: 面积={tri.fill_area:.3f} m²  体积={tri.fill_volume:.3f} m³\n"
+            )
+
         self.info_text.insert('1.0', info)
         self.info_text.config(state=tk.DISABLED)
         
@@ -455,7 +515,7 @@ class CalculationFrame(ttk.Frame):
         self._closing = True
         self._detail_load_token += 1
 
-        for attr_name in ("_worker_poll_after_id", "_detail_load_after_id"):
+        for attr_name in ("_worker_poll_after_id", "_detail_load_after_id", "_export_poll_after_id"):
             after_id = getattr(self, attr_name, None)
             if after_id is not None:
                 try:
@@ -472,130 +532,152 @@ class CalculationFrame(ttk.Frame):
             except tk.TclError:
                 pass
 
+    # ------------------------------------------------------------------
+    # 导出（后台线程执行，避免大数据量时界面无响应）
+    # ------------------------------------------------------------------
+
+    def _ask_export_path(self, title: str, extension: str, filetypes) -> Optional[str]:
+        if not self.result:
+            messagebox.showwarning("提示", "请先进行计算")
+            return None
+        if self._export_thread is not None:
+            messagebox.showinfo("提示", "上一个导出任务还在进行，请稍候")
+            return None
+        return filedialog.asksaveasfilename(
+            title=title, defaultextension=extension, filetypes=filetypes,
+            initialfile=f"{self._project_name()}{extension}",
+        ) or None
+
+    def _run_export(self, label: str, work: Callable[[], None], success: str):
+        """在后台线程执行导出，完成后在主线程提示结果。"""
+        for button in self._export_buttons:
+            button.config(state=tk.DISABLED)
+        self.status_var.set(f"正在{label}...")
+        events = queue.Queue()
+        self._export_events = events
+
+        def worker():
+            try:
+                work()
+                events.put(("done", success))
+            except Exception as error:  # 把具体原因带回界面
+                hint = "\n文件可能正被 Excel 等程序打开，请关闭后重试。" if isinstance(error, PermissionError) else ""
+                events.put(("error", f"{label}失败: {error}{hint}"))
+
+        self._export_thread = threading.Thread(target=worker, daemon=True)
+        self._export_thread.start()
+        self._schedule_export_poll()
+
+    def _schedule_export_poll(self):
+        if self._closing or self._export_poll_after_id is not None:
+            return
+        self._export_poll_after_id = self.after(50, self._poll_export_events)
+
+    def _poll_export_events(self):
+        self._export_poll_after_id = None
+        if self._closing:
+            return
+        try:
+            kind, message = self._export_events.get_nowait()
+        except queue.Empty:
+            self._schedule_export_poll()
+            return
+        self._export_thread = None
+        for button in self._export_buttons:
+            button.config(state=tk.NORMAL)
+        if kind == "done":
+            self.status_var.set(message)
+            messagebox.showinfo("成功", message)
+        else:
+            self.status_var.set("导出失败")
+            messagebox.showerror("错误", message)
+
     def _export_excel(self):
-        if not self.result:
-            messagebox.showwarning("提示", "请先进行计算")
-            return
-            
-        filepath = filedialog.asksaveasfilename(
-            title="导出 Excel 报告",
-            defaultextension=".xlsx",
-            filetypes=[("Excel文件", "*.xlsx")]
-        )
+        filepath = self._ask_export_path("导出 Excel 报告", ".xlsx", [("Excel文件", "*.xlsx")])
         if not filepath:
             return
-            
-        exporter = DataExporter("TIN土方计算项目")
-        design_elev = self.design_elevation_var.get()
-        if exporter.export_summary_excel(self.result, design_elev, filepath):
-            messagebox.showinfo("成功", "Excel 报告导出成功")
-        else:
-            messagebox.showerror("错误", "导出失败")
-            
+        exporter = DataExporter(self._project_name())
+        result, points = self.result, list(self.points)
+        self._run_export(
+            "导出 Excel 报告",
+            lambda: exporter.export_summary_excel(result, filepath, points),
+            "Excel 报告导出成功",
+        )
+
     def _export_csv(self):
-        if not self.result:
-            messagebox.showwarning("提示", "请先进行计算")
-            return
-            
-        filepath = filedialog.asksaveasfilename(
-            title="导出 CSV 明细",
-            defaultextension=".csv",
-            filetypes=[("CSV文件", "*.csv")]
-        )
+        filepath = self._ask_export_path("导出 CSV 明细", ".csv", [("CSV文件", "*.csv")])
         if not filepath:
             return
-            
-        exporter = DataExporter()
-        if exporter.export_triangles_csv(self.result, filepath):
-            messagebox.showinfo("成功", "CSV 明细导出成功")
-        else:
-            messagebox.showerror("错误", "导出失败")
+        exporter = DataExporter(self._project_name())
+        result = self.result
+        self._run_export("导出 CSV 明细", lambda: exporter.export_triangles_csv(result, filepath), "CSV 明细导出成功")
 
     def _export_dxf(self):
-        if not self.result:
-            messagebox.showwarning("提示", "请先进行计算")
-            return
-
-        filepath = filedialog.asksaveasfilename(
-            title="导出 DXF",
-            defaultextension=".dxf",
-            filetypes=[("DXF图形", "*.dxf")],
-        )
+        filepath = self._ask_export_path("导出 DXF", ".dxf", [("DXF图形", "*.dxf")])
         if not filepath:
             return
-
-        exporter = DataExporter()
-        if exporter.export_boundary_dxf(self.result, filepath):
-            messagebox.showinfo("成功", "DXF 已导出（BOUNDARY 边界 / ZERO_CONTOUR 零填挖线）")
-        else:
-            messagebox.showerror("错误", "导出失败")
+        exporter = DataExporter(self._project_name())
+        result = self.result
+        self._run_export(
+            "导出 DXF",
+            lambda: exporter.export_boundary_dxf(result, filepath),
+            "DXF 已导出（BOUNDARY 边界 / ZERO_CONTOUR 零填挖线）",
+        )
 
     def _export_pdf(self):
-        if not self.result:
-            messagebox.showwarning("提示", "请先进行计算")
-            return
-
-        filepath = filedialog.asksaveasfilename(
-            title="导出 PDF 计算书",
-            defaultextension=".pdf",
-            filetypes=[("PDF文件", "*.pdf")],
-        )
+        filepath = self._ask_export_path("导出 PDF 计算书", ".pdf", [("PDF文件", "*.pdf")])
         if not filepath:
             return
+        exporter = DataExporter(self._project_name())
+        result, points = self.result, list(self.points)
+        self._run_export(
+            "导出 PDF 计算书",
+            lambda: exporter.export_pdf_report(result, len(points), points, result.boundary_points, filepath),
+            "PDF 计算书已导出（汇总页 + 成果图）",
+        )
 
-        exporter = DataExporter("TIN土方计算项目")
-        design_elev = self.design_elevation_var.get()
-        if exporter.export_pdf_report(
-            self.result, design_elev, len(self.points), self.points, self.boundary, filepath
-        ):
-            messagebox.showinfo("成功", "PDF 计算书已导出（汇总页 + 成果图）")
-        else:
-            messagebox.showerror("错误", "导出失败")
-            
     def _export_image(self):
-        if not self.result:
-            messagebox.showwarning("提示", "请先进行计算")
-            return
-            
-        filepath = filedialog.asksaveasfilename(
-            title="导出高清图片",
-            defaultextension=".png",
-            filetypes=[("PNG图片", "*.png"), ("PDF文件", "*.pdf"), ("SVG矢量图", "*.svg")]
+        filepath = self._ask_export_path(
+            "导出高清图片", ".png",
+            [("PNG图片", "*.png"), ("PDF文件", "*.pdf"), ("SVG矢量图", "*.svg")],
         )
         if not filepath:
             return
-            
-        try:
-            from utils.plotter import create_standalone_figure
-            design_elev = self.design_elevation_var.get()
-            fig = create_standalone_figure(self.result, self.points, self.boundary, 
-                                         design_elev, "TIN土方计算项目")
-            fig.savefig(filepath, dpi=300, bbox_inches='tight')
-            import matplotlib.pyplot as plt
-            plt.close(fig)
-            messagebox.showinfo("成功", "高清图片导出成功")
-        except Exception as e:
-            messagebox.showerror("错误", f"导出失败: {e}")
-            
+        result, points, name = self.result, list(self.points), self._project_name()
+
+        def work():
+            figure = create_standalone_figure(result, points, result.boundary_points, name)
+            figure.savefig(filepath, dpi=300, bbox_inches='tight')
+
+        self._run_export("导出高清图片", work, "高清图片导出成功")
+
     def _export_text(self):
-        if not self.result:
-            messagebox.showwarning("提示", "请先进行计算")
-            return
-            
-        filepath = filedialog.asksaveasfilename(
-            title="生成文本报告",
-            defaultextension=".txt",
-            filetypes=[("文本文件", "*.txt")]
-        )
+        filepath = self._ask_export_path("生成文本报告", ".txt", [("文本文件", "*.txt")])
         if not filepath:
             return
-            
-        exporter = DataExporter("TIN土方计算项目")
-        design_elev = self.design_elevation_var.get()
-        report = exporter.generate_report_text(self.result, design_elev, len(self.points))
+        exporter = DataExporter(self._project_name())
+        report = exporter.generate_report_text(self.result, len(self.points))
+
+        def work():
+            with open(filepath, 'w', encoding='utf-8') as handle:
+                handle.write(report)
+
+        self._run_export("生成文本报告", work, "文本报告生成成功")
+
+
+def parse_partition_text(content: str) -> Tuple[Dict[str, float], List[str]]:
+    """解析“点号,高程”文本（逗号、中文逗号、制表符或空格分隔），返回 (数据, 无法解析的行)。"""
+    data: Dict[str, float] = {}
+    bad_lines: List[str] = []
+    for raw in content.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        parts = [part for part in line.replace("，", ",").replace("\t", ",").replace(" ", ",").split(",") if part]
         try:
-            with open(filepath, 'w', encoding='utf-8') as f:
-                f.write(report)
-            messagebox.showinfo("成功", "文本报告生成成功")
-        except Exception as e:
-            messagebox.showerror("错误", f"导出失败: {e}")
+            if len(parts) != 2:
+                raise ValueError
+            data[parts[0].strip()] = float(parts[1])
+        except ValueError:
+            bad_lines.append(line)
+    return data, bad_lines

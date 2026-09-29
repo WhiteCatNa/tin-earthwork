@@ -7,13 +7,25 @@ import pandas as pd
 from typing import List, Optional, Callable
 from core.calculator import SurveyPoint
 from gui.theme import COLORS
-from utils.data_handler import DataImporter, DataValidator
+from utils.data_handler import ISSUE_NAMES, DataImporter, DataValidator
 from utils.survey_edit import (
     add_survey_point as append_survey_point,
     delete_survey_point_at as remove_survey_point_at,
     offset_survey_data,
+    swap_survey_xy,
     update_survey_point as mutate_survey_point,
 )
+
+PREVIEW_LIMIT = 2000
+# 列映射的目标字段及显示名称
+MAPPING_TARGETS = [
+    ("id", "点号（可不选，自动编号）"),
+    ("x", "X 坐标"),
+    ("y", "Y 坐标"),
+    ("z", "实测高程"),
+    ("design_z", "设计高程（可不选）"),
+]
+NOT_USED = "（不使用）"
 
 
 class DataImportFrame(ttk.Frame):
@@ -28,6 +40,7 @@ class DataImportFrame(ttk.Frame):
         self.raw_df: Optional[pd.DataFrame] = None
         self.column_mapping = {}
         self._edit_entry = None
+        self._mapping_editor = None
         
         self._create_widgets()
         
@@ -50,15 +63,16 @@ class DataImportFrame(ttk.Frame):
         self.progress_bar: Optional[ttk.Progressbar] = None
         
         # 列映射
-        map_frame = ttk.LabelFrame(left_frame, text="列映射 (自动识别，可手动调整)", padding=8)
+        map_frame = ttk.LabelFrame(left_frame, text="列映射（自动识别；双击“源列名”可改选）", padding=8)
         map_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
-        
-        self.tree_map = ttk.Treeview(map_frame, columns=('source', 'target'), show='headings', height=8)
-        self.tree_map.heading('source', text='源列名')
+
+        self.tree_map = ttk.Treeview(map_frame, columns=('target', 'source'), show='headings', height=5)
         self.tree_map.heading('target', text='目标字段')
+        self.tree_map.heading('source', text='源列名')
+        self.tree_map.column('target', width=170)
         self.tree_map.column('source', width=150)
-        self.tree_map.column('target', width=150)
         self.tree_map.pack(fill=tk.BOTH, expand=True)
+        self.tree_map.bind("<Double-1>", self._on_mapping_double_click)
         
         # 映射编辑按钮
         map_btn_frame = ttk.Frame(map_frame)
@@ -103,6 +117,7 @@ class DataImportFrame(ttk.Frame):
         ttk.Label(offset_bar, text="ΔZ").pack(side=tk.LEFT, padx=(8, 2))
         ttk.Entry(offset_bar, textvariable=self.dz_var, width=8).pack(side=tk.LEFT)
         ttk.Button(offset_bar, text="应用平移", command=self._apply_offset_clicked).pack(side=tk.LEFT, padx=8)
+        ttk.Button(offset_bar, text="X/Y 互换", command=self._swap_xy_clicked).pack(side=tk.LEFT)
         
         # 右侧：数据检查结果
         right_frame = ttk.LabelFrame(self, text="数据质量检查", padding=12)
@@ -188,45 +203,103 @@ class DataImportFrame(ttk.Frame):
         self.import_btn.config(state='normal', text="导入")
         messagebox.showerror("错误", f"导入失败: {error_msg}")
             
-    def _update_mapping_display(self):
-        """更新列映射显示"""
+    def _update_mapping_display(self, mapping: Optional[dict] = None):
+        """显示列映射；不传 mapping 时重新自动识别。"""
+        self._destroy_mapping_editor()
         self.tree_map.delete(*self.tree_map.get_children())
-        if self.raw_df is not None:
-            self.column_mapping = DataImporter.complete_column_mapping(
+        if self.raw_df is None:
+            return
+        if mapping is None:
+            mapping = DataImporter.complete_column_mapping(
                 self.raw_df, DataValidator.auto_detect_columns(self.raw_df)
             )
-                    
-            for target, source in self.column_mapping.items():
-                self.tree_map.insert('', 'end', values=(source, target), tags=(target,))
-                
+        self.column_mapping = dict(mapping)
+        for target, label in MAPPING_TARGETS:
+            source = self.column_mapping.get(target)
+            self.tree_map.insert('', 'end', iid=target, values=(label, NOT_USED if source is None else str(source)))
+
     def _auto_detect_mapping(self):
         self._update_mapping_display()
-        
+
+    def _destroy_mapping_editor(self):
+        if self._mapping_editor is not None:
+            try:
+                self._mapping_editor.destroy()
+            except tk.TclError:
+                pass
+            self._mapping_editor = None
+
+    def _on_mapping_double_click(self, event):
+        """双击“源列名”弹出下拉框，从原始表格的列中选择。"""
+        if self.raw_df is None:
+            return
+        target = self.tree_map.identify_row(event.y)
+        if not target or self.tree_map.identify_column(event.x) != "#2":
+            return
+        bbox = self.tree_map.bbox(target, "source")
+        if not bbox:
+            return
+        self._destroy_mapping_editor()
+        columns = list(self.raw_df.columns)
+        labels = [NOT_USED] + [str(column) for column in columns]
+        editor = ttk.Combobox(self.tree_map, values=labels, state="readonly")
+        x, y, width, height = bbox
+        editor.place(x=x, y=y, width=width, height=height)
+        current = self.column_mapping.get(target)
+        editor.set(NOT_USED if current is None else str(current))
+        editor.focus()
+        self._mapping_editor = editor
+
+        def commit(_event=None):
+            if self._mapping_editor is not editor:
+                return
+            index = labels.index(editor.get()) if editor.get() in labels else 0
+            self.set_mapping_source(target, None if index == 0 else columns[index - 1])
+
+        editor.bind("<<ComboboxSelected>>", commit)
+        editor.bind("<FocusOut>", lambda _event: self._destroy_mapping_editor())
+        editor.bind("<Escape>", lambda _event: self._destroy_mapping_editor())
+
+    def set_mapping_source(self, target: str, source) -> None:
+        """设置某个目标字段对应的源列（None 表示不使用），随后需点“应用映射”。"""
+        mapping = dict(self.column_mapping)
+        if source is None:
+            mapping.pop(target, None)
+        else:
+            mapping[target] = source
+        self._update_mapping_display(mapping)
+
     def _apply_mapping(self):
         """应用当前映射重新解析数据"""
         if self.raw_df is None:
             return
-            
-        # 从 tree 获取当前映射
-        mapping = {}
-        for item in self.tree_map.get_children():
-            vals = self.tree_map.item(item)['values']
-            if len(vals) == 2:
-                mapping[vals[1]] = vals[0]
-        self.column_mapping = mapping
-        
-        # 重新解析
-        try:
-            self.points, format_errors = DataImporter.points_from_dataframe(self.raw_df, mapping)
-            issues = DataValidator.validate_points(self.points)
-            issues["format_errors"].extend(format_errors)
-            self._update_preview()
-            self._update_issues(issues)
-            self._update_stats()
-            messagebox.showinfo("成功", f"映射应用完成，共 {len(self.points)} 个有效点")
-        except Exception as e:
-            messagebox.showerror("错误", f"映射应用失败: {e}")
-            
+        mapping = dict(self.column_mapping)
+        missing = [label for target, label in MAPPING_TARGETS if target in ("x", "y", "z") and target not in mapping]
+        if missing:
+            messagebox.showwarning("提示", "请先为以下字段选择源列：" + "、".join(missing))
+            return
+        chosen = [mapping[target] for target in ("x", "y", "z")]
+        if len(set(chosen)) < 3:
+            messagebox.showwarning("提示", "X、Y、实测高程不能选同一列")
+            return
+
+        self.points, format_errors = DataImporter.points_from_dataframe(self.raw_df, mapping)
+        issues = DataValidator.validate_points(self.points)
+        issues["format_errors"].extend(format_errors)
+        self._update_preview()
+        self._update_issues(issues)
+        self._update_stats()
+        messagebox.showinfo("成功", f"映射应用完成，共 {len(self.points)} 个有效点")
+
+    def load_points(self, points: List[SurveyPoint]) -> None:
+        """直接载入测点（打开工程时使用），刷新表格、检查结果和统计。"""
+        self.points = points
+        self.raw_df = None
+        self._update_mapping_display()
+        self._update_preview()
+        self._update_issues(DataValidator.validate_points(points))
+        self._update_stats()
+
     def _update_preview(self):
         """刷新测点表。"""
         self._destroy_edit_entry()
@@ -240,7 +313,7 @@ class DataImportFrame(ttk.Frame):
                 self.tree_preview.heading(c, text=c)
                 self.tree_preview.column(c, width=100, anchor='center')
 
-            preview_count = min(2000, len(self.points))
+            preview_count = min(PREVIEW_LIMIT, len(self.points))
             for index, pt in enumerate(self.points[:preview_count]):
                 values = [pt.id, f"{pt.x:.3f}", f"{pt.y:.3f}", f"{pt.z:.3f}"]
                 if '设计高程' in cols:
@@ -394,6 +467,8 @@ class DataImportFrame(ttk.Frame):
         )
         if not indexes:
             return
+        if not messagebox.askokcancel("确认删除", f"确定删除选中的 {len(indexes)} 个测点吗？"):
+            return
         for index in indexes:
             remove_survey_point_at(self.points, index)
         self._refresh_after_edit("edit")
@@ -410,7 +485,11 @@ class DataImportFrame(ttk.Frame):
                     self.tree_preview.selection_set(iid)
                     self.tree_preview.focus(iid)
                 else:
-                    messagebox.showinfo("提示", f"已找到点 {target}（第 {index + 1} 行），当前表只显示前 2000 行，请用删除/修改接口或缩小数据后编辑")
+                    messagebox.showinfo(
+                        "提示",
+                        f"已找到点 {target}（第 {index + 1} 行）。表格只显示前 {PREVIEW_LIMIT} 行，"
+                        "这个点无法在表中直接修改，可在原始文件中修改后重新导入。",
+                    )
                 return
         messagebox.showwarning("提示", f"没有点号 {target}")
 
@@ -427,23 +506,28 @@ class DataImportFrame(ttk.Frame):
             return
         self.apply_coordinate_offset(dx, dy, dz)
         messagebox.showinfo("成功", f"已平移 ΔX={dx}  ΔY={dy}  ΔZ={dz}")
+
+    def swap_xy(self) -> None:
+        if not self.points:
+            raise ValueError("没有可互换的测量点")
+        swap_survey_xy(self.points)
+        self._refresh_after_edit("swap")
+
+    def _swap_xy_clicked(self):
+        if not self.points:
+            messagebox.showwarning("提示", "请先导入测量点")
+            return
+        self.swap_xy()
+        messagebox.showinfo("成功", "已交换所有测点的 X、Y 坐标")
                 
     def _update_issues(self, issues: dict):
         """更新检查结果"""
         self.tree_issues.delete(*self.tree_issues.get_children())
-        type_names = {
-            'missing_values': '缺失值',
-            'duplicate_coords': '重复坐标',
-            'duplicate_ids': '重复点号',
-            'coord_outliers': '坐标异常',
-            'elevation_outliers': '高程异常',
-            'format_errors': '格式错误'
-        }
         total = 0
         for key, items in issues.items():
             if items:
                 for item in items:
-                    self.tree_issues.insert('', 'end', values=(type_names.get(key, key), item))
+                    self.tree_issues.insert('', 'end', values=(ISSUE_NAMES.get(key, key), item))
                 total += len(items)
                 
         if total == 0:
@@ -492,6 +576,3 @@ class DataImportFrame(ttk.Frame):
                 messagebox.showinfo("成功", "报告已导出")
             except Exception as e:
                 messagebox.showerror("错误", f"导出失败: {e}")
-                
-    def get_points(self) -> List[SurveyPoint]:
-        return self.points

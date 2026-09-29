@@ -2,13 +2,15 @@
 可视化模块：matplotlib 绘图嵌入 Tkinter
 """
 import matplotlib.pyplot as plt
+from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 from matplotlib.figure import Figure
+from matplotlib.lines import Line2D
 from matplotlib.patches import Polygon, Patch
-from matplotlib.collections import PatchCollection, LineCollection
+from matplotlib.collections import PolyCollection, LineCollection
 import numpy as np
-from typing import List, Tuple, Optional, Callable
-from core.calculator import SurveyPoint, Triangle, CalculationResult
+from typing import List, Tuple, Optional
+from core.calculator import SurveyPoint, Triangle, CalculationResult, extract_zero_contour_segments
 from gui.theme import COLORS, PLOT_COLORS
 
 # 设置中文字体
@@ -63,6 +65,9 @@ class EarthworkPlotter:
         self._artist_contour_lines: list = []
         self._artist_scatter: Optional[object] = None
         self._artist_boundary: Optional[object] = None
+        self._highlight_artists: list = []
+        self._pick_xy: Optional[np.ndarray] = None
+        self._pick_tris: List[Triangle] = []
 
         # 颜色配置（与 GUI 主题共用挖填配色）
         self.colors = dict(PLOT_COLORS)
@@ -85,20 +90,18 @@ class EarthworkPlotter:
         """鼠标点击事件"""
         if event.inaxes != self.ax or event.button != 1:
             return
-            
         x, y = event.xdata, event.ydata
-        if x is None or y is None:
+        if x is None or y is None or self._current_result is None:
             return
-            
-        # 查找最近的三角形
-        if hasattr(self, '_current_result') and self._current_result:
-            tri = self._find_triangle_at(x, y, self._current_result.triangles)
-            if tri:
-                self.selected_triangle = tri
-                self.highlight_triangle(tri)
-                if self.on_triangle_click:
-                    self.on_triangle_click(tri)
-                    
+        tri = self._find_triangle_at(x, y)
+        if tri:
+            self.selected_triangle = tri
+            self.highlight_triangle(tri)
+            if self.canvas:
+                self.canvas.draw_idle()
+            if self.on_triangle_click:
+                self.on_triangle_click(tri)
+
     def _on_hover(self, event):
         """鼠标悬停事件 - 显示坐标（限速：最多 30 fps，约 33 ms/帧）"""
         import time
@@ -111,40 +114,19 @@ class EarthworkPlotter:
         x, y = event.xdata, event.ydata
         self.ax.set_title(f"X: {x:.3f}, Y: {y:.3f}", fontsize=9, loc='right', color='gray')
         self.canvas.draw_idle()
-            
-    def _find_triangle_at(self, x: float, y: float, triangles: List[Triangle]) -> Optional[Triangle]:
-        """查找包含点 (x,y) 的三角形。"""
-        candidates = []
-        for tri in triangles:
-            if tri.is_boundary:
-                continue
-            p0, p1, p2 = tri.vertex_points
-            if (min(p.x for p in (p0, p1, p2)) <= x <= max(p.x for p in (p0, p1, p2)) and
-                    min(p.y for p in (p0, p1, p2)) <= y <= max(p.y for p in (p0, p1, p2))):
-                candidates.append(tri)
-        for tri in candidates:
-            p0, p1, p2 = tri.vertex_points
-            # 重心坐标法判断点在三角形内
-            if self._point_in_triangle(x, y, p0, p1, p2):
-                return tri
-        return None
-    
-    def _point_in_triangle(self, x: float, y: float, 
-                           p0: SurveyPoint, p1: SurveyPoint, p2: SurveyPoint) -> bool:
-        """重心坐标法判断点在三角形内"""
-        x1, y1 = p0.x, p0.y
-        x2, y2 = p1.x, p1.y
-        x3, y3 = p2.x, p2.y
-        
-        denom = (y2 - y3) * (x1 - x3) + (x3 - x2) * (y1 - y3)
-        if abs(denom) < 1e-10:
-            return False
-            
-        a = ((y2 - y3) * (x - x3) + (x3 - x2) * (y - y3)) / denom
-        b = ((y3 - y1) * (x - x3) + (x1 - x3) * (y - y3)) / denom
+
+    def _find_triangle_at(self, x: float, y: float) -> Optional[Triangle]:
+        """向量化查找包含点 (x, y) 的三角形。"""
+        if self._pick_xy is None or not len(self._pick_xy):
+            return None
+        p0, p1, p2 = self._pick_xy[:, 0], self._pick_xy[:, 1], self._pick_xy[:, 2]
+        denom = (p1[:, 1] - p2[:, 1]) * (p0[:, 0] - p2[:, 0]) + (p2[:, 0] - p1[:, 0]) * (p0[:, 1] - p2[:, 1])
+        with np.errstate(divide="ignore", invalid="ignore"):
+            a = ((p1[:, 1] - p2[:, 1]) * (x - p2[:, 0]) + (p2[:, 0] - p1[:, 0]) * (y - p2[:, 1])) / denom
+            b = ((p2[:, 1] - p0[:, 1]) * (x - p2[:, 0]) + (p0[:, 0] - p2[:, 0]) * (y - p2[:, 1])) / denom
         c = 1 - a - b
-        
-        return 0 <= a <= 1 and 0 <= b <= 1 and 0 <= c <= 1
+        hits = np.nonzero((np.abs(denom) > 1e-12) & (a >= 0) & (b >= 0) & (c >= 0))[0]
+        return self._pick_tris[hits[0]] if len(hits) else None
 
     def _style_axes(self):
         """Apply survey-drawing paper colors after ax.clear()."""
@@ -176,6 +158,9 @@ class EarthworkPlotter:
         self._artist_contour_lines = []
         self._artist_scatter = None
         self._artist_boundary = None
+        self._highlight_artists = []
+        self._pick_xy = None
+        self._pick_tris = []
 
     def plot_result(self, result: CalculationResult,
                     points: List[SurveyPoint],
@@ -223,161 +208,69 @@ class EarthworkPlotter:
         self._remove_colorbar()
         self.ax.clear()
         self._style_axes()
+        self._invalidate_result_cache()
         self._current_result = result
         self._cached_points_id = id(points)
-        self._artist_cut = None
-        self._artist_fill = None
-        self._artist_tin = None
-        self._artist_contour_lines = []
-        self._artist_scatter = None
-        self._artist_boundary = None
 
-        # 1. 绘制三角形 (挖填分色)
-        cut_patches = []
-        fill_patches = []
-        legend_handles = []
+        artists = draw_result(self.ax, result, points, result.boundary_points, self.colors, fine=False)
+        self._artist_cut = artists["cut"]
+        self._artist_fill = artists["fill"]
+        self._artist_tin = artists["tin"]
+        self._artist_contour_lines = [artists["zero"]] if artists["zero"] is not None else []
+        self._artist_scatter = artists["scatter"]
+        self._artist_boundary = artists["boundary"]
+        self._pick_tris = artists["pick_tris"]
+        self._pick_xy = artists["pick_xy"]
 
-        for tri in result.triangles:
-            if tri.is_boundary:
-                continue
-            verts = np.array([[p.x, p.y] for p in tri.vertex_points])
-            poly = Polygon(verts, closed=True)
-            if tri.is_mixed:
-                for sub_tri in tri.sub_triangles:
-                    if not sub_tri.vertex_points:
-                        continue
-                    sub_verts = np.array([[p.x, p.y] for p in sub_tri.vertex_points])
-                    sub_poly = Polygon(sub_verts, closed=True)
-                    avg_dz = np.mean([p.delta_z for p in sub_tri.vertex_points])
-                    if avg_dz > 0:
-                        cut_patches.append(sub_poly)
-                    else:
-                        fill_patches.append(sub_poly)
-            else:
-                if tri.volume > 0:
-                    cut_patches.append(poly)
-                else:
-                    fill_patches.append(poly)
+        if self._artist_tin is not None:
+            self._artist_tin.set_visible(show_tin)
+        for line in self._artist_contour_lines:
+            line.set_visible(show_contour)
+        if self._artist_scatter is not None:
+            self._artist_scatter.set_visible(show_points)
+            self._colorbar = self.fig.colorbar(self._artist_scatter, ax=self.ax, shrink=0.8, label='实测高程 (m)')
+            self._colorbar.ax.set_visible(show_points)
+        if self._artist_boundary is not None:
+            self._artist_boundary.set_visible(show_boundary)
 
-        if cut_patches:
-            pc = PatchCollection(cut_patches, facecolor=self.colors['cut'],
-                                 edgecolor=self.colors['tin'], alpha=0.7, linewidth=0.5)
-            self.ax.add_collection(pc)
-            self._artist_cut = pc
-            legend_handles.append(Patch(facecolor=self.colors['cut'], edgecolor=self.colors['tin'], label='挖方区'))
-        if fill_patches:
-            pc = PatchCollection(fill_patches, facecolor=self.colors['fill'],
-                                 edgecolor=self.colors['tin'], alpha=0.7, linewidth=0.5)
-            self.ax.add_collection(pc)
-            self._artist_fill = pc
-            legend_handles.append(Patch(facecolor=self.colors['fill'], edgecolor=self.colors['tin'], label='填方区'))
-
-        # 2. TIN 网格
-        segments = []
-        for tri in result.triangles:
-            if tri.is_boundary:
-                continue
-            verts = np.array([[p.x, p.y] for p in tri.vertex_points])
-            segments.extend(((verts[0], verts[1]), (verts[1], verts[2]), (verts[2], verts[0])))
-        if segments:
-            lc = LineCollection(segments, colors=self.colors['tin'], linewidths=0.3, alpha=0.5,
-                                visible=show_tin)
-            self.ax.add_collection(lc)
-            self._artist_tin = lc
-
-        # 3. 零填挖线 (混合三角形分割线) — 批量绘制为单一 LineCollection
-        contour_segs = []
-        for tri in result.triangles:
-            if tri.is_mixed and tri.sub_triangles:
-                for i, sub1 in enumerate(tri.sub_triangles):
-                    for sub2 in tri.sub_triangles[i + 1:]:
-                        pts1 = [(p.x, p.y) for p in sub1.vertex_points]
-                        pts2 = [(p.x, p.y) for p in sub2.vertex_points]
-                        shared = list(set(pts1) & set(pts2))
-                        if len(shared) == 2:
-                            contour_segs.append(shared)
-        if contour_segs:
-            clc = LineCollection(contour_segs, colors=self.colors['zero'], linewidths=2,
-                                 zorder=6, visible=show_contour)
-            self.ax.add_collection(clc)
-            self._artist_contour_lines = [clc]
-
-        # 4. 测量点
-        if points:
-            xs = [p.x for p in points]
-            ys = [p.y for p in points]
-            zs = [p.z for p in points]
-            scatter = self.ax.scatter(xs, ys, c=zs, cmap='terrain',
-                                      s=20, edgecolors='white', linewidth=0.5,
-                                      zorder=5, label='测量点', visible=show_points)
-            self._artist_scatter = scatter
-            self._colorbar = self.fig.colorbar(scatter, ax=self.ax, shrink=0.8, label='实测高程 (m)')
-            if not show_points:
-                self._colorbar.ax.set_visible(False)
-
-        # 5. 边界
-        if result.boundary_points:
-            bx = [p[0] for p in result.boundary_points] + [result.boundary_points[0][0]]
-            by = [p[1] for p in result.boundary_points] + [result.boundary_points[0][1]]
-            line, = self.ax.plot(bx, by, color=self.colors['boundary'], linewidth=2.5,
-                                 linestyle='--', label='计算边界', zorder=10,
-                                 visible=show_boundary)
-            self._artist_boundary = line
-
-        # 6. 选中三角形高亮
-        if self.selected_triangle:
+        if self.selected_triangle is not None and self.selected_triangle in self._pick_tris:
             self.highlight_triangle(self.selected_triangle)
+        else:
+            self.selected_triangle = None
 
-        # 图例 & 轴标签
-        if show_legend:
-            handles, labels = self.ax.get_legend_handles_labels()
-            handles = legend_handles + handles
-            if handles:
-                self.ax.legend(handles=handles, loc='upper right', fontsize=9, framealpha=0.9)
-
-        self.ax.set_aspect('equal')
-        self.ax.set_xlabel('X 坐标 (m)', fontsize=10)
-        self.ax.set_ylabel('Y 坐标 (m)', fontsize=10)
+        if show_legend and artists["legend"]:
+            self.ax.legend(handles=artists["legend"], loc='upper right', fontsize=9, framealpha=0.9)
         self.ax.set_title(
             f'土方计算结果 - 挖方:{result.total_cut:.1f}m³  填方:{result.total_fill:.1f}m³  净:{result.net_volume:.1f}m³',
             fontsize=11, pad=10)
-        self.ax.grid(True, linestyle=':', alpha=0.3)
 
         if self.canvas:
             self.canvas.draw_idle()
 
-    def _plot_zero_contours(self, tri: Triangle):
-        """绘制混合三角形的零填挖线"""
-        # 简化：绘制子三角形之间的分割边
-        for i, sub1 in enumerate(tri.sub_triangles):
-            for sub2 in tri.sub_triangles[i+1:]:
-                # 检查是否共享边 (有两个相同顶点)
-                pts1 = [(p.x, p.y) for p in sub1.vertex_points]
-                pts2 = [(p.x, p.y) for p in sub2.vertex_points]
-                shared = set(pts1) & set(pts2)
-                if len(shared) == 2:
-                    pts = list(shared)
-                    self.ax.plot([pts[0][0], pts[1][0]], [pts[0][1], pts[1][1]],
-                               color=self.colors['zero'], linewidth=2, zorder=6)
-                    
     def highlight_triangle(self, tri: Triangle):
-        """高亮显示三角形"""
+        """高亮显示三角形（只保留一个高亮）"""
+        for artist in self._highlight_artists:
+            try:
+                artist.remove()
+            except (ValueError, NotImplementedError):
+                pass
+        self._highlight_artists = []
         if not tri.vertex_points:
             return
         verts = np.array([[p.x, p.y] for p in tri.vertex_points])
-        poly = Polygon(verts, closed=True, facecolor='none', 
-                      edgecolor=self.colors['selected'], linewidth=3, zorder=10)
+        poly = Polygon(verts, closed=True, facecolor='none',
+                       edgecolor=self.colors['selected'], linewidth=3, zorder=10)
         self.ax.add_patch(poly)
-        
-        # 显示三角形信息
+
         cx = np.mean(verts[:, 0])
         cy = np.mean(verts[:, 1])
         info = f"Δ{tri.id}\n面积:{tri.area:.1f}m²\n挖:{tri.cut_volume:.1f} 填:{tri.fill_volume:.1f}"
-        self.ax.annotate(info, (cx, cy), fontsize=8, 
-                        bbox=dict(boxstyle='round,pad=0.3', facecolor=COLORS["zero"],
-                                  alpha=0.9, edgecolor=self.colors['selected']),
-                        ha='center', va='center', zorder=11, color=COLORS["white"])
-        
+        note = self.ax.annotate(info, (cx, cy), fontsize=8,
+                                bbox=dict(boxstyle='round,pad=0.3', facecolor=COLORS["zero"],
+                                          alpha=0.9, edgecolor=self.colors['selected']),
+                                ha='center', va='center', zorder=11, color=COLORS["white"])
+        self._highlight_artists = [poly, note]
+
     def plot_points_only(self, points: List[SurveyPoint]):
         """仅绘制测量点 (用于数据导入预览)"""
         self._remove_colorbar()
@@ -512,106 +405,112 @@ class EarthworkPlotter:
         self.canvas = None
         self.toolbar = None
 
-    def clear(self):
-        """清空绘图"""
-        self._remove_colorbar()
-        self.ax.clear()
-        self._style_axes()
-        self._invalidate_result_cache()
-        self.selected_triangle = None
-        self._boundary_preview_artists = None
-        if self.canvas:
-            self.canvas.draw_idle()
+
+RASTERIZE_TRIANGLES = 5000
 
 
-def create_standalone_figure(result: CalculationResult, 
-                             points: List[SurveyPoint],
-                             boundary: List[Tuple[float, float]],
-                             design_elevation: float,
-                             project_name: str) -> Figure:
-    """创建独立的 matplotlib 图形用于导出高清图片"""
-    fig, ax = plt.subplots(figsize=(12, 10), dpi=150)
-    fig.patch.set_facecolor(COLORS["sheet"])
-    ax.set_facecolor(COLORS["sheet"])
-    
-    colors = dict(PLOT_COLORS)
-    
-    # 绘制挖填分色
-    cut_patches, fill_patches = [], []
+def _result_geometry(result: CalculationResult):
+    """整理绘图用的几何数据：挖方/填方多边形、TIN 三角形、零填挖线。"""
+    cut, fill, mesh, tris = [], [], [], []
     for tri in result.triangles:
         if tri.is_boundary:
             continue
-        verts = np.array([[p.x, p.y] for p in tri.vertex_points])
-        poly = Polygon(verts, closed=True)
-        if tri.is_mixed:
-            for sub_tri in tri.sub_triangles:
-                if not sub_tri.vertex_points:
-                    continue
-                sub_verts = np.array([[p.x, p.y] for p in sub_tri.vertex_points])
-                sub_poly = Polygon(sub_verts, closed=True)
-                avg_dz = np.mean([p.delta_z for p in sub_tri.vertex_points])
-                if avg_dz > 0:
-                    cut_patches.append(sub_poly)
-                else:
-                    fill_patches.append(sub_poly)
+        verts = [(p.x, p.y) for p in tri.vertex_points]
+        mesh.append(verts)
+        tris.append(tri)
+        if tri.cut_polygon or tri.fill_polygon:
+            if len(tri.cut_polygon) >= 3:
+                cut.append(tri.cut_polygon)
+            if len(tri.fill_polygon) >= 3:
+                fill.append(tri.fill_polygon)
+        elif tri.volume > 0:
+            cut.append(verts)
         else:
-            if tri.volume > 0:
-                cut_patches.append(poly)
-            else:
-                fill_patches.append(poly)
-                
-    if cut_patches:
-        pc = PatchCollection(cut_patches, facecolor=colors['cut'], edgecolor=colors['tin'], 
-                           alpha=0.7, linewidth=0.3, label='挖方区')
-        ax.add_collection(pc)
-    if fill_patches:
-        pc = PatchCollection(fill_patches, facecolor=colors['fill'], edgecolor=colors['tin'],
-                           alpha=0.7, linewidth=0.3, label='填方区')
-        ax.add_collection(pc)
-        
-    # TIN 网格
-    segments = []
-    for tri in result.triangles:
-        if tri.is_boundary:
+            fill.append(verts)
+    mesh_xy = np.array(mesh, dtype=float).reshape(-1, 3, 2)
+    return cut, fill, mesh_xy, tris, extract_zero_contour_segments(result)
+
+
+def draw_result(ax, result: CalculationResult, points: List[SurveyPoint],
+                boundary: List[Tuple[float, float]], colors: dict, fine: bool) -> dict:
+    """在坐标轴上绘制计算结果；界面图与导出图共用。fine=True 为导出用的细线条样式。"""
+    cut, fill, mesh_xy, tris, zero = _result_geometry(result)
+    edge_width = 0.3 if fine else 0.5
+    # 导出 PDF/SVG 时，大量三角形按栅格嵌入，文字、边界和零线仍为矢量
+    rasterize = fine and len(mesh_xy) > RASTERIZE_TRIANGLES
+    artists = {"cut": None, "fill": None, "tin": None, "zero": None, "scatter": None,
+               "boundary": None, "legend": [], "pick_tris": tris, "pick_xy": mesh_xy}
+
+    clip_patch = None
+    if boundary:
+        clip_patch = Polygon(np.asarray(boundary, dtype=float), closed=True, transform=ax.transData)
+
+    for key, polygons, label in (("cut", cut, "挖方区"), ("fill", fill, "填方区")):
+        if not polygons:
             continue
-        verts = np.array([[p.x, p.y] for p in tri.vertex_points])
-        segments.extend(((verts[0], verts[1]), (verts[1], verts[2]), (verts[2], verts[0])))
-    if segments:
-        ax.add_collection(LineCollection(
-            segments, colors=colors['tin'], linewidths=0.2, alpha=0.4
-        ))
-              
-    # 零填挖线
-    for tri in result.triangles:
-        if tri.is_mixed and tri.sub_triangles:
-            for i, sub1 in enumerate(tri.sub_triangles):
-                for sub2 in tri.sub_triangles[i+1:]:
-                    pts1 = [(p.x, p.y) for p in sub1.vertex_points]
-                    pts2 = [(p.x, p.y) for p in sub2.vertex_points]
-                    shared = set(pts1) & set(pts2)
-                    if len(shared) == 2:
-                        pts = list(shared)
-                        ax.plot([pts[0][0], pts[1][0]], [pts[0][1], pts[1][1]],
-                              color=colors['zero'], linewidth=1.5, zorder=6)
-                        
-    # 测量点
+        collection = PolyCollection(polygons, facecolor=colors[key], edgecolor=colors['tin'],
+                                    alpha=0.7, linewidth=edge_width)
+        collection.set_rasterized(rasterize)
+        ax.add_collection(collection)
+        artists[key] = collection
+        artists["legend"].append(Patch(facecolor=colors[key], edgecolor=colors['tin'], label=label))
+
+    if len(mesh_xy):
+        segments = np.concatenate([mesh_xy[:, [0, 1]], mesh_xy[:, [1, 2]], mesh_xy[:, [2, 0]]])
+        tin = LineCollection(segments, colors=colors['tin'], linewidths=0.2 if fine else 0.3,
+                             alpha=0.4 if fine else 0.5)
+        tin.set_rasterized(rasterize)
+        ax.add_collection(tin)
+        if clip_patch is not None:
+            tin.set_clip_path(clip_patch)
+        artists["tin"] = tin
+
+    if zero:
+        artists["zero"] = LineCollection(zero, colors=colors['zero'], linewidths=1.5 if fine else 2, zorder=6)
+        ax.add_collection(artists["zero"])
+        artists["legend"].append(Line2D([], [], color=colors['zero'], linewidth=2, label='零填挖线'))
+
     if points:
-        xs, ys, zs = zip(*[(p.x, p.y, p.z) for p in points])
-        ax.scatter(xs, ys, c=zs, cmap='terrain', s=15, edgecolors='white', linewidth=0.3, zorder=5)
-        
-    # 边界
+        xs = [p.x for p in points]
+        ys = [p.y for p in points]
+        zs = [p.z for p in points]
+        artists["scatter"] = ax.scatter(xs, ys, c=zs, cmap='terrain', s=15 if fine else 20,
+                                        edgecolors='white', linewidth=0.3 if fine else 0.5, zorder=5,
+                                        rasterized=rasterize)
+
     if boundary:
         bx = [p[0] for p in boundary] + [boundary[0][0]]
         by = [p[1] for p in boundary] + [boundary[0][1]]
-        ax.plot(bx, by, color=colors['boundary'], linewidth=3, linestyle='--', label='计算边界', zorder=10)
-        
+        artists["boundary"], = ax.plot(bx, by, color=colors['boundary'], linewidth=3 if fine else 2.5,
+                                       linestyle='--', label='计算边界', zorder=10)
+        artists["legend"].append(artists["boundary"])
+
     ax.set_aspect('equal')
-    ax.set_xlabel('X 坐标 (m)', fontsize=12)
-    ax.set_ylabel('Y 坐标 (m)', fontsize=12)
-    ax.set_title(f'{project_name}\n挖方:{result.total_cut:.1f}m³  填方:{result.total_fill:.1f}m³  净:{result.net_volume:.1f}m³  设计高程:{design_elevation}m', 
-                fontsize=13, pad=15)
-    ax.legend(loc='upper right', fontsize=11, framealpha=0.95)
+    ax.autoscale_view()
+    ax.set_xlabel('X 坐标 (m)', fontsize=12 if fine else 10)
+    ax.set_ylabel('Y 坐标 (m)', fontsize=12 if fine else 10)
     ax.grid(True, linestyle=':', alpha=0.3)
-    
+    return artists
+
+
+def create_standalone_figure(result: CalculationResult,
+                             points: List[SurveyPoint],
+                             boundary: List[Tuple[float, float]],
+                             project_name: str) -> Figure:
+    """创建独立图形用于导出（不经过 pyplot，可在后台线程使用）"""
+    setup_chinese_font()
+    fig = Figure(figsize=(12, 10), dpi=150, facecolor=COLORS["sheet"])
+    FigureCanvasAgg(fig)
+    ax = fig.add_subplot(111)
+    ax.set_facecolor(COLORS["sheet"])
+    artists = draw_result(ax, result, points, boundary, dict(PLOT_COLORS), fine=True)
+    if artists["scatter"] is not None:
+        fig.colorbar(artists["scatter"], ax=ax, shrink=0.8, label='实测高程 (m)')
+    ax.set_title(
+        f'{project_name}\n挖方:{result.total_cut:.1f}m³  填方:{result.total_fill:.1f}m³  '
+        f'净:{result.net_volume:.1f}m³  设计高程:{result.design_text}',
+        fontsize=13, pad=15)
+    if artists["legend"]:
+        ax.legend(handles=artists["legend"], loc='upper right', fontsize=11, framealpha=0.95)
     fig.tight_layout()
     return fig

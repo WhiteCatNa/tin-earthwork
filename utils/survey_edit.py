@@ -73,3 +73,9 @@ def offset_survey_data(
     if boundary is None:
         return None
     return [(x + dx, y + dy) for x, y in boundary]
+
+
+def swap_survey_xy(points: List[SurveyPoint]) -> None:
+    """交换每个测点的 X、Y（测量坐标 X 为北向，与 CAD 图纸方向相反时使用）。"""
+    for point in points:
+        point.x, point.y = point.y, point.x

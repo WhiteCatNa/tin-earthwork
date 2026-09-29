@@ -82,15 +82,18 @@ def run_full_pipeline(output_dir="."):
     calc.set_boundary(boundary)
     result = calc.run_full_calculation()
     _require(result.triangle_count > 0, "边界内没有可计算三角形")
-    print(f"[4/6] 计算通过: {result.triangle_count} 个三角形")
+    _require(abs(result.computed_area - 200 * 150) < 1e-6 or result.warnings, "计算面积与边界面积不符且没有提示")
+    print(f"[4/6] 计算通过: {result.triangle_count} 个三角形，计算面积 {result.computed_area:.1f} m²")
+    for warning in result.warnings:
+        print(f"    提示: {warning}")
 
     exporter = DataExporter("TIN土方计算项目 - 自动化测试")
     report_path = output_dir / "计算报告_自动化测试.xlsx"
     csv_path = output_dir / "计算明细_自动化测试.csv"
     txt_path = output_dir / "计算报告_自动化测试.txt"
-    _require(exporter.export_summary_excel(result, design_elevation, report_path), "Excel 报告导出失败")
+    _require(exporter.export_summary_excel(result, report_path, imported_points), "Excel 报告导出失败")
     _require(exporter.export_triangles_csv(result, csv_path), "CSV 明细导出失败")
-    txt_path.write_text(exporter.generate_report_text(result, design_elevation, len(imported_points)), encoding="utf-8")
+    txt_path.write_text(exporter.generate_report_text(result, len(imported_points)), encoding="utf-8")
     _require(report_path.is_file() and report_path.stat().st_size > 0, "Excel 报告为空")
     _require(csv_path.is_file() and csv_path.stat().st_size > 0, "CSV 明细为空")
     _require(txt_path.is_file() and txt_path.stat().st_size > 0, "文本报告为空")

@@ -1,17 +1,41 @@
 """
 数据处理模块：导入、检查、导出
 """
-import pandas as pd
-import numpy as np
-from typing import List, Tuple, Dict, Any, Optional
-from pathlib import Path
-import openpyxl
-from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-from openpyxl.utils import get_column_letter
-from core.calculator import SurveyPoint, Triangle, CalculationResult
-from utils.dxf_io import read_text_with_encodings
+import io
 import json
+import math
 from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import numpy as np
+import openpyxl
+import pandas as pd
+from openpyxl.cell import WriteOnlyCell
+from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.utils import get_column_letter
+
+from core.calculator import CalculationResult, SurveyPoint, chain_segments, extract_zero_contour_segments
+from utils.dxf_io import read_text_with_encodings
+from utils.fileio import atomic_write_text
+from version import __version__
+
+ISSUE_NAMES = {
+    'missing_values': '缺失值',
+    'duplicate_coords': '重复坐标',
+    'duplicate_ids': '重复点号',
+    'coord_outliers': '坐标异常',
+    'elevation_outliers': '高程异常',
+    'format_errors': '格式错误',
+}
+
+
+def _finite(value) -> float:
+    """转为有限浮点数；空值、NaN、inf 视为无法解析。"""
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError("非有限数值")
+    return number
 
 
 class DataValidator:
@@ -119,13 +143,19 @@ class DataImporter:
 
     @staticmethod
     def complete_column_mapping(df: pd.DataFrame, mapping: Optional[Dict[str, str]] = None) -> Dict[str, str]:
-        """补齐缺失的 id/x/y/z 映射，不覆盖已经识别出的列。"""
+        """补齐缺失的 id/x/y/z 映射：按顺序取尚未使用的列，不覆盖已识别出的列。
+
+        列数不够时优先保证 X/Y/Z，点号缺失会在解析时自动编号。
+        """
         completed = dict(mapping or {})
-        cols = df.columns.tolist()
-        defaults = {"id": 0, "x": 1, "y": 2, "z": 3}
-        for key, idx in defaults.items():
-            if key not in completed and idx < len(cols):
-                completed[key] = cols[idx]
+        used = set(completed.values())
+        unused = [column for column in df.columns if column not in used]
+        required = [key for key in ("x", "y", "z") if key not in completed]
+        if "id" not in completed and len(unused) > len(required):
+            completed["id"] = unused.pop(0)
+        for key in required:
+            if unused:
+                completed[key] = unused.pop(0)
         return completed
 
     @staticmethod
@@ -143,19 +173,25 @@ class DataImporter:
 
         for row_number, (index, row) in enumerate(df.iterrows(), start=1):
             try:
-                point_id = str(row[id_column]) if id_column is not None else f"P{index + 1}"
+                if x_column is None or y_column is None or z_column is None:
+                    raise KeyError("缺少 X/Y/Z 列映射")
+                raw_id = row[id_column] if id_column is not None else None
+                if raw_id is None or pd.isna(raw_id) or str(raw_id).strip() == "":
+                    point_id = f"P{row_number}"
+                else:
+                    point_id = str(raw_id).strip()
                 design_z = 0.0
                 has_design_z = False
                 if design_column is not None:
                     raw_design = row[design_column]
                     if pd.notna(raw_design) and str(raw_design).strip() != "":
-                        design_z = float(raw_design)
+                        design_z = _finite(raw_design)
                         has_design_z = True
-                z_value = float(row[z_column]) if z_column is not None else 0.0
+                z_value = _finite(row[z_column])
                 pt = SurveyPoint(
                     id=point_id,
-                    x=float(row[x_column]) if x_column is not None else 0.0,
-                    y=float(row[y_column]) if y_column is not None else 0.0,
+                    x=_finite(row[x_column]),
+                    y=_finite(row[y_column]),
                     z=z_value,
                     design_z=design_z,
                     delta_z=(z_value - design_z) if has_design_z else 0.0,
@@ -163,7 +199,7 @@ class DataImporter:
                 )
                 points.append(pt)
             except (ValueError, TypeError, KeyError):
-                format_errors.append(f"第{row_number}行: 坐标或高程无法解析")
+                format_errors.append(f"第{row_number}行: 坐标或高程为空或无法解析，已跳过")
         return points, format_errors
     
     @staticmethod
@@ -325,338 +361,277 @@ class DataImporter:
                         raise ValueError("字段不足")
                     point = SurveyPoint(
                         id=str(point_id),
-                        x=float(easting),
-                        y=float(northing),
-                        z=float(height),
+                        x=_finite(easting),
+                        y=_finite(northing),
+                        z=_finite(height),
                     )
                 else:
                     if len(fields) >= 4:
                         point = SurveyPoint(
                             id=str(fields[0]),
-                            x=float(fields[1]),
-                            y=float(fields[2]),
-                            z=float(fields[3]),
+                            x=_finite(fields[1]),
+                            y=_finite(fields[2]),
+                            z=_finite(fields[3]),
                         )
                     elif len(fields) == 3:
                         point = SurveyPoint(
                             id=f"P{row_number}",
-                            x=float(fields[0]),
-                            y=float(fields[1]),
-                            z=float(fields[2]),
+                            x=_finite(fields[0]),
+                            y=_finite(fields[1]),
+                            z=_finite(fields[2]),
                         )
                     else:
                         raise ValueError("字段不足")
                 points.append(point)
             except (ValueError, TypeError):
-                format_errors.append(f"第{row_number}行: 坐标或高程无法解析")
+                format_errors.append(f"第{row_number}行: 坐标或高程为空或无法解析，已跳过")
         if not points:
             raise ValueError("没有可解析的测量点")
         return points, format_errors, DataImporter._points_to_dataframe(points)
 
 
 class DataExporter:
-    """数据导出器"""
-    
+    """数据导出器。
+
+    导出失败时直接抛出异常，由界面把原因展示给用户。
+    """
+
+    DETAIL_HEADERS = [
+        '三角形编号', '顶点1点号', '顶点1X', '顶点1Y', '顶点1实测高程', '顶点1设计高程', '顶点1高差',
+        '顶点2点号', '顶点2X', '顶点2Y', '顶点2实测高程', '顶点2设计高程', '顶点2高差',
+        '顶点3点号', '顶点3X', '顶点3Y', '顶点3实测高程', '顶点3设计高程', '顶点3高差',
+        '边界内面积(m²)', '平均高差(m)', '挖方量(m³)', '填方量(m³)', '净体积(m³)', '是否混合', '是否被边界裁剪',
+    ]
+
     def __init__(self, project_name: str = "土方计算项目"):
         self.project_name = project_name
         self.calc_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        
-    def export_summary_excel(self, result: CalculationResult, 
-                             design_elevation: float, 
-                             filepath: str) -> bool:
-        """导出汇总表"""
-        wb = openpyxl.Workbook()
-        
-        # 样式定义
-        header_font = Font(bold=True, size=11)
-        header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
-        header_font_white = Font(bold=True, size=11, color="FFFFFF")
-        title_font = Font(bold=True, size=14)
-        subtitle_font = Font(bold=True, size=11)
-        thin_border = Border(
-            left=Side(style='thin'), right=Side(style='thin'),
-            top=Side(style='thin'), bottom=Side(style='thin')
-        )
-        center_align = Alignment(horizontal='center', vertical='center')
-        
-        # ===== Sheet 1: 汇总表 =====
-        ws1 = wb.active
-        ws1.title = "土方量汇总表"
-        
-        # 标题区
-        ws1.merge_cells('A1:F1')
-        ws1['A1'] = self.project_name
-        ws1['A1'].font = title_font
-        ws1['A1'].alignment = center_align
-        
-        ws1.merge_cells('A2:F2')
-        ws1['A2'] = "土方量计算汇总表"
-        ws1['A2'].font = subtitle_font
-        ws1['A2'].alignment = center_align
-        
-        # 项目信息
-        info_row = 4
-        ws1[f'A{info_row}'] = "计算日期"
-        ws1[f'B{info_row}'] = self.calc_date
-        ws1[f'D{info_row}'] = "设计高程"
-        ws1[f'E{info_row}'] = design_elevation
-        
-        ws1[f'A{info_row+1}'] = "计算方法"
-        ws1[f'B{info_row+1}'] = "TIN三角网法 (Delaunay剖分)"
-        ws1[f'D{info_row+1}'] = "三角形总数"
-        ws1[f'E{info_row+1}'] = result.triangle_count
-        
-        ws1[f'A{info_row+2}'] = "混合三角形数"
-        ws1[f'B{info_row+2}'] = result.mixed_triangle_count
-        ws1[f'D{info_row+2}'] = "边界点数"
-        ws1[f'E{info_row+2}'] = len(result.boundary_points) if result.boundary_points else 0
-        
-        # 汇总结果表头
-        header_row = info_row + 4
-        headers = ['项目', '数值', '单位', '说明']
-        for col, h in enumerate(headers, 1):
-            cell = ws1.cell(row=header_row, column=col, value=h)
-            cell.font = header_font_white
-            cell.fill = header_fill
-            cell.alignment = center_align
-            cell.border = thin_border
-            
-        summary_data = [
-            ['总挖方量', round(result.total_cut, 3), 'm³', '实测高程高于设计高程部分'],
-            ['总填方量', round(result.total_fill, 3), 'm³', '实测高程低于设计高程部分'],
-            ['挖填差值', round(result.net_volume, 3), 'm³', '正值为挖方大，负值为填方大'],
-        ]
-        
-        for i, row_data in enumerate(summary_data):
-            for col, val in enumerate(row_data, 1):
-                cell = ws1.cell(row=header_row + 1 + i, column=col, value=val)
-                cell.border = thin_border
-                cell.alignment = center_align
-                
-        # 设置列宽
-        ws1.column_dimensions['A'].width = 18
-        ws1.column_dimensions['B'].width = 18
-        ws1.column_dimensions['C'].width = 10
-        ws1.column_dimensions['D'].width = 35
-        ws1.column_dimensions['E'].width = 18
-        ws1.column_dimensions['F'].width = 18
-        
-        # ===== Sheet 2: 三角形计算明细 =====
-        ws2 = wb.create_sheet("三角形计算明细")
-        
-        detail_headers = [
-            '三角形编号', '顶点1点号', '顶点1X', '顶点1Y', '顶点1实测高程', '顶点1设计高程', '顶点1高差',
-            '顶点2点号', '顶点2X', '顶点2Y', '顶点2实测高程', '顶点2设计高程', '顶点2高差',
-            '顶点3点号', '顶点3X', '顶点3Y', '顶点3实测高程', '顶点3设计高程', '顶点3高差',
-            '水平投影面积(m²)', '平均高差(m)', '挖方量(m³)', '填方量(m³)', '净体积(m³)', '是否混合', '是否边界外'
-        ]
-        
-        for col, h in enumerate(detail_headers, 1):
-            cell = ws2.cell(row=1, column=col, value=h)
-            cell.font = header_font_white
-            cell.fill = header_fill
-            cell.alignment = center_align
-            cell.border = thin_border
-            
-        row_idx = 2
+
+    @staticmethod
+    def _detail_rows(result: CalculationResult):
         for tri in result.triangles:
             if tri.is_boundary:
                 continue
-
-            p0, p1, p2 = tri.vertex_points
-            row_data = [
-                tri.id,
-                p0.id, p0.x, p0.y, p0.z, p0.design_z, p0.delta_z,
-                p1.id, p1.x, p1.y, p1.z, p1.design_z, p1.delta_z,
-                p2.id, p2.x, p2.y, p2.z, p2.design_z, p2.delta_z,
+            row = [tri.id]
+            for point in tri.vertex_points:
+                row += [point.id, point.x, point.y, point.z, point.design_z, round(point.delta_z, 4)]
+            row += [
                 round(tri.area, 3),
-                round(tri.avg_delta_z, 3) if not tri.is_mixed else '',
+                '' if tri.is_mixed else round(tri.avg_delta_z, 3),
                 round(tri.cut_volume, 3),
                 round(tri.fill_volume, 3),
                 round(tri.volume, 3),
                 '是' if tri.is_mixed else '否',
-                '是' if tri.is_boundary else '否'
+                '是' if tri.is_clipped else '否',
             ]
-            
-            for col, val in enumerate(row_data, 1):
-                cell = ws2.cell(row=row_idx, column=col, value=val)
-                cell.border = thin_border
-                cell.alignment = center_align
-            row_idx += 1
-
-        # 调整列宽
-        for col in range(1, len(detail_headers) + 1):
-            ws2.column_dimensions[get_column_letter(col)].width = 14
-            
-        # ===== Sheet 3: 异常数据检查记录 =====
-        ws3 = wb.create_sheet("异常数据检查")
-        ws3.append(["检查项目", "发现数量", "详细信息"])
-        for cell in ws3[1]:
-            cell.font = header_font_white
-            cell.fill = header_fill
-            cell.alignment = center_align
-            cell.border = thin_border
-            
-        # 这里可以添加验证时发现的问题
-        ws3.append(["数据完整性", "已在导入时检查", "见导入日志"])
-        ws3.append(["坐标重复", "已在导入时检查", "见导入日志"])
-        ws3.append(["高程异常", "已在导入时检查", "见导入日志"])
-        
-        for row in ws3.iter_rows(min_row=2, max_row=4, min_col=1, max_col=3):
-            for cell in row:
-                cell.border = thin_border
-                cell.alignment = center_align
-                
-        # 保存
-        try:
-            wb.save(filepath)
-            return True
-        except Exception as e:
-            print(f"导出失败: {e}")
-            return False
-    
-    def export_triangles_csv(self, result: CalculationResult, filepath: str) -> bool:
-        """导出三角形明细CSV"""
-        try:
-            rows = []
-            for tri in result.triangles:
-                if tri.is_boundary:
-                    continue
-                p0, p1, p2 = tri.vertex_points
-                rows.append({
-                    '三角形编号': tri.id,
-                    '顶点1': p0.id, 'X1': p0.x, 'Y1': p0.y, 'Z1': p0.z, '设计高程1': p0.design_z, '高差1': p0.delta_z,
-                    '顶点2': p1.id, 'X2': p1.x, 'Y2': p1.y, 'Z2': p1.z, '设计高程2': p1.design_z, '高差2': p1.delta_z,
-                    '顶点3': p2.id, 'X3': p2.x, 'Y3': p2.y, 'Z3': p2.z, '设计高程3': p2.design_z, '高差3': p2.delta_z,
-                    '面积': round(tri.area, 3),
-                    '平均高差': round(tri.avg_delta_z, 3) if not tri.is_mixed else '',
-                    '挖方量': round(tri.cut_volume, 3),
-                    '填方量': round(tri.fill_volume, 3),
-                    '净体积': round(tri.volume, 3),
-                    '是否混合': '是' if tri.is_mixed else '否',
-                    '是否边界外': '是' if tri.is_boundary else '否'
-                })
-            df = pd.DataFrame(rows)
-            df.to_csv(filepath, index=False, encoding='utf-8-sig')
-            return True
-        except Exception as e:
-            print(f"CSV导出失败: {e}")
-            return False
-    
-    def export_boundary_dxf(self, result: CalculationResult, filepath: str) -> bool:
-        """导出计算边界（闭合多段线）和零填挖线到 DXF。"""
-        from core.calculator import chain_segments, extract_zero_contour_segments
-
-        try:
-            with open(filepath, "w", encoding="utf-8") as handle:
-                handle.write("0\nSECTION\n2\nHEADER\n0\nENDSEC\n")
-                handle.write("0\nSECTION\n2\nENTITIES\n")
-                if result.boundary_points:
-                    self._write_dxf_lwpolyline(
-                        handle, "BOUNDARY", result.boundary_points, closed=True
-                    )
-                for polyline in chain_segments(extract_zero_contour_segments(result)):
-                    if len(polyline) >= 2:
-                        self._write_dxf_lwpolyline(handle, "ZERO_CONTOUR", polyline, closed=False)
-                handle.write("0\nENDSEC\n0\nEOF\n")
-            return True
-        except Exception as error:
-            print(f"DXF导出失败: {error}")
-            return False
+            yield row
 
     @staticmethod
-    def _write_dxf_lwpolyline(handle, layer: str, points, closed: bool) -> None:
-        coords = [(float(x), float(y)) for x, y in points]
-        if closed and coords and coords[0] != coords[-1]:
-            vertex_count = len(coords)
-        else:
-            vertex_count = len(coords)
-        handle.write("0\nLWPOLYLINE\n")
-        handle.write(f"8\n{layer}\n")
-        handle.write(f"90\n{vertex_count}\n")
-        handle.write(f"70\n{1 if closed else 0}\n")
-        for x, y in coords:
-            handle.write(f"10\n{x}\n20\n{y}\n")
-    
-    def generate_report_text(self, result: CalculationResult, 
-                             design_elevation: float,
-                             point_count: int) -> str:
+    def summary_rows(result: CalculationResult) -> List[List[Any]]:
+        """汇总表各行：项目、数值、单位、说明。界面汇总页与报告共用。"""
+        rows = [
+            ['总挖方量', round(result.total_cut, 3), 'm³', '实测高程高于设计高程部分'],
+            ['总填方量', round(result.total_fill, 3), 'm³', '实测高程低于设计高程部分'],
+            ['挖填差值', round(result.net_volume, 3), 'm³', '正值为挖方大（需外运），负值为填方大（需借方）'],
+            ['计算面积', round(result.computed_area, 3), 'm²', '计算边界内且有测点覆盖的水平面积'],
+        ]
+        if result.boundary_area > 0:
+            rows.append(['计算边界面积', round(result.boundary_area, 3), 'm²', ''])
+            rows.append(['测点覆盖率', round(result.coverage_ratio * 100, 2), '%', '低于 99.5% 时请核对边界'])
+        rows += [
+            ['设计高程', result.design_text, '', ''],
+            ['三角形数', result.triangle_count, '个', '参与计算的三角形'],
+            ['混合三角形', result.mixed_triangle_count, '个', '跨越零填挖线，已按零线分割'],
+            ['边界裁剪三角形', result.clipped_triangle_count, '个', '跨越计算边界，只计边界内部分'],
+        ]
+        return rows
+
+    @staticmethod
+    def check_rows(points: Optional[List[SurveyPoint]], result: CalculationResult, limit: int = 30) -> List[List[Any]]:
+        """异常数据检查页：导入检查结果 + 计算过程中的提示。"""
+        rows: List[List[Any]] = []
+        if points is not None:
+            issues = DataValidator.validate_points(points)
+            for key, name in ISSUE_NAMES.items():
+                items = issues.get(key, [])
+                detail = "；".join(items[:limit]) + (f"；……共 {len(items)} 条" if len(items) > limit else "")
+                rows.append([name, len(items), detail or "未发现"])
+        rows.append(["计算提示", len(result.warnings), "\n".join(result.warnings) or "无"])
+        return rows
+
+    def export_summary_excel(self, result: CalculationResult, filepath: str,
+                             points: Optional[List[SurveyPoint]] = None) -> bool:
+        """导出汇总表、三角形明细和异常数据检查。
+
+        使用只写模式并只给表头设置样式，大数据量时速度约为逐格设置样式的 3 倍。
+        """
+        wb = openpyxl.Workbook(write_only=True)
+        header_font = Font(bold=True, size=11, color="FFFFFF")
+        header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
+        center = Alignment(horizontal='center', vertical='center')
+
+        def header(ws, values):
+            cells = []
+            for value in values:
+                cell = WriteOnlyCell(ws, value=value)
+                cell.font, cell.fill, cell.alignment = header_font, header_fill, center
+                cells.append(cell)
+            ws.append(cells)
+
+        def bold(ws, value, size=11):
+            cell = WriteOnlyCell(ws, value=value)
+            cell.font = Font(bold=True, size=size)
+            return cell
+
+        ws1 = wb.create_sheet("土方量汇总表")
+        for column, width in zip("ABCDEF", (18, 26, 10, 44, 18, 18)):
+            ws1.column_dimensions[column].width = width
+        ws1.append([bold(ws1, self.project_name, 14)])
+        ws1.append([bold(ws1, "土方量计算汇总表")])
+        ws1.append([])
+        ws1.append(["计算日期", self.calc_date, "", "计算方法", "TIN三角网法（Delaunay剖分，边界精确裁剪）"])
+        ws1.append(["设计高程", result.design_text, "", "计算边界顶点数", len(result.boundary_points or [])])
+        ws1.append([])
+        header(ws1, ['项目', '数值', '单位', '说明'])
+        for row in self.summary_rows(result):
+            ws1.append(row)
+
+        ws2 = wb.create_sheet("三角形计算明细")
+        ws2.freeze_panes = "B2"
+        for index in range(len(self.DETAIL_HEADERS)):
+            ws2.column_dimensions[get_column_letter(index + 1)].width = 14
+        header(ws2, self.DETAIL_HEADERS)
+        for row in self._detail_rows(result):
+            ws2.append(row)
+
+        ws3 = wb.create_sheet("异常数据检查")
+        ws3.column_dimensions["A"].width = 14
+        ws3.column_dimensions["B"].width = 10
+        ws3.column_dimensions["C"].width = 100
+        header(ws3, ["检查项目", "发现数量", "详细信息"])
+        for row in self.check_rows(points, result):
+            ws3.append(row)
+
+        # 先完整写入内存再落盘：目标文件被占用时不会留下半成品和临时文件
+        buffer = io.BytesIO()
+        wb.save(buffer)
+        Path(filepath).write_bytes(buffer.getvalue())
+        return True
+
+    def export_triangles_csv(self, result: CalculationResult, filepath: str) -> bool:
+        """导出三角形明细CSV"""
+        df = pd.DataFrame(list(self._detail_rows(result)), columns=self.DETAIL_HEADERS)
+        df.to_csv(filepath, index=False, encoding='utf-8-sig')
+        return True
+
+    def export_boundary_dxf(self, result: CalculationResult, filepath: str) -> bool:
+        """导出计算边界（闭合多段线）和零填挖线到 DXF。
+
+        采用 R12 格式的 POLYLINE，AutoCAD、CASS 等都能直接打开。
+        """
+        parts = ["0\nSECTION\n2\nHEADER\n9\n$ACADVER\n1\nAC1009\n0\nENDSEC\n",
+                 "0\nSECTION\n2\nENTITIES\n"]
+        if result.boundary_points:
+            parts.append(self._dxf_polyline("BOUNDARY", result.boundary_points, closed=True))
+        for polyline in chain_segments(extract_zero_contour_segments(result)):
+            if len(polyline) >= 2:
+                parts.append(self._dxf_polyline("ZERO_CONTOUR", polyline, closed=False))
+        parts.append("0\nENDSEC\n0\nEOF\n")
+        with open(filepath, "w", encoding="utf-8") as handle:
+            handle.write("".join(parts))
+        return True
+
+    @staticmethod
+    def _dxf_polyline(layer: str, points, closed: bool) -> str:
+        lines = [f"0\nPOLYLINE\n8\n{layer}\n66\n1\n10\n0.0\n20\n0.0\n30\n0.0\n70\n{1 if closed else 0}\n"]
+        for x, y in points:
+            lines.append(f"0\nVERTEX\n8\n{layer}\n10\n{float(x)!r}\n20\n{float(y)!r}\n30\n0.0\n")
+        lines.append(f"0\nSEQEND\n8\n{layer}\n")
+        return "".join(lines)
+
+    def generate_report_text(self, result: CalculationResult, point_count: int) -> str:
         """生成文本报告"""
-        report = f"""
+        if result.net_volume > 0:
+            balance = "(挖方大于填方，需外运)"
+        elif result.net_volume < 0:
+            balance = "(填方大于挖方，需借方)"
+        else:
+            balance = "(挖填平衡)"
+        area_lines = f"计算面积: {result.computed_area:.3f} m²"
+        if result.boundary_area > 0:
+            area_lines += (
+                f"\n计算边界面积: {result.boundary_area:.3f} m²"
+                f"（测点覆盖率 {result.coverage_ratio * 100:.2f}%）"
+            )
+        warnings = "\n".join(f"- {item}" for item in result.warnings) or "无"
+        return f"""
 ============================================================
               {self.project_name} - 土方计算报告
 ============================================================
 
 【项目基本信息】
 计算日期: {self.calc_date}
-计算方法: TIN三角网法 (Delaunay三角剖分)
+计算方法: TIN三角网法 (Delaunay三角剖分，边界精确裁剪)
 测量点数: {point_count}
 三角形总数: {result.triangle_count}
 混合挖填三角形: {result.mixed_triangle_count}
-计算边界点数: {len(result.boundary_points) if result.boundary_points else 0}
-设计高程: {design_elevation} m
+边界裁剪三角形: {result.clipped_triangle_count}
+计算边界顶点数: {len(result.boundary_points) if result.boundary_points else 0}
+设计高程: {result.design_text}
+{area_lines}
 
 【计算结果汇总】
 总挖方量: {result.total_cut:.3f} m³
 总填方量: {result.total_fill:.3f} m³
 挖填差值: {result.net_volume:.3f} m³
-{'(挖方大于填方，需外运)' if result.net_volume > 0 else '(填方大于挖方，需借方)' if result.net_volume < 0 else '(挖填平衡)'}
+{balance}
+
+【计算提示】
+{warnings}
 
 【说明】
 1. 本成果基于实测点构建TIN三角网，按水平投影面积×平均高差法计算。
-2. 混合挖填三角形已按零填挖线自动分割计算，避免正负高差抵消。
-3. 所有三角形均保留面积、顶点高程、高差及分项体积，可逐项复核。
-4. 计算结果仅供工程参考，正式计量请以复核成果为准。
+2. 跨越计算边界的三角形按边界精确裁剪，只计边界以内部分。
+3. 混合挖填三角形已按零填挖线分割计算，避免正负高差抵消。
+4. 所有三角形均保留面积、顶点高程、高差及分项体积，可逐项复核。
+5. 计算结果仅供工程参考，正式计量请以复核成果为准。
 
 ============================================================
 """
-        return report
 
     def export_pdf_report(
         self,
         result: CalculationResult,
-        design_elevation: float,
         point_count: int,
         points: List[SurveyPoint],
         boundary: List[Tuple[float, float]],
         filepath: str,
     ) -> bool:
         """导出含挖填汇总与成果图的 PDF 计算书。"""
-        import matplotlib.pyplot as plt
         from matplotlib.backends.backend_pdf import PdfPages
         from matplotlib.figure import Figure
         from utils.plotter import create_standalone_figure, setup_chinese_font
 
         setup_chinese_font()
-        try:
-            with PdfPages(filepath) as pdf:
-                summary = Figure(figsize=(8.27, 11.69))
-                axis = summary.add_subplot(111)
-                axis.axis("off")
-                axis.text(
-                    0.08,
-                    0.96,
-                    self.generate_report_text(result, design_elevation, point_count).strip(),
-                    va="top",
-                    ha="left",
-                    fontsize=10,
-                    family=plt.rcParams["font.family"],
-                    wrap=True,
-                    transform=axis.transAxes,
-                )
-                pdf.savefig(summary)
-                plt.close(summary)
+        with PdfPages(filepath) as pdf:
+            summary = Figure(figsize=(8.27, 11.69))
+            axis = summary.add_subplot(111)
+            axis.axis("off")
+            axis.text(
+                0.06,
+                0.97,
+                self.generate_report_text(result, point_count).strip(),
+                va="top",
+                ha="left",
+                fontsize=9,
+                wrap=True,
+                transform=axis.transAxes,
+            )
+            pdf.savefig(summary)
 
-                figure = create_standalone_figure(
-                    result, points, boundary, design_elevation, self.project_name
-                )
-                figure.suptitle(f"{self.project_name} 计算结果图", fontsize=14)
-                pdf.savefig(figure)
-                plt.close(figure)
-            return True
-        except Exception as error:
-            print(f"PDF导出失败: {error}")
-            return False
+            figure = create_standalone_figure(result, points, boundary, self.project_name)
+            pdf.savefig(figure)
+        return True
 
 
 def save_project(
@@ -672,7 +647,7 @@ def save_project(
     payload = {
         "format": "tin-earthwork-project",
         "format_version": 1,
-        "app_version": "1.3.0",
+        "app_version": __version__,
         "project_name": project_name,
         "design_elevation": float(design_elevation),
         "use_partition": bool(use_partition),
@@ -690,8 +665,7 @@ def save_project(
             for point in points
         ],
     }
-    with open(filepath, "w", encoding="utf-8") as handle:
-        json.dump(payload, handle, ensure_ascii=False, indent=2)
+    atomic_write_text(filepath, json.dumps(payload, ensure_ascii=False, indent=2))
 
 
 def load_project(filepath: str) -> Dict[str, Any]:
@@ -726,15 +700,3 @@ def load_project(filepath: str) -> Dict[str, Any]:
         "boundary": boundary,
         "points": points,
     }
-
-
-def save_project_config(config: Dict[str, Any], filepath: str):
-    """保存项目配置"""
-    with open(filepath, 'w', encoding='utf-8') as f:
-        json.dump(config, f, ensure_ascii=False, indent=2)
-
-
-def load_project_config(filepath: str) -> Dict[str, Any]:
-    """加载项目配置"""
-    with open(filepath, 'r', encoding='utf-8') as f:
-        return json.load(f)
