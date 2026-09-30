@@ -79,6 +79,7 @@ def test_cass_dat_uses_east_as_x_like_the_point_importer(tmp_path):
     ("pts.txt", "点号 X坐标 Y坐标 实测高程\nA 1.5 2.5 10\nB 11.5 2.5 10\nC 11.5 9.5 10\nD 1.5 9.5 10\n"),
     ("pts.txt", "A 1.5 2.5 10\nB 11.5 2.5 10\nC 11.5 9.5 10\nD 1.5 9.5 10\n"),
     ("pts.csv", "点号,X,Y,高程\n7,1.5,2.5,10\n8,11.5,2.5,10\n9,11.5,9.5,10\n10,1.5,9.5,10\n"),
+    ("pts.csv", "7,1.5,2.5,10\n8,11.5,2.5,10\n9,11.5,9.5,10\n10,1.5,9.5,10\n"),
     ("pts.dat", "7,KZ,1.5,2.5,10\n8,KZ,11.5,2.5,10\n9,KZ,11.5,9.5,10\n10,KZ,1.5,9.5,10\n"),
 ])
 def test_same_file_gives_same_coordinates_as_point_import(tmp_path, name, text):

@@ -347,3 +347,20 @@ def test_numeric_point_ids_stay_whole_numbers(tmp_path):
         {"点号": [7, None, 9], "X": [1.5, 11.5, 11.5], "Y": [2.5, 2.5, 9.5], "高程": [10, 10.5, 10]}
     ).to_excel(xlsx_path, index=False)
     assert [point.id for point in DataImporter.import_file(str(xlsx_path))[0]] == ["7", "P2", "9"]
+
+
+def test_csv_without_header_keeps_its_first_point(tmp_path):
+    # 曾经的问题：没有表头的 CSV 交给 pandas 读，第一个测点被当成表头悄悄丢掉
+    path = tmp_path / "noheader.csv"
+    path.write_text("1,1.5,2.5,10\n2,11.5,2.5,10.5\n3,11.5,9.5,10\n4,1.5,9.5,10.2\n", encoding="utf-8")
+    points, issues, frame = DataImporter.import_file(str(path))
+    assert [(p.id, p.x, p.y, p.z) for p in points] == [
+        ("1", 1.5, 2.5, 10.0), ("2", 11.5, 2.5, 10.5), ("3", 11.5, 9.5, 10.0), ("4", 1.5, 9.5, 10.2)
+    ]
+    assert issues["format_errors"] == [] and len(frame) == 4
+
+    # 有表头的 CSV 照旧按列名认，列的先后无所谓
+    named = tmp_path / "header.csv"
+    named.write_text("高程,Y,X,点号\n10,2.5,1.5,A\n10.5,2.5,11.5,B\n10,9.5,11.5,C\n", encoding="gbk")
+    points, _, _ = DataImporter.import_file(str(named))
+    assert [(p.id, p.x, p.y, p.z) for p in points] == [("A", 1.5, 2.5, 10.0), ("B", 11.5, 2.5, 10.5), ("C", 11.5, 9.5, 10.0)]

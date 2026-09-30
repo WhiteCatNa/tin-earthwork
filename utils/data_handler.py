@@ -245,10 +245,13 @@ class DataImporter:
         path = Path(filepath)
         suffix = path.suffix.lower()
         
+        # 没有表头的 CSV 按“点号,X,Y,高程”文本读；交给 pandas 会把第一个测点当成表头丢掉
+        as_text = suffix in ['.txt', '.dat'] or (suffix == '.csv' and not DataImporter._csv_has_header(filepath))
+
         try:
             if suffix in ['.xlsx', '.xls']:
                 df = pd.read_excel(filepath)
-            elif suffix == '.csv':
+            elif suffix == '.csv' and not as_text:
                 # 尝试多种编码
                 for enc in ['utf-8', 'gbk', 'gb2312', 'utf-16']:
                     try:
@@ -258,7 +261,7 @@ class DataImporter:
                         continue
                 else:
                     raise ValueError("无法识别CSV编码")
-            elif suffix in ['.txt', '.dat']:
+            elif as_text:
                 points, format_errors, df = DataImporter.import_survey_text(
                     filepath, cass=(suffix == '.dat')
                 )
@@ -281,6 +284,19 @@ class DataImporter:
         issues = DataValidator.validate_points(points)
         issues["format_errors"].extend(format_errors)
         return points, issues, df
+
+    @staticmethod
+    def _csv_has_header(filepath: str) -> bool:
+        """CSV 的第一行是不是表头（而不是第一个测点）。读不了的文件当作有表头，由后面的读取报错。"""
+        try:
+            text = read_text_with_encodings(filepath)
+        except OSError:
+            return True
+        for raw in text.splitlines():
+            line = raw.strip()
+            if line:
+                return DataImporter._is_survey_header(DataImporter._split_survey_fields(line))
+        return True
 
     @staticmethod
     def _split_survey_fields(line: str) -> List[str]:
