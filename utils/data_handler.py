@@ -198,13 +198,23 @@ class DataImporter:
         z_column = mapping.get("z")
         design_column = mapping.get("design_z")
 
+        # 点号直接从列里取：逐行取时整数会随其他列升成浮点，点号 7 就成了 “7.0”
+        id_values = None
+        if id_column is not None:
+            id_series = df[id_column]
+            if isinstance(id_series, pd.DataFrame):   # 表头里有重名的列，取第一列
+                id_series = id_series.iloc[:, 0]
+            id_values = id_series.tolist()
+
         for row_number, (index, row) in enumerate(df.iterrows(), start=1):
             try:
                 if x_column is None or y_column is None or z_column is None:
                     raise KeyError("缺少 X/Y/Z 列映射")
-                raw_id = row[id_column] if id_column is not None else None
+                raw_id = id_values[row_number - 1] if id_values is not None else None
                 if raw_id is None or pd.isna(raw_id) or str(raw_id).strip() == "":
                     point_id = f"P{row_number}"
+                elif isinstance(raw_id, float) and raw_id.is_integer():
+                    point_id = str(int(raw_id))   # 列里有空点号时整列是浮点
                 else:
                     point_id = str(raw_id).strip()
                 design_z = 0.0

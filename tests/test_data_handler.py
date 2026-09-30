@@ -334,3 +334,16 @@ def test_project_file_is_written_atomically(tmp_path, monkeypatch):
         pass
     assert path.read_text(encoding="utf-8") == original
     assert [p.name for p in tmp_path.iterdir()] == ["job.tinproj.json"]
+
+
+def test_numeric_point_ids_stay_whole_numbers(tmp_path):
+    # 曾经的问题：点号列是整数、坐标列是小数时，点号被读成 “7.0”
+    csv_path = tmp_path / "ids.csv"
+    csv_path.write_text("点号,X,Y,高程\n7,1.5,2.5,10\n8,11.5,2.5,10.5\n9,11.5,9.5,10\n", encoding="utf-8")
+    assert [point.id for point in DataImporter.import_file(str(csv_path))[0]] == ["7", "8", "9"]
+
+    xlsx_path = tmp_path / "ids.xlsx"
+    pd.DataFrame(
+        {"点号": [7, None, 9], "X": [1.5, 11.5, 11.5], "Y": [2.5, 2.5, 9.5], "高程": [10, 10.5, 10]}
+    ).to_excel(xlsx_path, index=False)
+    assert [point.id for point in DataImporter.import_file(str(xlsx_path))[0]] == ["7", "P2", "9"]
