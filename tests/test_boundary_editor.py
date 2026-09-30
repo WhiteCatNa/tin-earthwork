@@ -116,11 +116,14 @@ def test_zoom_and_pan_keep_the_view_and_do_not_add_points(frame):
     px, py = frame.plotter.ax.transData.transform((30.0, 30.0))
     assert frame.plotter.ax.contains_point((px, py))     # 以光标为中心缩放，光标下的位置还在视野里
 
+    # 重绘时 matplotlib 可能为保持 1:1 比例微调显示范围，平移的基准取拖动前重绘过的视野
+    frame.canvas.draw()
+    before_pan = frame.plotter.get_view()
     _drag(frame, (35.0, 35.0), (25.0, 30.0))             # 拖动空白处：平移
     panned = frame.plotter.get_view()
     assert frame.boundary == []
-    assert panned[0][0] == pytest.approx(zoomed[0][0] + 10.0, abs=0.5)
-    assert panned[1][0] == pytest.approx(zoomed[1][0] + 5.0, abs=0.5)
+    assert panned[0][0] == pytest.approx(before_pan[0][0] + 10.0, abs=0.5)
+    assert panned[1][0] == pytest.approx(before_pan[1][0] + 5.0, abs=0.5)
 
     _click(frame, 30.2, 29.7)                            # 加点后视野不跳回全图
     assert frame.boundary == [(30.0, 30.0)]
@@ -309,6 +312,13 @@ def _tk_event(main_window, frame, sequence, x, y):
 
 def test_real_tk_events_click_drag_and_right_click(main_window, frame):
     """走一遍 Tk → matplotlib → 边界页的完整事件链：按键编号、按下/松开配对、坐标换算。"""
+    if not frame.canvas.get_tk_widget().winfo_ismapped():
+        # Windows 上测试窗口是 withdraw 隐藏的，Tk 不给没显示的窗口发鼠标事件；改成透明显示
+        main_window.attributes("-alpha", 0.0)
+        main_window.deiconify()
+        main_window.update()
+    if not frame.canvas.get_tk_widget().winfo_ismapped():
+        pytest.skip("这个环境下测试窗口无法显示，发不了真实鼠标事件")
     for x, y in [(0.0, 0.0), (100.0, 0.0), (100.0, 100.0), (0.0, 100.0)]:
         _tk_event(main_window, frame, "<ButtonPress-1>", x, y)
         _tk_event(main_window, frame, "<ButtonRelease-1>", x, y)
