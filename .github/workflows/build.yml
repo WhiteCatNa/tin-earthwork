@@ -9,12 +9,14 @@ on:
 jobs:
   test-and-build-windows:
     runs-on: windows-latest
+    env:
+      PYTHONUTF8: "1"   # Windows 控制台默认 cp1252，中文输出会报 UnicodeEncodeError
     steps:
       - name: 检出代码
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: 配置 Python 3.13
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.13"
 
@@ -33,7 +35,7 @@ jobs:
         run: pyinstaller --noconfirm --clean tin_earthwork.spec
 
       - name: 上传产物
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: TIN土方自动算量系统-Windows
           path: dist/TIN土方自动算量系统/
