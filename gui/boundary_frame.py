@@ -14,10 +14,12 @@ import numpy as np
 class BoundaryFrame(ttk.Frame):
     """计算边界设置页面"""
     
-    def __init__(self, parent, points: List[SurveyPoint], on_boundary_set: Callable[[List[Tuple[float, float]]], None]):
+    def __init__(self, parent, points: List[SurveyPoint], on_boundary_set: Callable[[List[Tuple[float, float]]], None],
+                 notify: Optional[Callable[[str], None]] = None):
         super().__init__(parent)
         self.points = points
         self.on_boundary_set = on_boundary_set
+        self.notify = notify or (lambda message: messagebox.showinfo("提示", message))
         self.boundary: List[Tuple[float, float]] = []
         self.edit_mode = True
         self.current_point: Optional[Tuple[float, float]] = None
@@ -48,18 +50,57 @@ class BoundaryFrame(ttk.Frame):
         
         # 模式选择
         mode_frame = ttk.Frame(ctrl_frame)
-        mode_frame.pack(fill=tk.X, pady=(0, 4))
+        mode_frame.pack(side=tk.TOP, fill=tk.X, pady=(0, 4))
         self.edit_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(mode_frame, text="编辑模式（左键添加）", variable=self.edit_var,
                        command=self._toggle_edit_mode).pack(anchor=tk.W)
-        
-        # 边界点列表
-        ttk.Label(ctrl_frame, text="边界点坐标:", style="Title.TLabel").pack(anchor=tk.W, pady=(10, 0))
-        
+
+        # 底部控件先占位（side=BOTTOM 自下而上），窗口矮时由坐标列表让出高度，
+        # 保证“确认边界”始终可见
+        info_text = ("1. 不知道边界时，先点“自动生成数据范围边界”\n"
+                    "2. 手工边界按顺序逐点左键点击，会吸附到附近测点\n"
+                    "3. 右键或“撤销上一点”可回退；至少 3 个点，自动闭合\n"
+                    "4. 可导入 DXF（多段线）或 CSV/TXT（前两列为 X、Y）")
+        ttk.Label(ctrl_frame, text=info_text, justify=tk.LEFT, style="Hint.TLabel").pack(
+            side=tk.BOTTOM, anchor=tk.W, pady=(8, 0)
+        )
+        self.boundary_status_var = tk.StringVar(value="待添加边界点")
+        ttk.Label(ctrl_frame, textvariable=self.boundary_status_var, style="Accent.TLabel").pack(
+            side=tk.BOTTOM, anchor=tk.W
+        )
+        self.coord_var = tk.StringVar(value="X: --  Y: --")
+        ttk.Label(ctrl_frame, textvariable=self.coord_var, style="Muted.TLabel").pack(
+            side=tk.BOTTOM, anchor=tk.W, pady=(8, 2)
+        )
+        ttk.Button(ctrl_frame, text="确认边界", command=self._confirm_boundary,
+                  style='Accent.TButton').pack(side=tk.BOTTOM, fill=tk.X, pady=(2, 0))
+        ttk.Separator(ctrl_frame, orient='horizontal').pack(side=tk.BOTTOM, fill=tk.X, pady=8)
+
+        btn_frame = ttk.Frame(ctrl_frame)
+        btn_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=(4, 0))
+        ttk.Button(btn_frame, text="自动生成数据范围边界", command=self._create_auto_boundary).grid(
+            row=0, column=0, columnspan=2, sticky="ew", pady=2
+        )
+        ttk.Button(btn_frame, text="导入边界文件", command=self._import_boundary).grid(
+            row=1, column=0, columnspan=2, sticky="ew", pady=2
+        )
+        ttk.Button(btn_frame, text="撤销上一点", command=self._undo_last_point).grid(
+            row=2, column=0, sticky="ew", pady=2, padx=(0, 3)
+        )
+        ttk.Button(btn_frame, text="删除选中点", command=self._delete_selected).grid(
+            row=2, column=1, sticky="ew", pady=2, padx=(3, 0)
+        )
+        ttk.Button(btn_frame, text="清空边界", command=self._clear_boundary).grid(
+            row=3, column=0, columnspan=2, sticky="ew", pady=2
+        )
+        btn_frame.columnconfigure((0, 1), weight=1, uniform="buttons")
+
+        # 边界点列表占用剩余高度
+        ttk.Label(ctrl_frame, text="边界点坐标:", style="Title.TLabel").pack(side=tk.TOP, anchor=tk.W, pady=(10, 0))
         list_frame = ttk.Frame(ctrl_frame)
-        list_frame.pack(fill=tk.BOTH, expand=True, pady=8)
-        
-        self.tree_boundary = ttk.Treeview(list_frame, columns=('idx', 'x', 'y'), show='headings', height=15)
+        list_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True, pady=8)
+
+        self.tree_boundary = ttk.Treeview(list_frame, columns=('idx', 'x', 'y'), show='headings', height=4)
         self.tree_boundary.heading('idx', text='序号')
         self.tree_boundary.heading('x', text='X坐标')
         self.tree_boundary.heading('y', text='Y坐标')
@@ -67,38 +108,12 @@ class BoundaryFrame(ttk.Frame):
         self.tree_boundary.column('x', width=100, anchor='center')
         self.tree_boundary.column('y', width=100, anchor='center')
         self.tree_boundary.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        
+
         vsb = ttk.Scrollbar(list_frame, orient="vertical", command=self.tree_boundary.yview)
         self.tree_boundary.configure(yscrollcommand=vsb.set)
         vsb.pack(side=tk.RIGHT, fill=tk.Y)
-        
-        # 编辑按钮
-        btn_frame = ttk.Frame(ctrl_frame)
-        btn_frame.pack(fill=tk.X, pady=4)
-        ttk.Button(btn_frame, text="自动生成数据范围边界", command=self._create_auto_boundary).pack(fill=tk.X, pady=2)
-        ttk.Button(btn_frame, text="导入边界文件", command=self._import_boundary).pack(fill=tk.X, pady=2)
-        ttk.Button(btn_frame, text="撤销上一点", command=self._undo_last_point).pack(fill=tk.X, pady=2)
-        ttk.Button(btn_frame, text="清空边界", command=self._clear_boundary).pack(fill=tk.X, pady=2)
-        ttk.Button(btn_frame, text="删除选中点", command=self._delete_selected).pack(fill=tk.X, pady=2)
-        ttk.Separator(btn_frame, orient='horizontal').pack(fill=tk.X, pady=8)
-        ttk.Button(btn_frame, text="确认边界", command=self._confirm_boundary, 
-                  style='Accent.TButton').pack(fill=tk.X, pady=2)
-        
-        self.coord_var = tk.StringVar(value="X: --  Y: --")
-        ttk.Label(ctrl_frame, textvariable=self.coord_var, style="Muted.TLabel").pack(anchor=tk.W, pady=(10, 2))
-        self.boundary_status_var = tk.StringVar(value="待添加边界点")
-        ttk.Label(ctrl_frame, textvariable=self.boundary_status_var, style="Accent.TLabel").pack(anchor=tk.W)
         self._update_boundary_status()
 
-        # 信息提示
-        info_text = ("操作说明:\n"
-                    "1. 不知道边界时，先点“自动生成数据范围边界”\n"
-                    "2. 手工边界按顺时针或逆时针逐点左键点击\n"
-                    "3. 点会自动吸附到附近测量点；右键或“撤销”可回退\n"
-                    "4. 至少 3 个点，系统会自动闭合；确认前检查状态提示\n"
-                    "5. 也可导入 DXF（LWPOLYLINE/POLYLINE）或 CSV/TXT（前两列为 X、Y）")
-        ttk.Label(ctrl_frame, text=info_text, justify=tk.LEFT, style="Hint.TLabel").pack(anchor=tk.W, pady=(10, 0))
-        
     def _toggle_edit_mode(self):
         self.edit_mode = self.edit_var.get()
         self._refresh_plot()
@@ -260,7 +275,7 @@ class BoundaryFrame(ttk.Frame):
             self.current_point = None
             self._refresh_plot()
             self._update_boundary_list()
-            messagebox.showinfo("成功", f"导入边界点 {len(self.boundary)} 个")
+            self.notify(f"已导入边界点 {len(self.boundary)} 个，检查无误后点“确认边界”")
         except Exception as error:
             messagebox.showerror("错误", f"导入失败: {error}")
             
@@ -292,7 +307,6 @@ class BoundaryFrame(ttk.Frame):
             return
         self._update_boundary_list()
         self.on_boundary_set(list(self.boundary))
-        messagebox.showinfo("成功", f"边界已设置，共 {len(self.boundary)} 个点")
 
     def set_boundary(self, boundary: List[Tuple[float, float]]):
         """外部设置边界"""

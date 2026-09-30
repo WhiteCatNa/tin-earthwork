@@ -421,6 +421,19 @@ class TINEarthworkCalculator:
         self.build_tin()
         return self.calculate_volumes()
 
+    def balanced_design_elevation(self) -> float:
+        """挖填平衡（净方量为 0）的统一设计高程。
+
+        统一设计高程为 h 时，净方量 = ∫z dA − h·A，对 h 是线性的，
+        所以任取一个 h 算一次，h + 净方量 / 计算面积 就是精确的平衡高程。
+        会把测点改为统一设计高程。
+        """
+        base = self.design_elevation
+        result = self.run_full_calculation(base)
+        if result.computed_area <= 0:
+            raise ValueError("计算边界内没有测点覆盖，无法求挖填平衡高程")
+        return base + result.net_volume / result.computed_area
+
 
 def extract_zero_contour_segments(result: CalculationResult) -> List[Tuple[XY, XY]]:
     """收集边界内所有零填挖线段（去重）。"""

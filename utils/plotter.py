@@ -239,7 +239,9 @@ class EarthworkPlotter:
             self.selected_triangle = None
 
         if show_legend and artists["legend"]:
-            self.ax.legend(handles=artists["legend"], loc='upper right', fontsize=9, framealpha=0.9)
+            # 图例放在图下方一行，不遮挡边界角上的挖填区域
+            self.ax.legend(handles=artists["legend"], loc='upper center', bbox_to_anchor=(0.5, -0.09),
+                           ncol=len(artists["legend"]), fontsize=9, frameon=False)
         self.ax.set_title(
             f'土方计算结果 - 挖方:{result.total_cut:.1f}m³  填方:{result.total_fill:.1f}m³  净:{result.net_volume:.1f}m³',
             fontsize=11, pad=10)

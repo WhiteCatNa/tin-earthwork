@@ -29,6 +29,9 @@ COLORS = {
     "status_bg": "#E8EEF1",
     "white": "#FFFFFF",
     "disabled": "#8C9BA5",
+    "flash": "#FBEFD2",      # 状态栏操作反馈的短暂高亮
+    "cut_bg": "#FBECEA",     # 结果卡片底色
+    "fill_bg": "#E6F4F2",
 }
 
 PLOT_COLORS = {
@@ -105,9 +108,13 @@ def style_text_widget(widget: tk.Text) -> None:
 
 def apply_theme(root: tk.Tk) -> ttk.Style:
     """Configure the clam ttk theme to the survey-drawing palette."""
-    resolve_font_family(root)
+    family = resolve_font_family(root)
     root.configure(bg=COLORS["bg"])
-    root.option_add("*Font", font(11))
+    # 改具名字体而不是 option_add("*Font")：后者会作为每个 ttk 控件自身的 font 选项，
+    # 盖掉样式里的字号和粗体（标题、主按钮、结果卡片都会变成 11 号常规字）
+    import tkinter.font as tkfont
+    for name in ("TkDefaultFont", "TkTextFont", "TkMenuFont", "TkHeadingFont", "TkCaptionFont"):
+        tkfont.nametofont(name, root).configure(family=family, size=11)
 
     style = ttk.Style(root)
     style.theme_use("clam")
@@ -302,6 +309,15 @@ def apply_theme(root: tk.Tk) -> ttk.Style:
         )
 
     style.configure("TSeparator", background=COLORS["rule"])
+    style.configure("Card.TFrame", background=COLORS["surface"], relief="solid", borderwidth=1)
+    for name, fg, bg in (
+        ("Cut", COLORS["cut"], COLORS["cut_bg"]),
+        ("Fill", COLORS["fill"], COLORS["fill_bg"]),
+        ("Net", COLORS["ink"], COLORS["surface"]),
+    ):
+        style.configure(f"{name}Card.TFrame", background=bg)
+        style.configure(f"{name}CardTitle.TLabel", background=bg, foreground=COLORS["dim"], font=small)
+        style.configure(f"{name}CardValue.TLabel", background=bg, foreground=fg, font=font(17, "bold"))
     style.configure("Status.TLabel", background=COLORS["status_bg"], foreground=COLORS["dim"], font=small)
 
     return style

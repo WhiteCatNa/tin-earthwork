@@ -22,6 +22,8 @@ from utils.recent_projects import forget_recent, load_recent, remember_recent
 from version import APP_NAME, COMPANY, __version__
 
 PROJECT_SUFFIXES = (".tinproj.json", ".json")
+SHORTCUT_MODIFIER = "Command" if sys.platform == "darwin" else "Control"
+SHORTCUT_LABEL = "⌘" if sys.platform == "darwin" else "Ctrl"
 
 
 class MainApplication(tk.Tk):
@@ -30,7 +32,6 @@ class MainApplication(tk.Tk):
     def __init__(self):
         super().__init__()
         
-        self.title(f"{APP_NAME} v{__version__} - {COMPANY}")
         self.geometry("1400x900")
         self.minsize(1200, 800)
         
@@ -42,6 +43,8 @@ class MainApplication(tk.Tk):
         self.project_name_var = tk.StringVar(value=DEFAULT_PROJECT_NAME)
         self.project_path = None
         self._closing = False
+        self._dirty = False
+        self._flash_after_id = None
         
         # 创建界面
         self._create_widgets()
@@ -50,109 +53,39 @@ class MainApplication(tk.Tk):
         self.protocol("WM_DELETE_WINDOW", self._on_closing)
         
     def _create_widgets(self):
+        # 顶栏只占一行：左侧名称，右侧工程操作，给图表留出高度
         header = tk.Frame(self, bg=COLORS["accent"])
         header.pack(fill=tk.X)
         tk.Label(
-            header,
-            text=APP_NAME,
-            bg=COLORS["accent"],
-            fg=COLORS["white"],
-            font=font(16, "bold"),
-            anchor=tk.W,
-        ).pack(fill=tk.X, padx=16, pady=(12, 0))
+            header, text=APP_NAME, bg=COLORS["accent"], fg=COLORS["white"], font=font(15, "bold")
+        ).pack(side=tk.LEFT, padx=(16, 10), pady=10)
         tk.Label(
-            header,
-            text=COMPANY,
-            bg=COLORS["accent"],
-            fg=COLORS["header_sub"],
-            font=font(10),
-            anchor=tk.W,
-        ).pack(fill=tk.X, padx=16, pady=(2, 12))
+            header, text=f"v{__version__}  ·  {COMPANY}", bg=COLORS["accent"], fg=COLORS["header_sub"], font=font(10)
+        ).pack(side=tk.LEFT, pady=(4, 0))
+
         actions = tk.Frame(header, bg=COLORS["accent"])
-        actions.pack(fill=tk.X, padx=16, pady=(0, 10))
+        actions.pack(side=tk.RIGHT, padx=16)
+        tk.Label(
+            actions, text="项目名称", bg=COLORS["accent"], fg=COLORS["white"], font=font(10)
+        ).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Entry(actions, textvariable=self.project_name_var, width=24).pack(side=tk.LEFT, padx=(0, 16))
         ttk.Button(actions, text="打开工程", command=self._open_project).pack(side=tk.LEFT)
-        ttk.Button(actions, text="保存工程", command=self._save_project).pack(side=tk.LEFT, padx=8)
+        ttk.Button(actions, text="保存工程", command=self._save_project).pack(side=tk.LEFT, padx=6)
         self.recent_btn = ttk.Menubutton(actions, text="最近工程")
         self.recent_menu = tk.Menu(self.recent_btn, tearoff=0)
         self.recent_btn["menu"] = self.recent_menu
         self.recent_btn.pack(side=tk.LEFT)
         self._rebuild_recent_menu()
-        tk.Label(
-            actions, text="项目名称", bg=COLORS["accent"], fg=COLORS["white"], font=font(10)
-        ).pack(side=tk.LEFT, padx=(24, 6))
-        ttk.Entry(actions, textvariable=self.project_name_var, width=28).pack(side=tk.LEFT)
 
-        stepper = tk.Frame(self, bg=COLORS["surface"])
-        stepper.pack(fill=tk.X)
-        inner = tk.Frame(stepper, bg=COLORS["surface"])
-        inner.pack(fill=tk.X, padx=16, pady=8)
-
-        self.progress_steps = []
-        step_names = ["① 数据导入", "② 边界设置", "③ 计算结果"]
-        for i, name in enumerate(step_names):
-            lbl = tk.Label(
-                inner,
-                text=name,
-                bg=COLORS["surface"],
-                fg=COLORS["dim"],
-                font=font(11),
-            )
-            lbl.pack(side=tk.LEFT)
-            self.progress_steps.append(lbl)
-            if i < len(step_names) - 1:
-                tk.Label(
-                    inner,
-                    text="  ›  ",
-                    bg=COLORS["surface"],
-                    fg=COLORS["rule"],
-                    font=font(11),
-                ).pack(side=tk.LEFT)
-
+        # 底部状态栏：左侧操作反馈，右侧当前步骤和项目
+        self.status_var = tk.StringVar(value=f"就绪 - 请导入测量数据文件（{SHORTCUT_LABEL}+O 打开工程）")
+        self.step_var = tk.StringVar(value="步骤 1/3：数据导入")
         self.project_label_var = tk.StringVar(value="项目: 未加载")
-        self.project_name_var.trace_add("write", lambda *_: self._update_project_label())
-        tk.Label(
-            inner,
-            textvariable=self.project_label_var,
-            bg=COLORS["surface"],
-            fg=COLORS["dim"],
-            font=font(9),
-        ).pack(side=tk.RIGHT)
-        self.step_var = tk.StringVar(value="步骤 1/3: 数据导入")
-        tk.Label(
-            inner,
-            textvariable=self.step_var,
-            bg=COLORS["surface"],
-            fg=COLORS["accent"],
-            font=font(10),
-        ).pack(side=tk.RIGHT, padx=16)
-        self._update_step_indicator(0)
-
-        tk.Frame(self, bg=COLORS["rule"], height=1).pack(fill=tk.X)
-        
-        # 主内容区 - 使用 Notebook 作为向导式界面
-        self.notebook = ttk.Notebook(self)
-        self.notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
-        
-        # 页面 1: 数据导入
-        self.import_frame = DataImportFrame(
-            self.notebook, self._on_points_loaded, on_points_mutated=self._on_points_mutated
-        )
-        self.notebook.add(self.import_frame, text="  ① 数据导入与检查  ")
-        
-        # 页面 2: 边界设置
-        self.boundary_frame = BoundaryFrame(self.notebook, [], self._on_boundary_set)
-        self.notebook.add(self.boundary_frame, text="  ② 计算边界设置  ")
-        self.notebook.tab(1, state='disabled')  # 初始禁用
-        
-        # 页面 3: 计算结果
-        self.calc_frame = None  # 延迟创建
-        
-        # 底部状态栏
-        self.status_var = tk.StringVar(value="就绪 - 请导入测量数据文件")
+        self.project_name_var.trace_add("write", lambda *_: self._on_project_name_changed())
         status = tk.Frame(self, bg=COLORS["status_bg"])
         status.pack(fill=tk.X, side=tk.BOTTOM)
         tk.Frame(status, bg=COLORS["rule"], height=1).pack(fill=tk.X)
-        tk.Label(
+        self.status_label = tk.Label(
             status,
             textvariable=self.status_var,
             bg=COLORS["status_bg"],
@@ -161,8 +94,78 @@ class MainApplication(tk.Tk):
             anchor=tk.W,
             padx=16,
             pady=6,
-        ).pack(fill=tk.X)
+        )
+        self.status_label.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        tk.Label(
+            status, textvariable=self.project_label_var, bg=COLORS["status_bg"], fg=COLORS["dim"], font=font(10)
+        ).pack(side=tk.RIGHT, padx=16)
+        tk.Label(
+            status, textvariable=self.step_var, bg=COLORS["status_bg"], fg=COLORS["accent"], font=font(10, "bold")
+        ).pack(side=tk.RIGHT)
+
+        # 主内容区 - 使用 Notebook 作为向导式界面，选项卡本身就是步骤指示
+        self.notebook = ttk.Notebook(self)
+        self.notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=(8, 10))
         
+        # 页面 1: 数据导入
+        self.import_frame = DataImportFrame(
+            self.notebook, self._on_points_loaded, on_points_mutated=self._on_points_mutated, notify=self.notify
+        )
+        self.notebook.add(self.import_frame, text="  ① 数据导入与检查  ")
+        
+        # 页面 2: 边界设置
+        self.boundary_frame = BoundaryFrame(self.notebook, [], self._on_boundary_set, notify=self.notify)
+        self.notebook.add(self.boundary_frame, text="  ② 计算边界设置  ")
+        self.notebook.tab(1, state='disabled')  # 初始禁用
+        
+        # 页面 3: 计算结果
+        self.calc_frame = None  # 延迟创建
+
+        self._bind_shortcuts()
+        self._update_title()
+
+    def _bind_shortcuts(self):
+        for key, handler in (("o", self._open_project), ("s", self._save_project)):
+            for sequence in (f"<{SHORTCUT_MODIFIER}-{key}>", f"<{SHORTCUT_MODIFIER}-{key.upper()}>"):
+                self.bind_all(sequence, lambda _event, handler=handler: handler())
+        self.bind_all("<F5>", lambda _event: self._calculate_shortcut())
+
+    def _calculate_shortcut(self):
+        if self.calc_frame is not None and str(self.notebook.select()) == str(self.calc_frame):
+            self.calc_frame.start_calculation()
+
+    def notify(self, message: str) -> None:
+        """操作成功的反馈显示在状态栏（短暂高亮），不再弹窗打断操作。"""
+        self.status_var.set(message)
+        if self._flash_after_id is not None:
+            self.after_cancel(self._flash_after_id)
+        self.status_label.config(bg=COLORS["flash"], fg=COLORS["ink"])
+
+        def restore():
+            self._flash_after_id = None
+            self.status_label.config(bg=COLORS["status_bg"], fg=COLORS["dim"])
+
+        self._flash_after_id = self.after(1800, restore)
+
+    def mark_dirty(self, *_args) -> None:
+        if self.points and not self._dirty:
+            self._dirty = True
+            self._update_title()
+
+    def _mark_clean(self) -> None:
+        self._dirty = False
+        self._update_title()
+
+    def _update_title(self):
+        prefix = "* " if self._dirty else ""
+        name = f"{self.project_name} - " if self.points else ""
+        self.title(f"{prefix}{name}{APP_NAME} v{__version__} - {COMPANY}")
+
+    def _on_project_name_changed(self):
+        self._update_project_label()
+        self.mark_dirty()
+        self._update_title()
+
     @property
     def project_name(self) -> str:
         return self.project_name_var.get().strip() or DEFAULT_PROJECT_NAME
@@ -175,25 +178,15 @@ class MainApplication(tk.Tk):
         if self.points:
             self.project_label_var.set(f"项目: {self.project_name}")
 
-    def _update_step_indicator(self, current_step: int):
-        """更新步骤指示器颜色"""
-        for i, lbl in enumerate(self.progress_steps):
-            if i < current_step:
-                lbl.config(fg=COLORS["fill"], font=font(11, "bold"))
-            elif i == current_step:
-                lbl.config(fg=COLORS["accent"], font=font(11, "bold"))
-            else:
-                lbl.config(fg=COLORS["dim"], font=font(11))
-                
     def _on_points_loaded(self, points: list[SurveyPoint]):
         """数据导入完成回调"""
         self.points = points
-        self.status_var.set(f"已导入 {len(points)} 个测量点 - 请设置计算边界")
-        self.step_var.set("步骤 2/3: 边界设置")
-        self._update_step_indicator(1)
-        
+        self.notify(f"已导入 {len(points)} 个测量点 - 请设置计算边界")
+        self.step_var.set("步骤 2/3：边界设置")
+
         self.boundary_frame.set_points(points)
         self._update_project_label()
+        self.mark_dirty()
         if self.calc_frame is not None:
             # 测点变了，旧结果作废；须重新确认边界后才能计算和导出
             self.calc_frame.update_inputs(points, self.boundary)
@@ -225,19 +218,23 @@ class MainApplication(tk.Tk):
                 self.calc_frame.update_inputs(self.points, self.boundary)
             except tk.TclError:
                 pass
-        self.status_var.set(f"测点已更新，共 {len(self.points)} 个")
+        self.notify(f"测点已更新，共 {len(self.points)} 个")
+        self.mark_dirty()
 
     def _on_boundary_set(self, boundary: list[tuple[float, float]]):
         """边界设置完成回调"""
         self.boundary = boundary
-        self.status_var.set(f"边界已设置 ({len(boundary)} 个点) - 请进行计算")
-        self.step_var.set("步骤 3/3: 计算结果")
-        self._update_step_indicator(2)
-        
+        self.notify(f"边界已设置（{len(boundary)} 个点）- 请输入设计高程后计算（F5）")
+        self.step_var.set("步骤 3/3：计算结果")
+        self.mark_dirty()
+
         # 创建或更新计算页面
         if self.calc_frame is None:
             self.calc_frame = CalculationFrame(
-                self.notebook, self.points, self.boundary, project_name_getter=lambda: self.project_name
+                self.notebook, self.points, self.boundary,
+                project_name_getter=lambda: self.project_name,
+                notify=self.notify,
+                on_settings_changed=self.mark_dirty,
             )
             self.notebook.add(self.calc_frame, text="  ③ 计算设置与结果  ")
         else:
@@ -288,6 +285,7 @@ class MainApplication(tk.Tk):
         )
         self.project_path = filepath
         self._update_project_label()
+        self._mark_clean()
         remember_recent(filepath)
         self._rebuild_recent_menu()
 
@@ -316,6 +314,7 @@ class MainApplication(tk.Tk):
         data = load_project(filepath)
         self.apply_project(data)
         self.project_path = filepath
+        self._mark_clean()
         remember_recent(filepath)
         self._rebuild_recent_menu()
 
@@ -334,9 +333,11 @@ class MainApplication(tk.Tk):
             )
 
     def _open_recent_clicked(self, filepath: str):
+        if not self._confirm_discard_changes():
+            return
         try:
             self.open_recent_project(filepath)
-            messagebox.showinfo("成功", f"已打开工程，共 {len(self.points)} 个测量点")
+            self.notify(f"已打开工程 {os.path.basename(filepath)}，共 {len(self.points)} 个测量点")
         except Exception as error:
             messagebox.showerror("错误", f"打开失败: {error}")
 
@@ -347,10 +348,11 @@ class MainApplication(tk.Tk):
             raise FileNotFoundError(f"最近工程不存在: {filepath}")
         self.load_project_from(filepath)
 
-    def _save_project(self):
+    def _save_project(self) -> bool:
+        """保存工程；返回是否已保存（取消或失败为 False）。"""
         if not self.points:
             messagebox.showwarning("提示", "请先导入测量点再保存工程")
-            return
+            return False
         filepath = filedialog.asksaveasfilename(
             title="保存工程",
             defaultextension=".tinproj.json",
@@ -359,17 +361,32 @@ class MainApplication(tk.Tk):
             initialfile=os.path.basename(self.project_path) if self.project_path else f"{self.project_name}.tinproj.json",
         )
         if not filepath:
-            return
+            return False
         if self.project_name == DEFAULT_PROJECT_NAME:
             # 未起名时用文件名作为项目名，报告抬头才有意义
             self.project_name = project_name_from_path(filepath)
         try:
             self.save_project_to(filepath)
-            messagebox.showinfo("成功", "工程已保存，下次可用“打开工程”继续")
         except Exception as error:
             messagebox.showerror("错误", f"保存失败: {error}")
+            return False
+        self.notify(f"工程已保存：{filepath}")
+        return True
+
+    def _confirm_discard_changes(self) -> bool:
+        """有未保存的修改时询问是否先保存；返回 False 表示用户取消了当前操作。"""
+        if not self._dirty:
+            return True
+        answer = messagebox.askyesnocancel("未保存的修改", "当前工程有未保存的修改，是否先保存？")
+        if answer is None:
+            return False
+        if answer:
+            return self._save_project()
+        return True
 
     def _open_project(self):
+        if not self._confirm_discard_changes():
+            return
         filepath = filedialog.askopenfilename(
             title="打开工程",
             filetypes=[("TIN工程", "*.tinproj.json *.json"), ("JSON", "*.json"), ("所有文件", "*.*")],
@@ -378,7 +395,7 @@ class MainApplication(tk.Tk):
             return
         try:
             self.load_project_from(filepath)
-            messagebox.showinfo("成功", f"已打开工程，共 {len(self.points)} 个测量点")
+            self.notify(f"已打开工程 {os.path.basename(filepath)}，共 {len(self.points)} 个测量点")
         except Exception as error:
             messagebox.showerror("错误", f"打开失败: {error}")
         
@@ -386,7 +403,11 @@ class MainApplication(tk.Tk):
         """窗口关闭事件"""
         if self._closing:
             return
-        if messagebox.askokcancel("退出", "确定要退出程序吗？"):
+        if self._dirty:
+            proceed = self._confirm_discard_changes()
+        else:
+            proceed = messagebox.askokcancel("退出", "确定要退出程序吗？")
+        if proceed:
             self._closing = True
             if self.calc_frame is not None:
                 self.calc_frame.shutdown()
