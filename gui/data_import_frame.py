@@ -62,24 +62,24 @@ class DataImportFrame(ttk.Frame):
         # 进度条占位（不创建，仅在导入时动态添加）
         self.progress_bar: Optional[ttk.Progressbar] = None
         
-        # 列映射
+        # 列映射只有 5 行，不参与伸缩；多出的高度留给下面的测点表
         map_frame = ttk.LabelFrame(left_frame, text="列映射（自动识别；双击“源列名”可改选）", padding=8)
-        map_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
+        map_frame.pack(fill=tk.X, pady=(0, 8))
+
+        # 映射编辑按钮放在表格右侧，省出一行高度
+        map_btn_frame = ttk.Frame(map_frame)
+        map_btn_frame.pack(side=tk.RIGHT, fill=tk.Y, padx=(8, 0))
+        ttk.Button(map_btn_frame, text="应用映射", command=self._apply_mapping).pack(fill=tk.X)
+        ttk.Button(map_btn_frame, text="重置自动识别", command=self._auto_detect_mapping).pack(fill=tk.X, pady=(8, 0))
 
         self.tree_map = ttk.Treeview(map_frame, columns=('target', 'source'), show='headings', height=5)
         self.tree_map.heading('target', text='目标字段')
         self.tree_map.heading('source', text='源列名')
         self.tree_map.column('target', width=170)
         self.tree_map.column('source', width=150)
-        self.tree_map.pack(fill=tk.BOTH, expand=True)
+        self.tree_map.pack(side=tk.LEFT, fill=tk.X, expand=True)
         self.tree_map.bind("<Double-1>", self._on_mapping_double_click)
-        
-        # 映射编辑按钮
-        map_btn_frame = ttk.Frame(map_frame)
-        map_btn_frame.pack(fill=tk.X, pady=(8, 0))
-        ttk.Button(map_btn_frame, text="应用映射", command=self._apply_mapping).pack(side=tk.LEFT)
-        ttk.Button(map_btn_frame, text="重置自动识别", command=self._auto_detect_mapping).pack(side=tk.LEFT, padx=8)
-        
+
         # 数据预览（可编辑）
         preview_frame = ttk.LabelFrame(left_frame, text="测点表（双击单元格修改）", padding=8)
         preview_frame.pack(fill=tk.BOTH, expand=True)
@@ -123,23 +123,9 @@ class DataImportFrame(ttk.Frame):
         right_frame = ttk.LabelFrame(self, text="数据质量检查", padding=12)
         right_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=(6, 10), pady=10)
         
-        # 检查结果列表
-        self.tree_issues = ttk.Treeview(right_frame, columns=('type', 'detail'), show='headings', height=20)
-        self.tree_issues.heading('type', text='检查项')
-        self.tree_issues.heading('detail', text='详情')
-        self.tree_issues.column('type', width=120)
-        self.tree_issues.column('detail', width=300)
-        self.tree_issues.pack(fill=tk.BOTH, expand=True)
-        
-        # 统计信息
-        stats_frame = ttk.Frame(right_frame)
-        stats_frame.pack(fill=tk.X, pady=8)
-        self.stats_var = tk.StringVar(value="等待导入数据...")
-        ttk.Label(stats_frame, textvariable=self.stats_var, style="Title.TLabel").pack(anchor=tk.W)
-        
-        # 底部按钮
+        # 底部按钮和统计信息先 pack（side=BOTTOM），窗口偏矮时由检查列表收缩，按钮不被挤掉
         btn_frame = ttk.Frame(right_frame)
-        btn_frame.pack(fill=tk.X, pady=(4, 0))
+        btn_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=(4, 0))
         ttk.Button(
             btn_frame,
             text="确认无误，进入下一步",
@@ -147,7 +133,23 @@ class DataImportFrame(ttk.Frame):
             style="Accent.TButton",
         ).pack(side=tk.RIGHT)
         ttk.Button(btn_frame, text="导出检查报告", command=self._export_issues).pack(side=tk.RIGHT, padx=8)
-        
+
+        # 统计信息（大地坐标时一行放不下，按宽度自动换行）
+        stats_frame = ttk.Frame(right_frame)
+        stats_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=8)
+        self.stats_var = tk.StringVar(value="等待导入数据...")
+        stats_label = ttk.Label(stats_frame, textvariable=self.stats_var, style="Title.TLabel", justify=tk.LEFT)
+        stats_label.pack(anchor=tk.W, fill=tk.X)
+        stats_label.bind("<Configure>", lambda event: stats_label.configure(wraplength=max(event.width, 100)))
+
+        # 检查结果列表
+        self.tree_issues = ttk.Treeview(right_frame, columns=('type', 'detail'), show='headings', height=20)
+        self.tree_issues.heading('type', text='检查项')
+        self.tree_issues.heading('detail', text='详情')
+        self.tree_issues.column('type', width=120)
+        self.tree_issues.column('detail', width=300)
+        self.tree_issues.pack(fill=tk.BOTH, expand=True)
+
     def _browse_file(self):
         filepath = filedialog.askopenfilename(
             title="选择测量数据文件",

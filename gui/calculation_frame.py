@@ -100,9 +100,10 @@ class CalculationFrame(ttk.Frame):
         
         # 分区设计高程
         ttk.Separator(left_frame, orient='horizontal').pack(fill=tk.X, pady=10)
-        ttk.Checkbutton(left_frame, text="启用分区设计高程", variable=self.use_partition_var,
-                       command=self._toggle_partition).pack(anchor=tk.W)
-        
+        self.partition_check = ttk.Checkbutton(left_frame, text="启用分区设计高程", variable=self.use_partition_var,
+                                               command=self._toggle_partition)
+        self.partition_check.pack(anchor=tk.W)
+
         self.partition_frame = ttk.Frame(left_frame)
         self.partition_frame.pack(fill=tk.X, pady=6)
         ttk.Button(self.partition_frame, text="编辑分区高程", command=self._edit_partition).pack(fill=tk.X)
@@ -153,7 +154,22 @@ class CalculationFrame(ttk.Frame):
         # 右侧：结果显示
         right_frame = ttk.Frame(self)
         right_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=(6, 10), pady=10)
-        
+
+        # 底部导出按钮：先于结果选项卡 pack（side=BOTTOM），窗口偏矮时由图形区收缩，按钮不被挤掉
+        export_frame = ttk.Frame(right_frame)
+        export_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=(8, 0))
+        for index, (text, command) in enumerate((
+            ("导出 Excel 报告", self._export_excel),
+            ("导出 CSV 明细", self._export_csv),
+            ("导出 DXF", self._export_dxf),
+            ("导出 PDF 计算书", self._export_pdf),
+            ("导出高清图片", self._export_image),
+            ("生成文本报告", self._export_text),
+        )):
+            button = ttk.Button(export_frame, text=text, command=command)
+            button.pack(side=tk.LEFT, padx=(0, 6) if index == 0 else 6)
+            self._export_buttons.append(button)
+
         # 结果选项卡
         self.notebook = ttk.Notebook(right_frame)
         self.notebook.pack(fill=tk.BOTH, expand=True)
@@ -182,22 +198,7 @@ class CalculationFrame(ttk.Frame):
         self.info_frame = ttk.Frame(self.notebook)
         self.notebook.add(self.info_frame, text="三角形详情")
         self._create_triangle_info()
-        
-        # 底部导出按钮
-        export_frame = ttk.Frame(right_frame)
-        export_frame.pack(fill=tk.X, pady=(8, 0))
-        for index, (text, command) in enumerate((
-            ("导出 Excel 报告", self._export_excel),
-            ("导出 CSV 明细", self._export_csv),
-            ("导出 DXF", self._export_dxf),
-            ("导出 PDF 计算书", self._export_pdf),
-            ("导出高清图片", self._export_image),
-            ("生成文本报告", self._export_text),
-        )):
-            button = ttk.Button(export_frame, text=text, command=command)
-            button.pack(side=tk.LEFT, padx=(0, 6) if index == 0 else 6)
-            self._export_buttons.append(button)
-        
+
     def _create_summary_table(self):
         """创建汇总表"""
         columns = ('项目', '数值', '单位', '说明')
@@ -244,7 +245,8 @@ class CalculationFrame(ttk.Frame):
     def _toggle_partition(self):
         """切换分区高程编辑状态"""
         if self.use_partition_var.get():
-            self.partition_frame.pack(fill=tk.X, pady=5)
+            # after= 保证重新显示时仍紧跟在复选框下面，而不是排到面板最底部
+            self.partition_frame.pack(fill=tk.X, pady=5, after=self.partition_check)
         else:
             self.partition_frame.pack_forget()
             

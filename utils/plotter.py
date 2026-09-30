@@ -26,7 +26,7 @@ def setup_chinese_font():
     elif system == 'Windows':
         preferred = ['Microsoft YaHei', 'SimHei', 'SimSun']
     else:
-        preferred = ['Noto Sans CJK SC', 'WenQuanYi Micro Hei', 'Droid Sans Fallback']
+        preferred = ['Noto Sans CJK SC', 'WenQuanYi Micro Hei', 'WenQuanYi Zen Hei', 'Droid Sans Fallback']
 
     available = {font.name for font in fm.fontManager.ttflist}
     chosen = [name for name in preferred if name in available]

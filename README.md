@@ -56,6 +56,7 @@ tin_earthwork/
     ├── test_gui_flow.py           # 界面流程回归
     ├── test_project.py            # 工程文件恢复
     ├── test_v13.py                # 测点改错、平移、最近工程
+    ├── test_layout.py             # 窗口排版（默认尺寸下按钮不被挤出窗口）
     └── gui_stress_test.py         # 界面自动化点击压力测试（独立脚本）
 ```
 

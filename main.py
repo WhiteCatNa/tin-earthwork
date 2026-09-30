@@ -22,6 +22,16 @@ from utils.recent_projects import forget_recent, load_recent, remember_recent
 from version import APP_NAME, COMPANY, __version__
 
 PROJECT_SUFFIXES = (".tinproj.json", ".json")
+DEFAULT_WINDOW_SIZE = (1400, 900)
+MIN_WINDOW_SIZE = (1200, 800)
+
+
+def window_size_for_screen(screen_width: int, screen_height: int) -> tuple[int, int]:
+    """默认窗口尺寸，留出标题栏和任务栏的位置后不超过屏幕。"""
+    return (
+        min(DEFAULT_WINDOW_SIZE[0], screen_width - 40),
+        min(DEFAULT_WINDOW_SIZE[1], screen_height - 100),
+    )
 
 
 class MainApplication(tk.Tk):
@@ -31,9 +41,8 @@ class MainApplication(tk.Tk):
         super().__init__()
         
         self.title(f"{APP_NAME} v{__version__} - {COMPANY}")
-        self.geometry("1400x900")
-        self.minsize(1200, 800)
-        
+        self._fit_to_screen()
+
         apply_theme(self)
         
         # 数据状态
@@ -128,7 +137,23 @@ class MainApplication(tk.Tk):
         self._update_step_indicator(0)
 
         tk.Frame(self, bg=COLORS["rule"], height=1).pack(fill=tk.X)
-        
+
+        # 底部状态栏：先于主内容区 pack，窗口偏矮时由主内容区收缩，状态栏不被挤掉
+        self.status_var = tk.StringVar(value="就绪 - 请导入测量数据文件")
+        status = self.status_bar = tk.Frame(self, bg=COLORS["status_bg"])
+        status.pack(fill=tk.X, side=tk.BOTTOM)
+        tk.Frame(status, bg=COLORS["rule"], height=1).pack(fill=tk.X)
+        tk.Label(
+            status,
+            textvariable=self.status_var,
+            bg=COLORS["status_bg"],
+            fg=COLORS["dim"],
+            font=font(10),
+            anchor=tk.W,
+            padx=16,
+            pady=6,
+        ).pack(fill=tk.X)
+
         # 主内容区 - 使用 Notebook 作为向导式界面
         self.notebook = ttk.Notebook(self)
         self.notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
@@ -146,23 +171,16 @@ class MainApplication(tk.Tk):
         
         # 页面 3: 计算结果
         self.calc_frame = None  # 延迟创建
-        
-        # 底部状态栏
-        self.status_var = tk.StringVar(value="就绪 - 请导入测量数据文件")
-        status = tk.Frame(self, bg=COLORS["status_bg"])
-        status.pack(fill=tk.X, side=tk.BOTTOM)
-        tk.Frame(status, bg=COLORS["rule"], height=1).pack(fill=tk.X)
-        tk.Label(
-            status,
-            textvariable=self.status_var,
-            bg=COLORS["status_bg"],
-            fg=COLORS["dim"],
-            font=font(10),
-            anchor=tk.W,
-            padx=16,
-            pady=6,
-        ).pack(fill=tk.X)
-        
+
+    def _fit_to_screen(self):
+        """默认 1400x900；屏幕放不下时（如 1366x768 笔记本）缩到屏幕以内，避免按钮落在屏幕外。"""
+        screen_w, screen_h = self.winfo_screenwidth(), self.winfo_screenheight()
+        width, height = window_size_for_screen(screen_w, screen_h)
+        x = max(0, (screen_w - width) // 2)
+        y = max(0, (screen_h - height) // 2 - 30)
+        self.geometry(f"{width}x{height}+{x}+{y}")
+        self.minsize(min(MIN_WINDOW_SIZE[0], width), min(MIN_WINDOW_SIZE[1], height))
+
     @property
     def project_name(self) -> str:
         return self.project_name_var.get().strip() or DEFAULT_PROJECT_NAME
