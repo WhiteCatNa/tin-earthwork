@@ -3,22 +3,17 @@ import time
 
 import pytest
 
-import main as app_main
 from core.calculator import SurveyPoint
 
 BOUNDARY = [(0.0, 0.0), (20.0, 0.0), (20.0, 20.0), (0.0, 20.0)]
 
 
 @pytest.fixture
-def app(tmp_path, monkeypatch):
-    monkeypatch.setenv("TIN_EARTHWORK_RECENT", str(tmp_path / "recent.json"))
+def app(main_window, monkeypatch):
     for name in ("showinfo", "showwarning", "showerror"):
         monkeypatch.setattr(f"tkinter.messagebox.{name}", lambda *a, **k: "ok")
     monkeypatch.setattr("tkinter.messagebox.askokcancel", lambda *a, **k: True)
-    window = app_main.MainApplication()
-    window.withdraw()
-    yield window
-    window.destroy()
+    return main_window
 
 
 def _wait(app, predicate, timeout=30.0):
@@ -148,3 +143,64 @@ def test_settings_from_project_without_boundary_apply_when_calc_page_opens(app, 
     cf = app.calc_frame
     assert cf.design_mode_var.get() == "compare" and len(cf.compare_points) == 5
     assert cf.grid_enabled_var.get()
+
+
+def test_balance_only_offered_for_flat_design(app, monkeypatch):
+    """挖填平衡只对统一高程有意义：斜面、两期对比时拒绝，并说明原因。"""
+    warnings = []
+    monkeypatch.setattr("tkinter.messagebox.showwarning", lambda title, msg, **k: warnings.append(msg))
+    cf = _load(app)
+    for mode in ("plane", "compare"):
+        cf.design_mode_var.set(mode)
+        cf._on_mode_change()
+        cf._balance_elevation()
+        assert cf._worker_thread is None and cf.result is None
+    assert len(warnings) == 2 and all("统一高程" in item for item in warnings)
+
+
+def test_balance_after_compare_run_ignores_second_survey(app):
+    """回归：先做过两期对比再求挖填平衡，不能把后期测点带进平衡计算。"""
+    cf = _load(app, [SurveyPoint(f"P{i}", x, y, z) for i, (x, y, z) in
+                     enumerate([(0, 0, 9), (20, 0, 11), (20, 20, 11), (0, 20, 9), (10, 7, 10)], 1)])
+    cf.set_compare_points(_square(5.0, prefix="Q"), "after.xlsx")
+    cf.design_mode_var.set("compare")
+    cf._on_mode_change()
+    assert _calculate(app, cf).is_compare
+
+    cf.design_mode_var.set("flat")
+    cf._on_mode_change()
+    cf.result = None
+    cf._balance_elevation()
+    _wait(app, lambda: cf.result is not None)
+    assert not cf.result.is_compare
+    assert abs(cf.result.net_volume) <= 0.0005 * cf.result.computed_area + 1e-9
+    assert 9.5 < cf.design_elevation_value() < 10.5
+
+
+def test_grid_check_result_does_not_pop_up_when_clean(app, monkeypatch):
+    """没有需要注意的提示时，方格网校核的结果也走状态栏和汇总表，不弹窗。"""
+    popups = []
+    monkeypatch.setattr("tkinter.messagebox.showinfo", lambda *a, **k: popups.append(a))
+    monkeypatch.setattr("tkinter.messagebox.showwarning", lambda *a, **k: popups.append(a))
+    cf = _load(app)
+    cf.design_elevation_var.set(9.0)
+    cf.grid_enabled_var.set(True)
+    cf.grid_spacing_var.set("5")
+    result = _calculate(app, cf)
+    assert result.grid_check is not None
+    if not (result.warnings or result.grid_check.warnings):
+        assert popups == []
+        assert "方格网校核结果见汇总表" in app.status_var.get()
+
+
+def test_v2_settings_change_marks_project_unsaved(app, tmp_path):
+    cf = _load(app)
+    app.save_project_to(str(tmp_path / "a.tinproj.json"))
+    assert not app.title().startswith("*")
+    cf.design_mode_var.set("plane")
+    assert app.title().startswith("* ")
+    app.save_project_to(str(tmp_path / "a.tinproj.json"))
+    cf.grid_enabled_var.set(True)
+    assert app.title().startswith("* ")
+    app.load_project_from(str(tmp_path / "a.tinproj.json"))
+    assert not app.title().startswith("*")

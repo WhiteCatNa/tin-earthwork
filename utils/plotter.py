@@ -66,6 +66,7 @@ class EarthworkPlotter:
         self._artist_scatter: Optional[object] = None
         self._artist_boundary: Optional[object] = None
         self._highlight_artists: list = []
+        self._result_legend = None   # 结果图的图例（图级，放在坐标轴下方）
         self._pick_xy: Optional[np.ndarray] = None
         self._pick_tris: List[Triangle] = []
 
@@ -161,6 +162,9 @@ class EarthworkPlotter:
         self._highlight_artists = []
         self._pick_xy = None
         self._pick_tris = []
+        if self._result_legend is not None:
+            self._result_legend.remove()
+            self._result_legend = None
 
     def plot_result(self, result: CalculationResult,
                     points: List[SurveyPoint],
@@ -197,9 +201,8 @@ class EarthworkPlotter:
             if self._artist_boundary is not None:
                 self._artist_boundary.set_visible(show_boundary)
             # 图例同步
-            legend = self.ax.get_legend()
-            if legend:
-                legend.set_visible(show_legend)
+            if self._result_legend is not None:
+                self._result_legend.set_visible(show_legend)
             if self.canvas:
                 self.canvas.draw_idle()
             return
@@ -240,7 +243,11 @@ class EarthworkPlotter:
             self.selected_triangle = None
 
         if show_legend and artists["legend"]:
-            self.ax.legend(handles=artists["legend"], loc='upper right', fontsize=9, framealpha=0.9)
+            # 图例放在坐标轴下方一行，不遮挡边界角上的挖填区域。用图级图例的 outside 位置，
+            # 由约束布局给它留出高度；固定偏移在图较矮时会和 X 轴标题叠在一起
+            self._result_legend = self.fig.legend(
+                handles=artists["legend"], loc='outside lower center',
+                ncol=len(artists["legend"]), fontsize=9, frameon=False)
         self.ax.set_title(
             f'土方计算结果 - 挖方:{result.total_cut:.1f}m³  填方:{result.total_fill:.1f}m³  净:{result.net_volume:.1f}m³',
             fontsize=11, pad=10)

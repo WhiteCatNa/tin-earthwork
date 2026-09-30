@@ -35,10 +35,12 @@ class DataImportFrame(ttk.Frame):
     """数据导入与检查页面"""
     
     def __init__(self, parent, on_points_loaded: Callable[[List[SurveyPoint]], None],
-                 on_points_mutated: Optional[Callable] = None):
+                 on_points_mutated: Optional[Callable] = None,
+                 notify: Optional[Callable[[str], None]] = None):
         super().__init__(parent)
         self.on_points_loaded = on_points_loaded
         self.on_points_mutated = on_points_mutated
+        self.notify = notify or (lambda message: messagebox.showinfo("提示", message))
         self.points: List[SurveyPoint] = []
         self.raw_df: Optional[pd.DataFrame] = None
         self.column_mapping = {}
@@ -58,7 +60,9 @@ class DataImportFrame(ttk.Frame):
 
         ttk.Label(self.file_frame, text="数据文件:").pack(side=tk.LEFT)
         self.file_var = tk.StringVar()
-        ttk.Entry(self.file_frame, textvariable=self.file_var, width=20).pack(side=tk.LEFT, padx=8, fill=tk.X, expand=True)
+        file_entry = ttk.Entry(self.file_frame, textvariable=self.file_var, width=20)
+        file_entry.pack(side=tk.LEFT, padx=8, fill=tk.X, expand=True)
+        file_entry.bind("<Return>", lambda _event: self._import_file())
         ttk.Button(self.file_frame, text="浏览...", width=COMPACT_BUTTON, command=self._browse_file).pack(side=tk.LEFT)
         self.import_btn = ttk.Button(self.file_frame, text="导入", width=COMPACT_BUTTON, command=self._import_file,
                                      style="Accent.TButton")
@@ -122,7 +126,9 @@ class DataImportFrame(ttk.Frame):
         ttk.Button(edit_bar, text="删除选中", width=COMPACT_BUTTON, command=self._delete_selected).pack(side=tk.LEFT, padx=6)
         ttk.Label(edit_bar, text="定位点号").pack(side=tk.LEFT, padx=(12, 4))
         self.find_id_var = tk.StringVar()
-        ttk.Entry(edit_bar, textvariable=self.find_id_var, width=10).pack(side=tk.LEFT)
+        find_entry = ttk.Entry(edit_bar, textvariable=self.find_id_var, width=10)
+        find_entry.pack(side=tk.LEFT)
+        find_entry.bind("<Return>", lambda _event: self._focus_point_id())
         ttk.Button(edit_bar, text="定位", width=COMPACT_BUTTON, command=self._focus_point_id).pack(side=tk.LEFT, padx=4)
 
         offset_bar = ttk.Frame(preview_frame)
@@ -180,7 +186,8 @@ class DataImportFrame(ttk.Frame):
         )
         if filepath:
             self.file_var.set(filepath)
-            
+            self._import_file()  # 选好文件直接导入，省去再点一次“导入”
+
     def _import_file(self):
         filepath = self.file_var.get()
         if not filepath:
@@ -216,7 +223,7 @@ class DataImportFrame(ttk.Frame):
         self._update_preview()
         self._update_issues(issues)
         self._update_stats()
-        messagebox.showinfo("成功", f"导入完成，共 {len(self.points)} 个测量点")
+        self.notify(f"导入完成，共 {len(self.points)} 个测量点 - 核对检查结果后点“确认无误，进入下一步”")
 
     def _on_import_error(self, error_msg):
         """导入失败，回主线程显示错误"""
@@ -330,7 +337,7 @@ class DataImportFrame(ttk.Frame):
         self._update_preview()
         self._update_issues(issues)
         self._update_stats()
-        messagebox.showinfo("成功", f"映射应用完成，共 {len(self.points)} 个有效点")
+        self.notify(f"映射应用完成，共 {len(self.points)} 个有效点")
 
     def load_points(self, points: List[SurveyPoint]) -> None:
         """直接载入测点（打开工程时使用），刷新表格、检查结果和统计。"""
@@ -546,7 +553,7 @@ class DataImportFrame(ttk.Frame):
             messagebox.showwarning("提示", "请先导入测量点")
             return
         self.apply_coordinate_offset(dx, dy, dz)
-        messagebox.showinfo("成功", f"已平移 ΔX={dx}  ΔY={dy}  ΔZ={dz}")
+        self.notify(f"已平移 ΔX={dx}  ΔY={dy}  ΔZ={dz}")
 
     def swap_xy(self) -> None:
         if not self.points:
@@ -559,7 +566,7 @@ class DataImportFrame(ttk.Frame):
             messagebox.showwarning("提示", "请先导入测量点")
             return
         self.swap_xy()
-        messagebox.showinfo("成功", "已交换所有测点的 X、Y 坐标")
+        self.notify("已交换所有测点的 X、Y 坐标")
                 
     def _update_issues(self, issues: dict):
         """更新检查结果"""
@@ -614,6 +621,6 @@ class DataImportFrame(ttk.Frame):
                     for item in self.tree_issues.get_children():
                         vals = self.tree_issues.item(item)['values']
                         f.write(f"[{vals[0]}] {vals[1]}\n")
-                messagebox.showinfo("成功", "报告已导出")
+                self.notify(f"检查报告已导出：{filepath}")
             except Exception as e:
                 messagebox.showerror("错误", f"导出失败: {e}")

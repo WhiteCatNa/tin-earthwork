@@ -6,7 +6,6 @@ from utils.survey_edit import (
     offset_survey_data,
     update_survey_point,
 )
-import main as app_main
 
 
 def test_edit_add_delete_survey_points():
@@ -58,37 +57,32 @@ def test_remember_and_reopen_recent_projects(tmp_path, monkeypatch):
     assert str(missing.resolve()) not in load_recent()
 
 
-def test_import_frame_edit_offset_and_recent_project(tmp_path, monkeypatch):
-    monkeypatch.setenv("TIN_EARTHWORK_RECENT", str(tmp_path / "recent.json"))
-    app = app_main.MainApplication()
-    app.withdraw()
-    try:
-        app.import_frame.points = [
-            SurveyPoint("A", 0, 0, 12),
-            SurveyPoint("B", 1, 0, 8),
-        ]
-        app.import_frame._update_preview()
-        app.import_frame.update_survey_point_at(0, z=12.2)
-        app.import_frame.add_survey_point(SurveyPoint("C", 0, 1, 10))
-        app.import_frame.delete_survey_point_at(1)
-        assert [point.id for point in app.import_frame.points] == ["A", "C"]
-        assert app.import_frame.points[0].z == 12.2
+def test_import_frame_edit_offset_and_recent_project(main_window, tmp_path):
+    app = main_window
+    app.import_frame.points = [
+        SurveyPoint("A", 0, 0, 12),
+        SurveyPoint("B", 1, 0, 8),
+    ]
+    app.import_frame._update_preview()
+    app.import_frame.update_survey_point_at(0, z=12.2)
+    app.import_frame.add_survey_point(SurveyPoint("C", 0, 1, 10))
+    app.import_frame.delete_survey_point_at(1)
+    assert [point.id for point in app.import_frame.points] == ["A", "C"]
+    assert app.import_frame.points[0].z == 12.2
 
-        app.import_frame._confirm_points()
-        app.boundary_frame.set_boundary([(0, 0), (1, 0), (0, 1)])
-        app._on_boundary_set(app.boundary_frame.boundary)
-        app.import_frame.apply_coordinate_offset(10, 20, 1)
-        assert app.import_frame.points[0].x == 10
-        assert app.boundary == [(10, 20), (11, 20), (10, 21)]
+    app.import_frame._confirm_points()
+    app.boundary_frame.set_boundary([(0, 0), (1, 0), (0, 1)])
+    app._on_boundary_set(app.boundary_frame.boundary)
+    app.import_frame.apply_coordinate_offset(10, 20, 1)
+    assert app.import_frame.points[0].x == 10
+    assert app.boundary == [(10, 20), (11, 20), (10, 21)]
 
-        project = tmp_path / "job.tinproj.json"
-        app.save_project_to(project)
-        assert str(project.resolve()) in load_recent()
+    project = tmp_path / "job.tinproj.json"
+    app.save_project_to(project)
+    assert str(project.resolve()) in load_recent()
 
-        app.import_frame.points = [SurveyPoint("Z", 9, 9, 9)]
-        app.points = app.import_frame.points
-        app.open_recent_project(project)
-        assert [point.id for point in app.points] == ["A", "C"]
-        assert app.points[0].x == 10
-    finally:
-        app.destroy()
+    app.import_frame.points = [SurveyPoint("Z", 9, 9, 9)]
+    app.points = app.import_frame.points
+    app.open_recent_project(project)
+    assert [point.id for point in app.points] == ["A", "C"]
+    assert app.points[0].x == 10

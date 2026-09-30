@@ -21,15 +21,20 @@ DEFAULT_PROJECT_NAME = "TIN土方计算项目"
 # 比较面：统一高程 / 斜面 / 两期对比
 MODE_LABELS = (("flat", "统一高程"), ("plane", "斜面"), ("compare", "两期对比"))
 PLANE_FIELDS = (("x0", "基准点 X0"), ("y0", "Y0"), ("h0", "基准高程 H0"), ("slope_x", "X向坡度%"), ("slope_y", "Y向坡度%"))
+NET_TITLE = "净方量（挖 − 填）"
 
 
 class CalculationFrame(ttk.Frame):
     """计算设置与结果页面"""
     
     def __init__(self, parent, points: List[SurveyPoint], boundary: List[Tuple[float, float]],
-                 project_name_getter: Optional[Callable[[], str]] = None):
+                 project_name_getter: Optional[Callable[[], str]] = None,
+                 notify: Optional[Callable[[str], None]] = None,
+                 on_settings_changed: Optional[Callable[[], None]] = None):
         super().__init__(parent)
         self.project_name_getter = project_name_getter
+        self.notify = notify or (lambda message: messagebox.showinfo("提示", message))
+        self.on_settings_changed = on_settings_changed or (lambda: None)
         self.points = points
         self.boundary = boundary
         self.calculator = TINEarthworkCalculator()
@@ -61,8 +66,14 @@ class CalculationFrame(ttk.Frame):
         self._export_poll_after_id = None
         self._export_buttons: List[ttk.Button] = []
         self._closing = False
+        self._pending_export_path = ""
+        self._balanced_level: Optional[float] = None
 
         self._create_widgets()
+        # 控件建好后再挂监听：初始化时的赋值不算“用户改了设置”
+        for variable in (self.design_elevation_var, self.use_partition_var, self.design_mode_var,
+                         self.grid_enabled_var, self.grid_spacing_var, *self.plane_vars.values()):
+            variable.trace_add("write", lambda *_: self.on_settings_changed())
 
     def _project_name(self) -> str:
         name = self.project_name_getter() if self.project_name_getter else ""
@@ -81,7 +92,13 @@ class CalculationFrame(ttk.Frame):
         self.boundary = boundary
         self.calculator.add_points(points)
         self.calculator.set_boundary(boundary)
+        self._invalidate_result()
+
+    def _invalidate_result(self):
+        """输入变了，旧结果作废：结果卡片标记为需重新计算，并重画测点图。"""
+        had_result = self.result is not None
         self.result = None
+        self._show_result_cards(None, stale=had_result)
         self._refresh_plot()
 
     def apply_design_settings(self, design_elevation: float, use_partition: bool, partition: Dict[str, float],
@@ -114,8 +131,7 @@ class CalculationFrame(ttk.Frame):
             self.calculator.set_design_elevations(overrides, default=design_elevation)
         else:
             self.calculator.set_design_elevation(design_elevation)
-        self.result = None
-        self._refresh_plot()
+        self._invalidate_result()
 
     def design_settings(self) -> Dict[str, Any]:
         """当前的比较面与方格网设置，供保存工程。输入框不是数字时抛出 ValueError。"""
@@ -197,7 +213,10 @@ class CalculationFrame(ttk.Frame):
         """设置两期对比的后期测点（导入文件或恢复工程时调用）。"""
         self.compare_points = list(points)
         self.compare_source = source
+        had_result = self.result is not None
         self.result = None
+        self._show_result_cards(None, stale=had_result)
+        self.on_settings_changed()
         if hasattr(self, "compare_label"):
             if self.compare_points:
                 name = os.path.basename(source) if source else "工程文件"
@@ -216,8 +235,8 @@ class CalculationFrame(ttk.Frame):
         ttk.Separator(bottom, orient='horizontal').pack(fill=tk.X, pady=(4, 8))
         self.calculate_button = ttk.Button(
             bottom,
-            text="开始计算",
-            command=self._run_calculation,
+            text="开始计算（F5）",
+            command=self.start_calculation,
             style='Accent.TButton'
         )
         self.calculate_button.pack(fill=tk.X, ipady=5)
@@ -243,9 +262,19 @@ class CalculationFrame(ttk.Frame):
         self.mode_container.pack(fill=tk.X, pady=(6, 0))
 
         self.flat_frame = ttk.Frame(self.mode_container)
-        ttk.Label(self.flat_frame, text="设计高程 (m)").pack(side=tk.LEFT)
-        ttk.Entry(self.flat_frame, textvariable=self.design_elevation_var, width=10).pack(side=tk.LEFT, padx=6)
-        ttk.Button(self.flat_frame, text="从数据估算", command=self._estimate_elevation).pack(side=tk.LEFT)
+        flat_row = ttk.Frame(self.flat_frame)
+        flat_row.pack(fill=tk.X)
+        ttk.Label(flat_row, text="设计高程 (m)").pack(side=tk.LEFT)
+        elevation_entry = ttk.Entry(flat_row, textvariable=self.design_elevation_var, width=10)
+        elevation_entry.pack(side=tk.LEFT, padx=6)
+        elevation_entry.bind("<Return>", lambda _event: self.start_calculation())
+        ttk.Button(flat_row, text="从数据估算", command=self._estimate_elevation).pack(side=tk.LEFT)
+        balance_row = ttk.Frame(self.flat_frame)
+        balance_row.pack(fill=tk.X, pady=(6, 0))
+        self.balance_button = ttk.Button(balance_row, text="挖填平衡", command=self._balance_elevation)
+        self.balance_button.pack(side=tk.LEFT)
+        ttk.Label(balance_row, text="求挖方 = 填方的设计高程并计算", style="Muted.TLabel").pack(
+            side=tk.LEFT, padx=6)
 
         self.plane_frame = ttk.Frame(self.mode_container)
         positions = {"x0": (0, 0), "y0": (0, 1), "h0": (1, 0), "slope_x": (2, 0), "slope_y": (2, 1)}
@@ -322,6 +351,26 @@ class CalculationFrame(ttk.Frame):
         ):
             self._export_buttons.append(export_frame.add(text, command))
 
+        # 结果卡片：计算完成后直接显示主要数字，不必每次看弹窗。
+        # 横排放在结果选项卡上方，左栏留给计算设置（小屏上左栏高度紧张）
+        cards = ttk.Frame(right_frame)
+        cards.pack(side=tk.TOP, fill=tk.X, pady=(0, 6))
+        self._cards = {}
+        for column, (key, title, kind, unit) in enumerate((
+            ("cut", "总挖方", "Cut", "m³"),
+            ("fill", "总填方", "Fill", "m³"),
+            ("net", NET_TITLE, "Net", "m³"),
+            ("area", "计算面积", "Net", "m²"),
+        )):
+            cards.grid_columnconfigure(column, weight=1, uniform="cards")
+            card = ttk.Frame(cards, style=f"{kind}Card.TFrame", padding=(10, 3))
+            card.grid(row=0, column=column, sticky="nsew", padx=(0 if column == 0 else 6, 0))
+            title_label = ttk.Label(card, text=title, style=f"{kind}CardTitle.TLabel")
+            title_label.pack(anchor=tk.W)
+            value_label = ttk.Label(card, text="—", style=f"{kind}CardValue.TLabel")
+            value_label.pack(anchor=tk.W)
+            self._cards[key] = (title_label, value_label, title, unit)
+
         # 结果选项卡
         self.notebook = ttk.Notebook(right_frame)
         self.notebook.pack(fill=tk.BOTH, expand=True)
@@ -367,6 +416,16 @@ class CalculationFrame(ttk.Frame):
                                             ('单位', 50, 'center', False), ('说明', 360, 'w', True)):
             self.tree_summary.heading(col, text=col)
             self.tree_summary.column(col, width=width, anchor=anchor, stretch=stretch)
+        # 提示往往是长句，放在表下方自动换行显示，不在表格里被截断
+        self.summary_warnings_var = tk.StringVar(value="")
+        self.summary_warnings = ttk.Label(
+            self.summary_frame, textvariable=self.summary_warnings_var, foreground=COLORS["cut"],
+            justify=tk.LEFT, wraplength=600,
+        )
+        self.summary_warnings.pack(side=tk.BOTTOM, fill=tk.X, padx=10, pady=(0, 10))
+        self.summary_warnings.bind(
+            "<Configure>", lambda event: self.summary_warnings.config(wraplength=max(event.width - 10, 200))
+        )
         self.tree_summary.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
         
     def _create_detail_table(self):
@@ -401,7 +460,7 @@ class CalculationFrame(ttk.Frame):
         zs = [p.z for p in self.points]
         median_z = np.median(zs)
         self.design_elevation_var.set(round(median_z, 3))
-        messagebox.showinfo("估算结果", f"建议设计高程 (中位数): {median_z:.3f} m")
+        self.notify(f"设计高程已设为实测高程中位数 {median_z:.3f} m")
         
     def _on_mode_change(self):
         """切换比较面：只显示对应的输入；两期对比时分区高程不适用。"""
@@ -508,23 +567,45 @@ class CalculationFrame(ttk.Frame):
                 return
             self.partition_data = data
             self.partition_label.config(text=f"已设置 {len(self.partition_data)} 个分区高程", foreground=COLORS["ink"])
+            self.on_settings_changed()
             dialog.destroy()
             
         ttk.Button(dialog, text="保存", command=save, style="Accent.TButton").pack(pady=10)
         
-    def _run_calculation(self):
-        """运行计算 (在后台线程)"""
+    def start_calculation(self):
+        """开始计算（按钮、回车和 F5 共用）；计算进行中时忽略。"""
+        if self._worker_thread is None:
+            self._run_calculation()
+
+    def _balance_elevation(self):
+        """求挖填平衡的统一设计高程，填入输入框并按它计算。只适用于统一高程、未启用分区。"""
+        if self.design_mode_var.get() != "flat":
+            messagebox.showwarning("提示", "挖填平衡只适用于统一设计高程，请先把比较面切换到“统一高程”")
+            return
+        if self.use_partition_var.get() and self.partition_data:
+            messagebox.showwarning("提示", "挖填平衡只适用于统一设计高程，请先取消“分区设计高程”")
+            return
+        if self._worker_thread is None:
+            self._run_calculation(balance=True)
+
+    def _run_calculation(self, balance: bool = False):
+        """运行计算 (在后台线程)；balance=True 时先求挖填平衡高程再按它计算。"""
         if not self.points:
             messagebox.showwarning("提示", "没有可计算的测量点")
             return
 
         # Tkinter 控件只能由主线程访问；在线程启动前读取所需配置。
-        mode = self.design_mode_var.get()
-        use_partition = self.use_partition_var.get() and mode != "compare"
+        mode = "flat" if balance else self.design_mode_var.get()
+        use_partition = self.use_partition_var.get() and mode != "compare" and not balance
         partition_data = self.partition_data.copy() if use_partition else {}
         compare_points = list(self.compare_points)
         try:
-            design_elevation = self.design_elevation_value()
+            try:
+                design_elevation = self.design_elevation_value()
+            except ValueError:
+                if not balance:
+                    raise
+                design_elevation = 0.0  # 求平衡高程与起始值无关
             plane = self.plane_value() if mode == "plane" else None
             grid_spacing = self.grid_spacing_value() if self.grid_enabled_var.get() else None
         except ValueError as error:
@@ -536,14 +617,22 @@ class CalculationFrame(ttk.Frame):
 
         self.status_var.set("正在计算...")
         self.progress_var.set(0)
+        self._balanced_level = None
         self.calculate_button.config(state=tk.DISABLED)
+        self.balance_button.config(state=tk.DISABLED)
         self.update_idletasks()
 
         def calc_thread():
             try:
                 calculator = self.calculator
                 calculator.set_compare_points(compare_points if mode == "compare" else None)
-                if plane is not None:
+                if balance:
+                    self._worker_events.put(("progress", 20, "求挖填平衡高程..."))
+                    calculator.set_design_elevation(design_elevation)
+                    level = round(calculator.balanced_design_elevation(), 3)
+                    self._worker_events.put(("balanced", level))
+                    calculator.set_design_elevation(level)
+                elif plane is not None:
                     calculator.set_design_plane(plane, partition_data)
                 elif partition_data:
                     # 未列入分区的点使用界面上的统一设计高程
@@ -598,6 +687,11 @@ class CalculationFrame(ttk.Frame):
 
             if event[0] == "progress":
                 self._update_calculation_progress(event[1], event[2])
+            elif event[0] == "balanced":
+                self.use_partition_var.set(False)
+                self._toggle_partition()
+                self.design_elevation_var.set(event[1])
+                self._balanced_level = event[1]
             elif event[0] == "done":
                 self._worker_thread = None
                 self.result = event[1]
@@ -620,9 +714,11 @@ class CalculationFrame(ttk.Frame):
         self.progress_var.set(100)
         self.status_var.set("计算完成")
         self.calculate_button.config(state=tk.NORMAL)
+        self.balance_button.config(state=tk.NORMAL)
         self._refresh_plot()
         self._update_summary_table()
         self._start_detail_table_load()
+        self._show_result_cards(self.result)
         summary = (
             f"总挖方量: {self.result.total_cut:.2f} m³\n"
             f"总填方量: {self.result.total_fill:.2f} m³\n"
@@ -645,13 +741,51 @@ class CalculationFrame(ttk.Frame):
                 "计算完成，请注意",
                 summary + "\n\n" + "\n\n".join(f"· {item}" for item in warnings),
             )
+            return
+        # 没有需要注意的提示：结果已在卡片和汇总表里，状态栏给一句反馈即可，不再弹窗
+        brief = (
+            f"挖方 {self.result.total_cut:,.2f} m³，填方 {self.result.total_fill:,.2f} m³，"
+            f"净方量 {self.result.net_volume:+,.2f} m³"
+        )
+        if grid is not None:
+            brief += "；方格网校核结果见汇总表"
+        if self._balanced_level is not None:
+            self.notify(f"挖填平衡设计高程 {self._balanced_level:.3f} m（取整到 mm）：{brief}")
         else:
-            messagebox.showinfo("计算完成", summary)
-            
+            self.notify(f"计算完成：{brief}")
+
+    def _show_result_cards(self, result: Optional[CalculationResult], stale: bool = False):
+        """刷新结果卡片；result 为 None 时显示占位（stale 表示旧结果已作废）。"""
+        if not hasattr(self, "_cards"):
+            return
+        if result is None:
+            for title_label, value_label, title, _unit in self._cards.values():
+                title_label.config(text=title)
+                value_label.config(text="需重新计算" if stale else "—")
+            return
+        net = result.net_volume
+        values = {
+            "cut": result.total_cut,
+            "fill": result.total_fill,
+            "net": net,
+            "area": result.computed_area,
+        }
+        for key, (title_label, value_label, title, unit) in self._cards.items():
+            number = f"{values[key]:+,.2f}" if key == "net" else f"{values[key]:,.2f}"
+            value_label.config(text=f"{number} {unit}")
+            title_label.config(text=title)
+        net_title = self._cards["net"][0]
+        # 设计高程取到 mm，平衡时净方量最多剩 0.0005 m × 计算面积
+        if abs(net) <= 0.0005 * result.computed_area + 0.005:
+            net_title.config(text=f"{NET_TITLE}· 基本平衡")
+        else:
+            net_title.config(text=f"{NET_TITLE}· {'余方外运' if net > 0 else '缺方借土'}")
+
     def _on_calculation_error(self, error):
         self.status_var.set("计算失败")
         self.progress_var.set(0)
         self.calculate_button.config(state=tk.NORMAL)
+        self.balance_button.config(state=tk.NORMAL)
         messagebox.showerror("计算错误", str(error))
         
     def _refresh_plot(self):
@@ -675,9 +809,9 @@ class CalculationFrame(ttk.Frame):
         for row in DataExporter.summary_rows(self.result):
             self.tree_summary.insert('', 'end', values=row)
         grid_warnings = self.result.grid_check.warnings if self.result.grid_check is not None else []
-        for item in list(self.result.warnings) + list(grid_warnings):
-            self.tree_summary.insert('', 'end', values=('提示', '', '', item), tags=('warn',))
-        self.tree_summary.tag_configure('warn', foreground=COLORS["cut"])
+        self.summary_warnings_var.set(
+            "\n\n".join(f"提示：{item}" for item in list(self.result.warnings) + list(grid_warnings))
+        )
 
     def _start_detail_table_load(self):
         """分批写入明细，避免大量 Treeview 行阻塞主界面。"""
@@ -793,10 +927,12 @@ class CalculationFrame(ttk.Frame):
         if self._export_thread is not None:
             messagebox.showinfo("提示", "上一个导出任务还在进行，请稍候")
             return None
-        return filedialog.asksaveasfilename(
+        path = filedialog.asksaveasfilename(
             title=title, defaultextension=extension, filetypes=filetypes,
             initialfile=f"{self._project_name()}{extension}",
         ) or None
+        self._pending_export_path = path or ""
+        return path
 
     def _run_export(self, label: str, work: Callable[[], None], success: str):
         """在后台线程执行导出，完成后在主线程提示结果。"""
@@ -805,6 +941,8 @@ class CalculationFrame(ttk.Frame):
         self.status_var.set(f"正在{label}...")
         events = queue.Queue()
         self._export_events = events
+        if self._pending_export_path:
+            success = f"{success}：{self._pending_export_path}"
 
         def worker():
             try:
@@ -836,8 +974,8 @@ class CalculationFrame(ttk.Frame):
         for button in self._export_buttons:
             button.config(state=tk.NORMAL)
         if kind == "done":
-            self.status_var.set(message)
-            messagebox.showinfo("成功", message)
+            self.status_var.set("导出完成")
+            self.notify(message)
         else:
             self.status_var.set("导出失败")
             messagebox.showerror("错误", message)

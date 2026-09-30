@@ -97,3 +97,25 @@ def test_standalone_figure_does_not_leak_pyplot_figures():
     figure.savefig(buf, format="png")
     assert plt.get_fignums() == before
     assert "试验段" in figure.axes[0].get_title()
+
+
+def test_result_legend_sits_below_axis_label_even_on_short_figure():
+    """回归：图例用固定偏移放在图下方时，图较矮会和 X 轴标题叠在一起。"""
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+
+    plotter = EarthworkPlotter(figsize=(9, 3.2))
+    FigureCanvasAgg(plotter.fig)
+    result, points = _mixed_result()
+    plotter.plot_result(result, points)
+    plotter.fig.canvas.draw()
+    renderer = plotter.fig.canvas.get_renderer()
+    legend_box = plotter._result_legend.get_window_extent(renderer)
+    label_box = plotter.ax.xaxis.label.get_window_extent(renderer)
+    assert legend_box.y1 <= label_box.y0 + 1
+    assert legend_box.y0 >= 0
+
+    # 切回测点图时图例要清掉，再画结果时不能叠出两个
+    plotter.plot_points_only(points)
+    assert plotter._result_legend is None and plotter.fig.legends == []
+    plotter.plot_result(result, points)
+    assert len(plotter.fig.legends) == 1
