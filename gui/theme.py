@@ -60,7 +60,7 @@ def resolve_font_family(root: tk.Misc) -> str:
     elif system == "Windows":
         candidates = ("Microsoft YaHei UI", "Microsoft YaHei", "SimHei")
     else:
-        candidates = ("Noto Sans CJK SC", "WenQuanYi Micro Hei", "Droid Sans Fallback")
+        candidates = ("Noto Sans CJK SC", "WenQuanYi Micro Hei", "WenQuanYi Zen Hei", "Droid Sans Fallback")
 
     for name in candidates:
         if name in available:

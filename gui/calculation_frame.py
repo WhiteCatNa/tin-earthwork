@@ -1,18 +1,26 @@
 """
 计算设置与结果页面
 """
+import math
+import os
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
-from typing import List, Callable, Optional, Dict, Tuple
+from typing import Any, List, Callable, Optional, Dict, Tuple
 from core.calculator import SurveyPoint, CalculationResult, TINEarthworkCalculator, format_id_list
+from core.grid_check import run_grid_check, suggest_spacing
+from core.surface import PlaneDesign
 from utils.plotter import EarthworkPlotter, create_standalone_figure
-from utils.data_handler import DataExporter
+from utils.data_handler import ISSUE_NAMES, DataExporter, DataImporter, DataValidator, report_labels
 from gui.theme import COLORS, style_text_widget
+from gui.widgets import ScrollableFrame, WrappingButtonRow
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import threading
 import queue
 
 DEFAULT_PROJECT_NAME = "TIN土方计算项目"
+# 比较面：统一高程 / 斜面 / 两期对比
+MODE_LABELS = (("flat", "统一高程"), ("plane", "斜面"), ("compare", "两期对比"))
+PLANE_FIELDS = (("x0", "基准点 X0"), ("y0", "Y0"), ("h0", "基准高程 H0"), ("slope_x", "X向坡度%"), ("slope_y", "Y向坡度%"))
 
 
 class CalculationFrame(ttk.Frame):
@@ -35,6 +43,12 @@ class CalculationFrame(ttk.Frame):
         self.partition_data: Dict[str, float] = (
             {point.id: point.design_z for point in imported_design} if len(unique_design) > 1 else {}
         )
+        self.design_mode_var = tk.StringVar(value="flat")
+        self.plane_vars = {key: tk.StringVar(value="0") for key, _ in PLANE_FIELDS}
+        self.compare_points: List[SurveyPoint] = []
+        self.compare_source = ""
+        self.grid_enabled_var = tk.BooleanVar(value=False)
+        self.grid_spacing_var = tk.StringVar(value=f"{self._suggested_spacing():g}")
         self._detail_rows = []
         self._detail_load_after_id = None
         self._detail_batch_size = 200
@@ -70,40 +84,198 @@ class CalculationFrame(ttk.Frame):
         self.result = None
         self._refresh_plot()
 
-    def apply_design_settings(self, design_elevation: float, use_partition: bool, partition: Dict[str, float]):
-        """恢复工程文件中的设计高程设置。"""
+    def apply_design_settings(self, design_elevation: float, use_partition: bool, partition: Dict[str, float],
+                              design_mode: str = "flat", design_plane: Optional[Dict[str, float]] = None,
+                              compare_points: Optional[List[SurveyPoint]] = None, compare_source: str = "",
+                              grid_enabled: bool = False, grid_spacing: Optional[float] = None):
+        """恢复工程文件中的比较面、分区、后期测点和方格网设置。"""
         self.design_elevation_var.set(design_elevation)
         self.use_partition_var.set(bool(use_partition))
         self.partition_data = dict(partition or {})
         self._toggle_partition()
-        if self.use_partition_var.get() and self.partition_data:
-            self.calculator.set_design_elevations(self.partition_data, default=design_elevation)
+        if design_plane:
+            plane = PlaneDesign.from_dict(design_plane)
+            for key, _ in PLANE_FIELDS:
+                self.plane_vars[key].set(f"{getattr(plane, key):g}")
+        self.set_compare_points(list(compare_points or []), compare_source)
+        self.grid_enabled_var.set(bool(grid_enabled))
+        if grid_spacing:
+            self.grid_spacing_var.set(f"{grid_spacing:g}")
+        self.design_mode_var.set(design_mode if design_mode in dict(MODE_LABELS) else "flat")
+        self._on_mode_change()
+        overrides = self.partition_data if self.use_partition_var.get() else {}
+        if self.partition_data and self.use_partition_var.get():
             self.partition_label.config(
                 text=f"已设置 {len(self.partition_data)} 个分区高程", foreground=COLORS["ink"]
             )
+        if self.design_mode_var.get() == "plane" and design_plane:
+            self.calculator.set_design_plane(PlaneDesign.from_dict(design_plane), overrides)
+        elif overrides:
+            self.calculator.set_design_elevations(overrides, default=design_elevation)
         else:
             self.calculator.set_design_elevation(design_elevation)
         self.result = None
         self._refresh_plot()
-        
+
+    def design_settings(self) -> Dict[str, Any]:
+        """当前的比较面与方格网设置，供保存工程。输入框不是数字时抛出 ValueError。"""
+        mode = self.design_mode_var.get()
+        plane = None
+        try:
+            plane = self.plane_value().to_dict()
+        except ValueError:
+            if mode == "plane":
+                raise
+        spacing = None
+        try:
+            spacing = self.grid_spacing_value()
+        except ValueError:
+            if self.grid_enabled_var.get():
+                raise
+        return {
+            "design_mode": mode,
+            "design_elevation": self.design_elevation_value(),
+            "design_plane": plane,
+            "use_partition": bool(self.use_partition_var.get()),
+            "partition": dict(self.partition_data),
+            "compare_points": list(self.compare_points),
+            "compare_source": self.compare_source,
+            "grid_enabled": bool(self.grid_enabled_var.get()),
+            "grid_spacing": spacing,
+        }
+
+    def plane_value(self) -> PlaneDesign:
+        values = {}
+        for key, label in PLANE_FIELDS:
+            try:
+                values[key] = float(self.plane_vars[key].get())
+            except ValueError:
+                raise ValueError(f"斜面参数“{label}”必须是数字") from None
+            if not math.isfinite(values[key]):
+                raise ValueError(f"斜面参数“{label}”必须是有限数字")
+        return PlaneDesign(**values)
+
+    def grid_spacing_value(self) -> float:
+        try:
+            spacing = float(self.grid_spacing_var.get())
+        except ValueError:
+            raise ValueError("方格边长必须是数字") from None
+        if not math.isfinite(spacing) or spacing <= 0:
+            raise ValueError("方格边长必须大于 0")
+        return spacing
+
+    def _site_extent(self) -> Optional[Tuple[float, float, float, float]]:
+        coords = list(self.boundary) or [(p.x, p.y) for p in self.points]
+        if not coords:
+            return None
+        xs = [float(x) for x, _ in coords]
+        ys = [float(y) for _, y in coords]
+        return min(xs), min(ys), max(xs), max(ys)
+
+    def _suggested_spacing(self) -> float:
+        extent = self._site_extent()
+        if extent is None:
+            return 10.0
+        xmin, ymin, xmax, ymax = extent
+        return suggest_spacing(xmax - xmin, ymax - ymin)
+
+    def _fill_plane_defaults(self, include_height: bool = True):
+        """基准点取场地中心；include_height 时基准高程取测点高程中位数。坡度保持不变。"""
+        extent = self._site_extent()
+        if extent is None:
+            return
+        xmin, ymin, xmax, ymax = extent
+        self.plane_vars["x0"].set(f"{(xmin + xmax) / 2:.3f}")
+        self.plane_vars["y0"].set(f"{(ymin + ymax) / 2:.3f}")
+        if include_height and self.points:
+            zs = sorted(p.z for p in self.points)
+            middle = len(zs) // 2
+            median = zs[middle] if len(zs) % 2 else (zs[middle - 1] + zs[middle]) / 2
+            self.plane_vars["h0"].set(f"{median:.3f}")
+
+    def set_compare_points(self, points: List[SurveyPoint], source: str = ""):
+        """设置两期对比的后期测点（导入文件或恢复工程时调用）。"""
+        self.compare_points = list(points)
+        self.compare_source = source
+        self.result = None
+        if hasattr(self, "compare_label"):
+            if self.compare_points:
+                name = os.path.basename(source) if source else "工程文件"
+                self.compare_label.config(text=f"已导入 {len(self.compare_points)} 个后期测点（{name}）",
+                                          foreground=COLORS["ink"])
+            else:
+                self.compare_label.config(text="未导入后期测量数据", foreground=COLORS["dim"])
+
     def _create_widgets(self):
-        # 左侧：设置面板
+        # 左侧：设置面板。“开始计算”和进度固定在底部；设置项放在可滚动区域，窗口偏矮时滚动查看
         left_frame = ttk.LabelFrame(self, text="计算设置", padding=12)
         left_frame.pack(side=tk.LEFT, fill=tk.Y, padx=(10, 6), pady=10)
-        
-        # 统一设计高程
-        ttk.Label(left_frame, text="统一设计高程 (m):", style="Title.TLabel").pack(anchor=tk.W, pady=(0, 6))
-        elev_frame = ttk.Frame(left_frame)
-        elev_frame.pack(fill=tk.X, pady=(0, 4))
-        ttk.Entry(elev_frame, textvariable=self.design_elevation_var, width=15).pack(side=tk.LEFT)
-        ttk.Button(elev_frame, text="从数据估算", command=self._estimate_elevation).pack(side=tk.LEFT, padx=8)
-        
-        # 分区设计高程
-        ttk.Separator(left_frame, orient='horizontal').pack(fill=tk.X, pady=10)
-        ttk.Checkbutton(left_frame, text="启用分区设计高程", variable=self.use_partition_var,
-                       command=self._toggle_partition).pack(anchor=tk.W)
-        
-        self.partition_frame = ttk.Frame(left_frame)
+
+        bottom = ttk.Frame(left_frame)
+        bottom.pack(side=tk.BOTTOM, fill=tk.X)
+        ttk.Separator(bottom, orient='horizontal').pack(fill=tk.X, pady=(4, 8))
+        self.calculate_button = ttk.Button(
+            bottom,
+            text="开始计算",
+            command=self._run_calculation,
+            style='Accent.TButton'
+        )
+        self.calculate_button.pack(fill=tk.X, ipady=5)
+        self.progress_var = tk.DoubleVar()
+        self.progress = ttk.Progressbar(bottom, variable=self.progress_var, maximum=100)
+        self.progress.pack(fill=tk.X, pady=8)
+        self.status_var = tk.StringVar(value="就绪")
+        ttk.Label(bottom, textvariable=self.status_var, style="Muted.TLabel").pack(anchor=tk.W)
+
+        self.settings = ScrollableFrame(left_frame)
+        self.settings.pack(fill=tk.BOTH, expand=True)
+        body = self.settings.body
+
+        # 比较面：统一高程 / 斜面 / 两期对比
+        ttk.Label(body, text="比较面", style="Title.TLabel").pack(anchor=tk.W, pady=(0, 4))
+        mode_row = ttk.Frame(body)
+        mode_row.pack(fill=tk.X)
+        for value, label in MODE_LABELS:
+            ttk.Radiobutton(mode_row, text=label, value=value, variable=self.design_mode_var,
+                            command=self._on_mode_change).pack(side=tk.LEFT, padx=(0, 10))
+
+        self.mode_container = ttk.Frame(body)
+        self.mode_container.pack(fill=tk.X, pady=(6, 0))
+
+        self.flat_frame = ttk.Frame(self.mode_container)
+        ttk.Label(self.flat_frame, text="设计高程 (m)").pack(side=tk.LEFT)
+        ttk.Entry(self.flat_frame, textvariable=self.design_elevation_var, width=10).pack(side=tk.LEFT, padx=6)
+        ttk.Button(self.flat_frame, text="从数据估算", command=self._estimate_elevation).pack(side=tk.LEFT)
+
+        self.plane_frame = ttk.Frame(self.mode_container)
+        positions = {"x0": (0, 0), "y0": (0, 1), "h0": (1, 0), "slope_x": (2, 0), "slope_y": (2, 1)}
+        for key, label in PLANE_FIELDS:
+            row, column = positions[key]
+            ttk.Label(self.plane_frame, text=label).grid(row=row, column=column * 2, sticky="w", pady=2)
+            ttk.Entry(self.plane_frame, textvariable=self.plane_vars[key], width=10).grid(
+                row=row, column=column * 2 + 1, sticky="w", padx=(4, 8), pady=2)
+        ttk.Button(self.plane_frame, text="基准点取场地中心",
+                   command=lambda: self._fill_plane_defaults(include_height=False)).grid(
+            row=1, column=2, columnspan=2, sticky="ew", pady=2)
+        ttk.Label(self.plane_frame, text="坡度沿 +X / +Y 方向升高为正", style="Muted.TLabel").grid(
+            row=3, column=0, columnspan=4, sticky="w")
+
+        self.compare_frame = ttk.Frame(self.mode_container)
+        compare_buttons = ttk.Frame(self.compare_frame)
+        compare_buttons.pack(fill=tk.X)
+        ttk.Button(compare_buttons, text="导入后期测量数据…", command=self._import_compare_points).pack(side=tk.LEFT)
+        ttk.Button(compare_buttons, text="后期 X/Y 互换", command=self._swap_compare_xy).pack(side=tk.LEFT, padx=6)
+        self.compare_label = ttk.Label(self.compare_frame, style="Muted.TLabel", text="未导入后期测量数据")
+        self.compare_label.pack(anchor=tk.W, pady=(4, 0))
+        ttk.Label(self.compare_frame, text="前期 = 数据导入页的测点；高差 = 前期 − 后期",
+                  style="Muted.TLabel").pack(anchor=tk.W)
+
+        # 分区设计高程（统一高程、斜面时可用）
+        self.partition_check = ttk.Checkbutton(body, text="分区设计高程（个别点单独指定）",
+                                               variable=self.use_partition_var, command=self._toggle_partition)
+        self.partition_check.pack(anchor=tk.W, pady=(8, 0))
+
+        self.partition_frame = ttk.Frame(body)
         self.partition_frame.pack(fill=tk.X, pady=6)
         ttk.Button(self.partition_frame, text="编辑分区高程", command=self._edit_partition).pack(fill=tk.X)
         self.partition_label = ttk.Label(self.partition_frame, text="未设置", style="Muted.TLabel")
@@ -114,54 +286,57 @@ class CalculationFrame(ttk.Frame):
                 text=f"已从文件导入 {len(self.partition_data)} 个分区高程",
                 foreground=COLORS["ink"],
             )
-        
-        # 计算选项
-        ttk.Separator(left_frame, orient='horizontal').pack(fill=tk.X, pady=10)
-        ttk.Label(left_frame, text="计算选项:", style="Title.TLabel").pack(anchor=tk.W, pady=(0, 4))
-        
+        self.update_idletasks()
+        widest = max(frame.winfo_reqwidth() for frame in (self.flat_frame, self.plane_frame, self.compare_frame))
+        ttk.Frame(self.mode_container, width=widest, height=1).pack(side=tk.BOTTOM)
+        self._on_mode_change()
+
+        # 方格网校核
+        ttk.Separator(body, orient='horizontal').pack(fill=tk.X, pady=8)
+        grid_row = ttk.Frame(body)
+        grid_row.pack(fill=tk.X)
+        ttk.Checkbutton(grid_row, text="方格网法校核", variable=self.grid_enabled_var).pack(side=tk.LEFT)
+        ttk.Label(grid_row, text="边长 (m)").pack(side=tk.LEFT, padx=(10, 4))
+        ttk.Entry(grid_row, textvariable=self.grid_spacing_var, width=6).pack(side=tk.LEFT)
+
         self.show_tin_var = tk.BooleanVar(value=True)
         self.show_contour_var = tk.BooleanVar(value=True)
         self.show_points_var = tk.BooleanVar(value=True)
         self.show_boundary_var = tk.BooleanVar(value=True)
-        
-        ttk.Checkbutton(left_frame, text="显示TIN网格", variable=self.show_tin_var,
-                       command=self._refresh_plot).pack(anchor=tk.W)
-        ttk.Checkbutton(left_frame, text="显示零填挖线", variable=self.show_contour_var,
-                       command=self._refresh_plot).pack(anchor=tk.W)
-        ttk.Checkbutton(left_frame, text="显示测量点", variable=self.show_points_var,
-                       command=self._refresh_plot).pack(anchor=tk.W)
-        ttk.Checkbutton(left_frame, text="显示计算边界", variable=self.show_boundary_var,
-                       command=self._refresh_plot).pack(anchor=tk.W)
-        
-        # 计算按钮
-        ttk.Separator(left_frame, orient='horizontal').pack(fill=tk.X, pady=10)
-        self.calculate_button = ttk.Button(
-            left_frame,
-            text="开始计算",
-            command=self._run_calculation,
-            style='Accent.TButton'
-        )
-        self.calculate_button.pack(fill=tk.X, ipady=5)
-        
-        # 进度条
-        self.progress_var = tk.DoubleVar()
-        self.progress = ttk.Progressbar(left_frame, variable=self.progress_var, maximum=100)
-        self.progress.pack(fill=tk.X, pady=8)
-        self.status_var = tk.StringVar(value="就绪")
-        ttk.Label(left_frame, textvariable=self.status_var, style="Muted.TLabel").pack(anchor=tk.W)
-        
+
         # 右侧：结果显示
         right_frame = ttk.Frame(self)
         right_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=(6, 10), pady=10)
-        
+
+        # 底部导出按钮：先于结果选项卡 pack（side=BOTTOM），窗口偏矮时由图形区收缩，按钮不被挤掉
+        # 窗口较窄（如 1024×768 屏幕）时自动折成两行，按钮不会被挤掉
+        export_frame = WrappingButtonRow(right_frame)
+        export_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=(8, 0))
+        for text, command in (
+            ("导出 Excel 报告", self._export_excel),
+            ("导出 CSV 明细", self._export_csv),
+            ("导出 DXF", self._export_dxf),
+            ("导出 PDF 计算书", self._export_pdf),
+            ("导出高清图片", self._export_image),
+            ("生成文本报告", self._export_text),
+        ):
+            self._export_buttons.append(export_frame.add(text, command))
+
         # 结果选项卡
         self.notebook = ttk.Notebook(right_frame)
         self.notebook.pack(fill=tk.BOTH, expand=True)
         
-        # 选项卡1：图形显示
+        # 选项卡1：图形显示（显示开关放在图上方，左栏留给计算设置）
         self.plot_frame = ttk.Frame(self.notebook)
         self.notebook.add(self.plot_frame, text="计算结果图")
-        
+        toggles = ttk.Frame(self.plot_frame)
+        toggles.pack(fill=tk.X, padx=4, pady=(4, 0))
+        ttk.Label(toggles, text="显示：", style="Muted.TLabel").pack(side=tk.LEFT)
+        for text, variable in (("TIN网格", self.show_tin_var), ("零填挖线", self.show_contour_var),
+                               ("测量点", self.show_points_var), ("计算边界", self.show_boundary_var)):
+            ttk.Checkbutton(toggles, text=text, variable=variable, command=self._refresh_plot).pack(
+                side=tk.LEFT, padx=(0, 10))
+
         self.plotter = EarthworkPlotter(figsize=(10, 7))
         self.canvas = FigureCanvasTkAgg(self.plotter.fig, master=self.plot_frame)
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
@@ -182,29 +357,16 @@ class CalculationFrame(ttk.Frame):
         self.info_frame = ttk.Frame(self.notebook)
         self.notebook.add(self.info_frame, text="三角形详情")
         self._create_triangle_info()
-        
-        # 底部导出按钮
-        export_frame = ttk.Frame(right_frame)
-        export_frame.pack(fill=tk.X, pady=(8, 0))
-        for index, (text, command) in enumerate((
-            ("导出 Excel 报告", self._export_excel),
-            ("导出 CSV 明细", self._export_csv),
-            ("导出 DXF", self._export_dxf),
-            ("导出 PDF 计算书", self._export_pdf),
-            ("导出高清图片", self._export_image),
-            ("生成文本报告", self._export_text),
-        )):
-            button = ttk.Button(export_frame, text=text, command=command)
-            button.pack(side=tk.LEFT, padx=(0, 6) if index == 0 else 6)
-            self._export_buttons.append(button)
-        
+
     def _create_summary_table(self):
         """创建汇总表"""
         columns = ('项目', '数值', '单位', '说明')
         self.tree_summary = ttk.Treeview(self.summary_frame, columns=columns, show='headings', height=10)
-        for col in columns:
+        # 比较面说明、提示等文字较长：数值列放宽，说明列靠左并随窗口伸展
+        for col, width, anchor, stretch in (('项目', 130, 'center', False), ('数值', 220, 'center', False),
+                                            ('单位', 50, 'center', False), ('说明', 360, 'w', True)):
             self.tree_summary.heading(col, text=col)
-            self.tree_summary.column(col, width=150, anchor='center')
+            self.tree_summary.column(col, width=width, anchor=anchor, stretch=stretch)
         self.tree_summary.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
         
     def _create_detail_table(self):
@@ -241,10 +403,67 @@ class CalculationFrame(ttk.Frame):
         self.design_elevation_var.set(round(median_z, 3))
         messagebox.showinfo("估算结果", f"建议设计高程 (中位数): {median_z:.3f} m")
         
+    def _on_mode_change(self):
+        """切换比较面：只显示对应的输入；两期对比时分区高程不适用。"""
+        mode = self.design_mode_var.get()
+        for frame, value in ((self.flat_frame, "flat"), (self.plane_frame, "plane"), (self.compare_frame, "compare")):
+            if value == mode:
+                frame.pack(fill=tk.X)
+            else:
+                frame.pack_forget()
+        if mode == "plane" and all(var.get() in ("", "0") for key, var in self.plane_vars.items()
+                                   if key in ("x0", "y0", "h0")):
+            self._fill_plane_defaults()
+        compare = mode == "compare"
+        self.partition_check.config(state=tk.DISABLED if compare else tk.NORMAL)
+        if compare:
+            self.partition_frame.pack_forget()
+        else:
+            self._toggle_partition()
+
+    def _import_compare_points(self):
+        filepath = filedialog.askopenfilename(
+            title="导入后期测量数据",
+            filetypes=[("测量数据", "*.xlsx *.xls *.csv *.txt *.dat"), ("所有文件", "*.*")],
+        )
+        if filepath:
+            self.load_compare_file(filepath)
+
+    def load_compare_file(self, filepath: str) -> bool:
+        """导入后期测点：自动识别列，显示识别结果与数据检查，确认后生效。"""
+        try:
+            points, issues, df = DataImporter.import_file(filepath)
+        except Exception as error:
+            messagebox.showerror("导入失败", str(error))
+            return False
+        if len(points) < 3:
+            messagebox.showerror("导入失败", "后期测量至少需要 3 个有效测点")
+            return False
+        mapping = DataImporter.complete_column_mapping(df, DataValidator.auto_detect_columns(df))
+        names = {"id": "点号", "x": "X", "y": "Y", "z": "高程"}
+        mapping_text = "，".join(f"{names[key]}={mapping[key]}" for key in names if key in mapping)
+        problems = [f"{ISSUE_NAMES[key]} {len(items)} 条" for key, items in issues.items() if items]
+        message = f"识别到 {len(points)} 个后期测点。\n列映射：{mapping_text}"
+        if problems:
+            message += "\n\n数据检查：" + "；".join(problems) + "\n（坐标重复且高程不同的点会在计算时报错）"
+        if not messagebox.askokcancel("确认后期测量数据", message + "\n\n使用这批数据作为后期测量？"):
+            return False
+        self.set_compare_points(points, filepath)
+        return True
+
+    def _swap_compare_xy(self):
+        if not self.compare_points:
+            messagebox.showinfo("提示", "请先导入后期测量数据")
+            return
+        swapped = [SurveyPoint(p.id, p.y, p.x, p.z) for p in self.compare_points]
+        self.set_compare_points(swapped, self.compare_source)
+        self.compare_label.config(text=self.compare_label.cget("text") + "，已互换 X/Y")
+
     def _toggle_partition(self):
         """切换分区高程编辑状态"""
         if self.use_partition_var.get():
-            self.partition_frame.pack(fill=tk.X, pady=5)
+            # after= 保证重新显示时仍紧跟在复选框下面，而不是排到面板最底部
+            self.partition_frame.pack(fill=tk.X, pady=5, after=self.partition_check)
         else:
             self.partition_frame.pack_forget()
             
@@ -300,12 +519,19 @@ class CalculationFrame(ttk.Frame):
             return
 
         # Tkinter 控件只能由主线程访问；在线程启动前读取所需配置。
-        use_partition = self.use_partition_var.get()
-        partition_data = self.partition_data.copy()
+        mode = self.design_mode_var.get()
+        use_partition = self.use_partition_var.get() and mode != "compare"
+        partition_data = self.partition_data.copy() if use_partition else {}
+        compare_points = list(self.compare_points)
         try:
             design_elevation = self.design_elevation_value()
+            plane = self.plane_value() if mode == "plane" else None
+            grid_spacing = self.grid_spacing_value() if self.grid_enabled_var.get() else None
         except ValueError as error:
             messagebox.showerror("输入错误", str(error))
+            return
+        if mode == "compare" and not compare_points:
+            messagebox.showwarning("提示", "两期对比需要先导入后期测量数据")
             return
 
         self.status_var.set("正在计算...")
@@ -315,21 +541,32 @@ class CalculationFrame(ttk.Frame):
 
         def calc_thread():
             try:
-                if use_partition and partition_data:
+                calculator = self.calculator
+                calculator.set_compare_points(compare_points if mode == "compare" else None)
+                if plane is not None:
+                    calculator.set_design_plane(plane, partition_data)
+                elif partition_data:
                     # 未列入分区的点使用界面上的统一设计高程
-                    self.calculator.set_design_elevations(partition_data, default=design_elevation)
+                    calculator.set_design_elevations(partition_data, default=design_elevation)
                 else:
-                    self.calculator.set_design_elevation(design_elevation)
+                    calculator.set_design_elevation(design_elevation)
 
-                self._worker_events.put(("progress", 30, "构建 TIN 三角网..."))
-                result = self.calculator.run_full_calculation()
-                if use_partition and partition_data:
-                    unlisted = [str(p.id) for p in self.calculator.points if p.id not in partition_data]
+                stage = "叠加前期、后期三角网..." if mode == "compare" else "构建 TIN 三角网..."
+                self._worker_events.put(("progress", 30, stage))
+                result = calculator.run_full_calculation()
+                if partition_data:
+                    unlisted = [str(p.id) for p in calculator.points if p.id not in partition_data]
                     if unlisted:
+                        base = "斜面" if plane is not None else f"统一设计高程 {design_elevation:.3f} m"
                         result.warnings.insert(0, (
-                            f"有 {len(unlisted)} 个测点不在分区高程表中，按统一设计高程 "
-                            f"{design_elevation:.3f} m 计算：{format_id_list(unlisted)}"
+                            f"有 {len(unlisted)} 个测点不在分区高程表中，按{base} 计算：{format_id_list(unlisted)}"
                         ))
+                if grid_spacing is not None:
+                    self._worker_events.put(("progress", 75, "方格网校核..."))
+                    try:
+                        result.grid_check = run_grid_check(calculator, result, grid_spacing)
+                    except ValueError as error:
+                        result.warnings.append(f"方格网校核未完成：{error}")
                 self._worker_events.put(("progress", 90, "更新显示..."))
                 self._worker_events.put(("done", result))
             except Exception as error:
@@ -394,11 +631,19 @@ class CalculationFrame(ttk.Frame):
             f"三角形数: {self.result.triangle_count}\n"
             f"混合三角形: {self.result.mixed_triangle_count}"
         )
-        if self.result.warnings:
+        warnings = list(self.result.warnings)
+        grid = self.result.grid_check
+        if grid is not None:
+            summary += f"\n\n方格网校核（边长 {grid.spacing:g} m）:"
+            for label, _, grid_value, diff, relative in grid.comparison(self.result)[:3]:
+                percent = "" if relative is None else f"，{relative:+.2f}%"
+                summary += f"\n  {label} {grid_value:.2f} m³（与 TIN 法相差 {diff:+.2f}{percent}）"
+            warnings += grid.warnings
+        if warnings:
             self.status_var.set("计算完成（有提示，请查看）")
             messagebox.showwarning(
                 "计算完成，请注意",
-                summary + "\n\n" + "\n\n".join(f"· {item}" for item in self.result.warnings),
+                summary + "\n\n" + "\n\n".join(f"· {item}" for item in warnings),
             )
         else:
             messagebox.showinfo("计算完成", summary)
@@ -429,7 +674,8 @@ class CalculationFrame(ttk.Frame):
         self.tree_summary.delete(*self.tree_summary.get_children())
         for row in DataExporter.summary_rows(self.result):
             self.tree_summary.insert('', 'end', values=row)
-        for item in self.result.warnings:
+        grid_warnings = self.result.grid_check.warnings if self.result.grid_check is not None else []
+        for item in list(self.result.warnings) + list(grid_warnings):
             self.tree_summary.insert('', 'end', values=('提示', '', '', item), tags=('warn',))
         self.tree_summary.tag_configure('warn', foreground=COLORS["cut"])
 
@@ -479,7 +725,13 @@ class CalculationFrame(ttk.Frame):
         self.info_text.config(state=tk.NORMAL)
         self.info_text.delete('1.0', 'end')
         
-        p0, p1, p2 = tri.vertex_points
+        labels = report_labels(self.result) if self.result is not None else report_labels(CalculationResult())
+        natural, design = labels["natural"][:2], labels["design"][:2]
+        vertex_lines = "\n".join(
+            f"  顶点{index}: {p.id}  X={p.x:.3f}  Y={p.y:.3f}  {natural}={p.z:.3f}  {design}={p.design_z:.3f}"
+            f"  高差={p.delta_z:+.3f}"
+            for index, p in enumerate(tri.vertex_points, 1)
+        )
         info = f"""三角形详细信息
 {'='*50}
 三角形编号: {tri.id}
@@ -488,9 +740,7 @@ class CalculationFrame(ttk.Frame):
 边界内水平面积: {tri.area:.3f} m²
 
 顶点信息:
-  顶点1: {p0.id}  X={p0.x:.3f}  Y={p0.y:.3f}  实测={p0.z:.3f}  设计={p0.design_z:.3f}  高差={p0.delta_z:+.3f}
-  顶点2: {p1.id}  X={p1.x:.3f}  Y={p1.y:.3f}  实测={p1.z:.3f}  设计={p1.design_z:.3f}  高差={p1.delta_z:+.3f}
-  顶点3: {p2.id}  X={p2.x:.3f}  Y={p2.y:.3f}  实测={p2.z:.3f}  设计={p2.design_z:.3f}  高差={p2.delta_z:+.3f}
+{vertex_lines}
 
 计算结果:
   平均高差: {tri.avg_delta_z:.3f} m

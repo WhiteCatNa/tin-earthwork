@@ -42,24 +42,27 @@ class BoundaryFrame(ttk.Frame):
             self.canvas.mpl_connect('motion_notify_event', self._on_canvas_motion),
         ]
         
-        # 右侧：控制面板
+        # 右侧：控制面板。before=plot_frame 让面板先按自身宽度占位，绘图区用剩下的宽度；
+        # 面板内用 grid 且只给坐标列表权重，窗口偏矮时先缩列表，“确认边界”等按钮始终可见
         ctrl_frame = ttk.LabelFrame(self, text="边界控制", padding=12)
-        ctrl_frame.pack(side=tk.RIGHT, fill=tk.Y, padx=(6, 10), pady=10)
-        
+        ctrl_frame.pack(side=tk.RIGHT, fill=tk.Y, padx=(6, 10), pady=10, before=plot_frame)
+        ctrl_frame.grid_columnconfigure(0, weight=1)
+        ctrl_frame.grid_rowconfigure(2, weight=1)
+
         # 模式选择
         mode_frame = ttk.Frame(ctrl_frame)
-        mode_frame.pack(fill=tk.X, pady=(0, 4))
+        mode_frame.grid(row=0, column=0, sticky="ew", pady=(0, 4))
         self.edit_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(mode_frame, text="编辑模式（左键添加）", variable=self.edit_var,
                        command=self._toggle_edit_mode).pack(anchor=tk.W)
-        
+
         # 边界点列表
-        ttk.Label(ctrl_frame, text="边界点坐标:", style="Title.TLabel").pack(anchor=tk.W, pady=(10, 0))
-        
+        ttk.Label(ctrl_frame, text="边界点坐标:", style="Title.TLabel").grid(row=1, column=0, sticky="w", pady=(10, 0))
+
         list_frame = ttk.Frame(ctrl_frame)
-        list_frame.pack(fill=tk.BOTH, expand=True, pady=8)
-        
-        self.tree_boundary = ttk.Treeview(list_frame, columns=('idx', 'x', 'y'), show='headings', height=15)
+        list_frame.grid(row=2, column=0, sticky="nsew", pady=8)
+
+        self.tree_boundary = ttk.Treeview(list_frame, columns=('idx', 'x', 'y'), show='headings', height=8)
         self.tree_boundary.heading('idx', text='序号')
         self.tree_boundary.heading('x', text='X坐标')
         self.tree_boundary.heading('y', text='Y坐标')
@@ -72,22 +75,34 @@ class BoundaryFrame(ttk.Frame):
         self.tree_boundary.configure(yscrollcommand=vsb.set)
         vsb.pack(side=tk.RIGHT, fill=tk.Y)
         
-        # 编辑按钮
+        # 编辑按钮（上行 2 个、下行 3 个，省出高度给坐标列表）
         btn_frame = ttk.Frame(ctrl_frame)
-        btn_frame.pack(fill=tk.X, pady=4)
-        ttk.Button(btn_frame, text="自动生成数据范围边界", command=self._create_auto_boundary).pack(fill=tk.X, pady=2)
-        ttk.Button(btn_frame, text="导入边界文件", command=self._import_boundary).pack(fill=tk.X, pady=2)
-        ttk.Button(btn_frame, text="撤销上一点", command=self._undo_last_point).pack(fill=tk.X, pady=2)
-        ttk.Button(btn_frame, text="清空边界", command=self._clear_boundary).pack(fill=tk.X, pady=2)
-        ttk.Button(btn_frame, text="删除选中点", command=self._delete_selected).pack(fill=tk.X, pady=2)
-        ttk.Separator(btn_frame, orient='horizontal').pack(fill=tk.X, pady=8)
-        ttk.Button(btn_frame, text="确认边界", command=self._confirm_boundary, 
-                  style='Accent.TButton').pack(fill=tk.X, pady=2)
-        
+        btn_frame.grid(row=3, column=0, sticky="ew", pady=4)
+        btn_frame.grid_columnconfigure(tuple(range(6)), weight=1, uniform="boundary_buttons")
+        button_rows = (
+            (("自动生成数据范围边界", self._create_auto_boundary), ("导入边界文件", self._import_boundary)),
+            (("撤销上一点", self._undo_last_point), ("删除选中点", self._delete_selected),
+             ("清空边界", self._clear_boundary)),
+        )
+        for row, buttons in enumerate(button_rows):
+            span = 6 // len(buttons)
+            for index, (text, command) in enumerate(buttons):
+                ttk.Button(btn_frame, text=text, command=command).grid(
+                    row=row, column=index * span, columnspan=span, sticky="ew",
+                    padx=(0 if index == 0 else 2, 0 if index == len(buttons) - 1 else 2), pady=2,
+                )
+        ttk.Separator(btn_frame, orient='horizontal').grid(row=2, column=0, columnspan=6, sticky="ew", pady=8)
+        ttk.Button(btn_frame, text="确认边界", command=self._confirm_boundary,
+                  style='Accent.TButton').grid(row=3, column=0, columnspan=6, sticky="ew", pady=2)
+
         self.coord_var = tk.StringVar(value="X: --  Y: --")
-        ttk.Label(ctrl_frame, textvariable=self.coord_var, style="Muted.TLabel").pack(anchor=tk.W, pady=(10, 2))
+        ttk.Label(ctrl_frame, textvariable=self.coord_var, style="Muted.TLabel").grid(
+            row=4, column=0, sticky="w", pady=(10, 2)
+        )
         self.boundary_status_var = tk.StringVar(value="待添加边界点")
-        ttk.Label(ctrl_frame, textvariable=self.boundary_status_var, style="Accent.TLabel").pack(anchor=tk.W)
+        ttk.Label(ctrl_frame, textvariable=self.boundary_status_var, style="Accent.TLabel").grid(
+            row=5, column=0, sticky="w"
+        )
         self._update_boundary_status()
 
         # 信息提示
@@ -96,8 +111,26 @@ class BoundaryFrame(ttk.Frame):
                     "2. 手工边界按顺时针或逆时针逐点左键点击\n"
                     "3. 点会自动吸附到附近测量点；右键或“撤销”可回退\n"
                     "4. 至少 3 个点，系统会自动闭合；确认前检查状态提示\n"
-                    "5. 也可导入 DXF（LWPOLYLINE/POLYLINE）或 CSV/TXT（前两列为 X、Y）")
-        ttk.Label(ctrl_frame, text=info_text, justify=tk.LEFT, style="Hint.TLabel").pack(anchor=tk.W, pady=(10, 0))
+                    "5. 也可导入 DXF 多段线或 CSV/TXT（前两列为 X、Y）")
+        self.info_label = ttk.Label(ctrl_frame, text=info_text, justify=tk.LEFT, style="Hint.TLabel")
+        self.info_label.grid(row=6, column=0, sticky="w", pady=(10, 0))
+        self.ctrl_frame, self.list_frame = ctrl_frame, list_frame
+        ctrl_frame.bind("<Configure>", self._adapt_hint)
+
+    # 坐标列表至少保留的高度（表头 + 约 4 行）
+    LIST_MIN_HEIGHT = 140
+
+    def _adapt_hint(self, _event=None):
+        """面板偏矮时隐藏操作说明，把高度留给坐标列表；变高后再显示。"""
+        shown = bool(self.info_label.winfo_manager())
+        info_height = self.info_label.winfo_reqheight() + 10
+        without_info = self.ctrl_frame.winfo_reqheight() - (info_height if shown else 0)
+        needed = without_info - self.list_frame.winfo_reqheight() + self.LIST_MIN_HEIGHT + info_height
+        if self.ctrl_frame.winfo_height() >= needed:
+            if not shown:
+                self.info_label.grid()
+        elif shown:
+            self.info_label.grid_remove()
         
     def _toggle_edit_mode(self):
         self.edit_mode = self.edit_var.get()
