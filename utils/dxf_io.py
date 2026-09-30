@@ -269,10 +269,15 @@ def select_boundary_polyline(polylines: List[DxfPolyline]) -> DxfPolyline:
     return max(usable, key=score)
 
 
-def import_boundary_from_dxf(filepath: str) -> List[Tuple[float, float]]:
-    """从 DXF 取出一条计算边界多边形。"""
+def read_boundary_from_dxf(filepath: str) -> Tuple[List[Tuple[float, float]], int]:
+    """从 DXF 取出一条计算边界多边形，同时返回其中折线化了几段圆弧。"""
     chosen = select_boundary_polyline(parse_dxf_polylines(filepath))
     ring = _ring_points(chosen.points)
     if len(ring) < 3:
         raise ValueError("DXF 边界顶点不足 3 个")
-    return ring
+    return ring, chosen.arc_count
+
+
+def import_boundary_from_dxf(filepath: str) -> List[Tuple[float, float]]:
+    """从 DXF 取出一条计算边界多边形。"""
+    return read_boundary_from_dxf(filepath)[0]

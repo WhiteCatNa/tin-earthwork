@@ -111,8 +111,11 @@ def test_primary_buttons_visible(app, size):
     app.boundary_frame._create_auto_boundary()
     app.notebook.select(1)
     app.update()
-    for text in ("确认边界", "自动生成数据范围边界", "清空边界"):
+    for text in ("确认边界", "自动生成数据范围边界", "导入边界文件", "沿测点外轮廓生成", "按点号连线",
+                 "撤销上一步", "删除选中点", "清空边界", "全图"):
         _assert_fully_inside_window(app, _find(app.boundary_frame, text), text)
+    # 坐标列表没有被新增的几行按钮挤没
+    assert app.boundary_frame.list_frame.winfo_height() >= app.boundary_frame.LIST_MIN_HEIGHT - 2
     assert _squeezed_controls(app.boundary_frame) == []
 
     app.boundary_frame._confirm_boundary()

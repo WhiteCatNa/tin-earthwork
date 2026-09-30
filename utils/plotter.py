@@ -14,8 +14,20 @@ from core.calculator import SurveyPoint, Triangle, CalculationResult, extract_ze
 from gui.theme import COLORS, PLOT_COLORS
 
 # 设置中文字体
+import logging
 import matplotlib.font_manager as fm
 import platform
+
+
+class _ExpectedAspectAdjustment(logging.Filter):
+    """边界页缩放后视野是固定的，窗口大小一变，matplotlib 会微调显示范围来保持 1:1 比例，
+    并为此记一条日志。这正是想要的行为，不必每次都打印。"""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return "to fulfill fixed data aspect" not in record.getMessage()
+
+
+logging.getLogger("matplotlib.axes._base").addFilter(_ExpectedAspectAdjustment())
 
 def setup_chinese_font():
     """配置中文 UI 字体，并保留拉丁字体以渲染 m²/m³ 上标。"""
@@ -52,6 +64,8 @@ class EarthworkPlotter:
         self.selected_triangle = None
         self.on_triangle_click = None  # 回调函数
         self._boundary_preview_artists = None
+        self._boundary_artists = None      # 边界线、闭合线、起点、选中标记、顶点序号
+        self._point_label_artists: list = []
         self._colorbar = None
         self._connection_ids = []
         self._current_result = None
@@ -313,59 +327,162 @@ class EarthworkPlotter:
         if self.canvas:
             self.canvas.draw_idle()
 
-    def plot_boundary_edit(self, points: List[SurveyPoint], 
+    # 边界顶点多于这个数时（如圆弧折线化后的边界）缩小顶点标记、不再标序号
+    BOUNDARY_MARKER_LIMIT = 80
+    BOUNDARY_NUMBER_LIMIT = 40
+    # 视野内的测点不超过这个数时才标点号，避免全图挤成一片
+    MAX_POINT_LABELS = 150
+
+    def plot_boundary_edit(self, points: List[SurveyPoint],
                            boundary: List[Tuple[float, float]],
-                           current_point: Optional[Tuple[float, float]] = None):
-        """边界编辑模式绘制"""
+                           current_point: Optional[Tuple[float, float]] = None,
+                           view: Optional[Tuple[Tuple[float, float], Tuple[float, float]]] = None,
+                           selected: Optional[int] = None):
+        """边界编辑模式绘制。view 为 (xlim, ylim) 时保持这个视野，否则显示全图。"""
         self._remove_colorbar()
         self.ax.clear()
         self._style_axes()
         self._invalidate_result_cache()
         self._boundary_preview_artists = None
+        self._boundary_artists = None
+        self._point_label_artists = []
         if points:
             xs = [p.x for p in points]
             ys = [p.y for p in points]
             self.ax.scatter(xs, ys, c=self.colors['points'], s=10, alpha=0.45)
-            
+
         # 绘制边界
         if boundary:
             bx = [p[0] for p in boundary]
             by = [p[1] for p in boundary]
-            self.ax.plot(
+            line, = self.ax.plot(
                 bx, by,
                 color=self.colors['boundary'],
                 marker='o',
                 linewidth=2,
-                markersize=6,
+                markersize=6 if len(boundary) <= self.BOUNDARY_MARKER_LIMIT else 3,
                 label='边界',
             )
-            
             # 闭合预览线
-            if len(boundary) >= 2:
-                self.ax.plot(
-                    [boundary[-1][0], boundary[0][0]],
-                    [boundary[-1][1], boundary[0][1]],
-                    color=self.colors['boundary'],
-                    linestyle='--',
-                    linewidth=1,
-                    alpha=0.5,
-                )
-                           
+            closing, = self.ax.plot(
+                [], [],
+                color=self.colors['boundary'],
+                linestyle='--',
+                linewidth=1,
+                alpha=0.5,
+            )
+            # 起点用方形标出，便于看出连线方向
+            start, = self.ax.plot(
+                [], [],
+                color=self.colors['boundary'],
+                marker='s',
+                markersize=9,
+                linestyle='None',
+            )
+            chosen, = self.ax.plot(
+                [], [],
+                marker='o',
+                markersize=13,
+                markerfacecolor='none',
+                markeredgecolor=self.colors['selected'],
+                markeredgewidth=2,
+                linestyle='None',
+            )
+            numbers = []
+            if len(boundary) <= self.BOUNDARY_NUMBER_LIMIT:
+                numbers = [
+                    self.ax.annotate(
+                        str(index), point, xytext=(6, 6), textcoords='offset points',
+                        fontsize=8, color=self.colors['boundary'], fontweight='bold',
+                    )
+                    for index, point in enumerate(boundary, 1)
+                ]
+            self._boundary_artists = (line, closing, start, chosen, numbers)
+            self.update_boundary_line(boundary, selected, redraw=False)
+
         # 当前正在添加的点由可复用 artist 绘制，避免鼠标移动时不断创建新对象。
-                           
-        self.ax.set_aspect('equal')
+
+        # datalim：坐标轴铺满绘图区，比例靠调整显示范围保持，缩放、平移时不留白边
+        self.ax.set_aspect('equal', adjustable='datalim')
         self.ax.set_xlabel('X 坐标 (m)')
         self.ax.set_ylabel('Y 坐标 (m)')
-        self.ax.set_title('边界编辑模式 - 左键添加点，右键结束')
         handles, labels = self.ax.get_legend_handles_labels()
         if labels:
             self.ax.legend()
         self.ax.grid(True, linestyle=':', alpha=0.3)
         self._boundary_preview_artists = self._create_boundary_preview_artists()
+        if view is not None:
+            self.ax.set_xlim(view[0])
+            self.ax.set_ylim(view[1])
         if current_point:
             self.update_boundary_preview(boundary, current_point)
         if self.canvas:
             self.canvas.draw_idle()
+
+    def update_boundary_line(self, boundary, selected: Optional[int] = None, redraw: bool = True):
+        """只更新边界线、起点、序号和选中标记（拖动顶点时用），不重绘测点。"""
+        if not self._boundary_artists or not boundary:
+            return
+        line, closing, start, chosen, numbers = self._boundary_artists
+        line.set_data([p[0] for p in boundary], [p[1] for p in boundary])
+        if len(boundary) >= 2:
+            closing.set_data([boundary[-1][0], boundary[0][0]], [boundary[-1][1], boundary[0][1]])
+        else:
+            closing.set_data([], [])
+        start.set_data([boundary[0][0]], [boundary[0][1]])
+        if selected is not None and 0 <= selected < len(boundary):
+            chosen.set_data([boundary[selected][0]], [boundary[selected][1]])
+        else:
+            chosen.set_data([], [])
+        for label, point in zip(numbers, boundary):
+            label.xy = point
+        if redraw and self.canvas:
+            self.canvas.draw_idle()
+
+    def update_point_labels(self, xy: np.ndarray, ids, enabled: bool = True):
+        """视野内测点不多时标出点号（放大后才出现），供“按点号连线”对照。"""
+        for artist in self._point_label_artists:
+            artist.remove()
+        self._point_label_artists = []
+        if enabled and xy is not None and len(xy):
+            x0, x1 = sorted(self.ax.get_xlim())
+            y0, y1 = sorted(self.ax.get_ylim())
+            visible = np.nonzero((xy[:, 0] >= x0) & (xy[:, 0] <= x1) & (xy[:, 1] >= y0) & (xy[:, 1] <= y1))[0]
+            if 0 < len(visible) <= self.MAX_POINT_LABELS:
+                self._point_label_artists = [
+                    self.ax.annotate(
+                        str(ids[index]), (xy[index, 0], xy[index, 1]), xytext=(4, -9), textcoords='offset points',
+                        fontsize=7, color=COLORS["dim"],
+                    )
+                    for index in visible
+                ]
+        if self.canvas:
+            self.canvas.draw_idle()
+
+    def get_view(self) -> Tuple[Tuple[float, float], Tuple[float, float]]:
+        return tuple(self.ax.get_xlim()), tuple(self.ax.get_ylim())
+
+    def set_view(self, xlim, ylim):
+        self.ax.set_xlim(xlim)
+        self.ax.set_ylim(ylim)
+        if self.canvas:
+            self.canvas.draw_idle()
+
+    def zoom_view(self, x: float, y: float, factor: float):
+        """以 (x, y) 为中心缩放，factor > 1 为放大。"""
+        (x0, x1), (y0, y1) = self.get_view()
+        self.set_view((x - (x - x0) / factor, x + (x1 - x) / factor),
+                      (y - (y - y0) / factor, y + (y1 - y) / factor))
+
+    def data_per_pixel(self) -> float:
+        """当前视野下一个屏幕像素对应的图上距离（米）；还没画出来时返回 0。"""
+        try:
+            inverse = self.ax.transData.inverted()
+            (ax_, ay), (bx_, by) = inverse.transform([(0.0, 0.0), (1.0, 0.0)])
+        except (ValueError, np.linalg.LinAlgError):
+            return 0.0
+        scale = float(np.hypot(bx_ - ax_, by - ay))
+        return scale if np.isfinite(scale) else 0.0
 
     def _create_boundary_preview_artists(self):
         marker, = self.ax.plot(
@@ -385,17 +502,27 @@ class EarthworkPlotter:
         )
         return marker, guide
 
-    def update_boundary_preview(self, boundary, current_point):
-        """只更新临时预览 artist，避免鼠标移动时重绘整张图。"""
+    def update_boundary_preview(self, boundary, current_point, anchors=None):
+        """只更新临时预览 artist，避免鼠标移动时重绘整张图。
+
+        默认从最后一个边界点连到光标（接着往后加点）；anchors 给出两个点时，
+        画成“前一点 → 光标 → 后一点”，表示在这条边上插入。
+        """
         if not self._boundary_preview_artists:
             return
         marker, guide = self._boundary_preview_artists
         if current_point:
             marker.set_data([current_point[0]], [current_point[1]])
             marker.set_visible(True)
-            if boundary:
+            if anchors:
+                guide.set_data([anchors[0][0], current_point[0], anchors[1][0]],
+                               [anchors[0][1], current_point[1], anchors[1][1]])
+                guide.set_visible(True)
+            elif boundary:
                 guide.set_data([boundary[-1][0], current_point[0]], [boundary[-1][1], current_point[1]])
                 guide.set_visible(True)
+            else:
+                guide.set_visible(False)
         else:
             marker.set_visible(False)
             guide.set_visible(False)
