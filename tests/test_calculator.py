@@ -293,3 +293,11 @@ def test_balanced_design_elevation_without_coverage_raises():
     calculator.set_boundary([(100, 100), (110, 100), (110, 110)])
     with pytest.raises(ValueError, match="无法求挖填平衡高程"):
         calculator.balanced_design_elevation()
+
+
+def test_balanced_design_elevation_is_refused_in_compare_mode():
+    calculator = TINEarthworkCalculator(10)
+    calculator.add_points([SurveyPoint("A", 0, 0, 11), SurveyPoint("B", 10, 0, 11), SurveyPoint("C", 0, 10, 11)])
+    calculator.set_compare_points([SurveyPoint("Q1", 0, 0, 9), SurveyPoint("Q2", 10, 0, 9), SurveyPoint("Q3", 0, 10, 9)])
+    with pytest.raises(ValueError, match="两期对比"):
+        calculator.balanced_design_elevation()

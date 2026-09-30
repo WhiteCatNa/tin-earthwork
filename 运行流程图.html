@@ -295,7 +295,7 @@ source .venv/bin/activate</code>
       <div class="cmd lane-e2e">
         <span class="label">② 端到端全流程（无需界面）</span>
         <code>python run_full_test.py --output-dir ./验证输出</code>
-        <span class="out">导入 → 建网 → 计算 → Excel / CSV / TXT 三份报告落盘</span>
+        <span class="out">导入 → 建网 → 计算 → 斜面 → 两期对比 → 方格网校核 → Excel / CSV / TXT / DXF / PDF 落盘</span>
       </div>
       <div class="cmd lane-gui">
         <span class="label">③ GUI 自动点击压测</span>
@@ -305,7 +305,7 @@ source .venv/bin/activate</code>
       <div class="cmd lane-run">
         <span class="label">④ 启动应用</span>
         <code>python main.py</code>
-        <span class="out">1400×900 主窗口 · 三步作业向导</span>
+        <span class="out">默认 1400×900，小屏自动缩到屏幕以内 · 三步作业向导</span>
       </div>
     </div>
   </section>
@@ -345,9 +345,10 @@ flowchart TB
 
   subgraph P3 ["③ 计算设置与结果"]
     direction TB
-    C1["设计高程<br/>统一值 / 分区值 / 挖填平衡"] --> C2["开始计算<br/>后台线程 + 队列轮询"]
-    C2 --> C3["Delaunay 建 TIN<br/>按边界精确裁剪 · 零填挖线分割"]
-    C3 --> C4["结果四页<br/>图 · 汇总 · 明细 · 三角形详情"]
+    C1["比较面<br/>统一高程 · 斜面 · 两期对比<br/>（可加分区高程，统一高程可求挖填平衡）"] --> C2["开始计算<br/>后台线程 + 队列轮询"]
+    C2 --> C3["建 TIN（两期对比时叠加前后两网）<br/>按边界精确裁剪 · 零填挖线分割"]
+    C3 --> C6["方格网校核（可选）<br/>与 TIN 法对比差异"]
+    C6 --> C4["结果四页<br/>图 · 汇总 · 明细 · 三角形详情"]
     C4 --> C5["后台导出<br/>Excel · CSV · DXF · PDF · 图片 · TXT"]
   end
 

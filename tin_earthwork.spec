@@ -16,6 +16,7 @@ hiddenimports = (
         "matplotlib.backends._backend_tk",
         "PIL._tkinter_finder",
         "scipy.spatial._qhull",
+        "scipy.spatial._ckdtree",
         "openpyxl.cell._writer",
     ]
 )

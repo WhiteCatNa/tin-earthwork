@@ -7,10 +7,16 @@ import conftest
 
 
 class _FakeWindow:
-    withdrawn = False
+    hidden = False
 
     def withdraw(self):
-        self.withdrawn = True
+        self.hidden = True
+
+    def attributes(self, *args):
+        self.hidden = True
+
+    def geometry(self, *args):
+        pass
 
 
 def test_create_main_window_retries_tcl_init_flake(monkeypatch):
@@ -25,7 +31,7 @@ def test_create_main_window_retries_tcl_init_flake(monkeypatch):
     monkeypatch.setattr(conftest.app_main, "MainApplication", flaky)
     window = conftest.create_main_window(delay=0)
     assert len(attempts) == 3
-    assert window.withdrawn
+    assert window.hidden
 
 
 def test_create_main_window_gives_up_after_repeated_flakes(monkeypatch):

@@ -63,7 +63,7 @@ def resolve_font_family(root: tk.Misc) -> str:
     elif system == "Windows":
         candidates = ("Microsoft YaHei UI", "Microsoft YaHei", "SimHei")
     else:
-        candidates = ("Noto Sans CJK SC", "WenQuanYi Micro Hei", "Droid Sans Fallback")
+        candidates = ("Noto Sans CJK SC", "WenQuanYi Micro Hei", "WenQuanYi Zen Hei", "Droid Sans Fallback")
 
     for name in candidates:
         if name in available:
@@ -317,7 +317,7 @@ def apply_theme(root: tk.Tk) -> ttk.Style:
     ):
         style.configure(f"{name}Card.TFrame", background=bg)
         style.configure(f"{name}CardTitle.TLabel", background=bg, foreground=COLORS["dim"], font=small)
-        style.configure(f"{name}CardValue.TLabel", background=bg, foreground=fg, font=font(17, "bold"))
+        style.configure(f"{name}CardValue.TLabel", background=bg, foreground=fg, font=font(15, "bold"))
     style.configure("Status.TLabel", background=COLORS["status_bg"], foreground=COLORS["dim"], font=small)
 
     return style
