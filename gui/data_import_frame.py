@@ -7,6 +7,7 @@ import pandas as pd
 from typing import List, Optional, Callable
 from core.calculator import SurveyPoint
 from gui.theme import COLORS
+from gui.widgets import WrappingButtonRow, fixed_request_box
 from utils.data_handler import ISSUE_NAMES, DataImporter, DataValidator
 from utils.survey_edit import (
     add_survey_point as append_survey_point,
@@ -26,6 +27,8 @@ MAPPING_TARGETS = [
     ("design_z", "设计高程（可不选）"),
 ]
 NOT_USED = "（不使用）"
+# 短文字按钮的最小宽度（字符）：ttk 默认约 11 个字符，两三个字的按钮也占很宽，窄窗口下会把右栏挤没
+COMPACT_BUTTON = -8
 
 
 class DataImportFrame(ttk.Frame):
@@ -55,9 +58,10 @@ class DataImportFrame(ttk.Frame):
 
         ttk.Label(self.file_frame, text="数据文件:").pack(side=tk.LEFT)
         self.file_var = tk.StringVar()
-        ttk.Entry(self.file_frame, textvariable=self.file_var, width=40).pack(side=tk.LEFT, padx=8, fill=tk.X, expand=True)
-        ttk.Button(self.file_frame, text="浏览...", command=self._browse_file).pack(side=tk.LEFT)
-        self.import_btn = ttk.Button(self.file_frame, text="导入", command=self._import_file, style="Accent.TButton")
+        ttk.Entry(self.file_frame, textvariable=self.file_var, width=20).pack(side=tk.LEFT, padx=8, fill=tk.X, expand=True)
+        ttk.Button(self.file_frame, text="浏览...", width=COMPACT_BUTTON, command=self._browse_file).pack(side=tk.LEFT)
+        self.import_btn = ttk.Button(self.file_frame, text="导入", width=COMPACT_BUTTON, command=self._import_file,
+                                     style="Accent.TButton")
         self.import_btn.pack(side=tk.LEFT, padx=(8, 0))
         # 进度条占位（不创建，仅在导入时动态添加）
         self.progress_bar: Optional[ttk.Progressbar] = None
@@ -80,12 +84,16 @@ class DataImportFrame(ttk.Frame):
         ttk.Button(map_btn_frame, text="应用映射", command=self._apply_mapping).pack(fill=tk.X)
         ttk.Button(map_btn_frame, text="重置自动识别", command=self._auto_detect_mapping).pack(fill=tk.X, pady=(8, 0))
 
-        self.tree_map = ttk.Treeview(self.mapping_body, columns=('target', 'source'), show='headings', height=5)
+        # 表格放在固定请求尺寸的容器里：列宽被拉伸后不会反过来把左栏越撑越宽、挤没右栏
+        map_box = fixed_request_box(self.mapping_body, width=320, height=1)
+        map_box.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.tree_map = ttk.Treeview(map_box, columns=('target', 'source'), show='headings', height=5)
         self.tree_map.heading('target', text='目标字段')
         self.tree_map.heading('source', text='源列名')
         self.tree_map.column('target', width=170)
         self.tree_map.column('source', width=150)
-        self.tree_map.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.tree_map.pack(fill=tk.BOTH, expand=True)
+        map_box.configure(height=self.tree_map.winfo_reqheight())
         self.tree_map.bind("<Double-1>", self._on_mapping_double_click)
         self.set_mapping_expanded(self.winfo_screenheight() >= 900)
 
@@ -93,25 +101,29 @@ class DataImportFrame(ttk.Frame):
         preview_frame = ttk.LabelFrame(left_frame, text="测点表（双击单元格修改）", padding=8)
         preview_frame.pack(fill=tk.BOTH, expand=True)
         
-        self.tree_preview = ttk.Treeview(preview_frame, show='headings', height=10)
-        vsb = ttk.Scrollbar(preview_frame, orient="vertical", command=self.tree_preview.yview)
-        hsb = ttk.Scrollbar(preview_frame, orient="horizontal", command=self.tree_preview.xview)
+        tree_box = fixed_request_box(preview_frame, width=420, height=200)
+        tree_box.grid(row=0, column=0, columnspan=2, sticky='nsew')
+        self.tree_preview = ttk.Treeview(tree_box, show='headings', height=10)
+        vsb = ttk.Scrollbar(tree_box, orient="vertical", command=self.tree_preview.yview)
+        hsb = ttk.Scrollbar(tree_box, orient="horizontal", command=self.tree_preview.xview)
         self.tree_preview.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
         self.tree_preview.grid(row=0, column=0, sticky='nsew')
         vsb.grid(row=0, column=1, sticky='ns')
         hsb.grid(row=1, column=0, sticky='ew')
+        tree_box.grid_rowconfigure(0, weight=1)
+        tree_box.grid_columnconfigure(0, weight=1)
         preview_frame.grid_rowconfigure(0, weight=1)
         preview_frame.grid_columnconfigure(0, weight=1)
         self.tree_preview.bind("<Double-1>", self._on_preview_double_click)
 
         edit_bar = ttk.Frame(preview_frame)
         edit_bar.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(6, 0))
-        ttk.Button(edit_bar, text="添加测点", command=self._add_point_dialog).pack(side=tk.LEFT)
-        ttk.Button(edit_bar, text="删除选中", command=self._delete_selected).pack(side=tk.LEFT, padx=6)
+        ttk.Button(edit_bar, text="添加测点", width=COMPACT_BUTTON, command=self._add_point_dialog).pack(side=tk.LEFT)
+        ttk.Button(edit_bar, text="删除选中", width=COMPACT_BUTTON, command=self._delete_selected).pack(side=tk.LEFT, padx=6)
         ttk.Label(edit_bar, text="定位点号").pack(side=tk.LEFT, padx=(12, 4))
         self.find_id_var = tk.StringVar()
         ttk.Entry(edit_bar, textvariable=self.find_id_var, width=10).pack(side=tk.LEFT)
-        ttk.Button(edit_bar, text="定位", command=self._focus_point_id).pack(side=tk.LEFT, padx=4)
+        ttk.Button(edit_bar, text="定位", width=COMPACT_BUTTON, command=self._focus_point_id).pack(side=tk.LEFT, padx=4)
 
         offset_bar = ttk.Frame(preview_frame)
         offset_bar.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(4, 0))
@@ -120,28 +132,24 @@ class DataImportFrame(ttk.Frame):
         self.dy_var = tk.StringVar(value="0")
         self.dz_var = tk.StringVar(value="0")
         ttk.Label(offset_bar, text="ΔX").pack(side=tk.LEFT, padx=(8, 2))
-        ttk.Entry(offset_bar, textvariable=self.dx_var, width=8).pack(side=tk.LEFT)
+        ttk.Entry(offset_bar, textvariable=self.dx_var, width=6).pack(side=tk.LEFT)
         ttk.Label(offset_bar, text="ΔY").pack(side=tk.LEFT, padx=(8, 2))
-        ttk.Entry(offset_bar, textvariable=self.dy_var, width=8).pack(side=tk.LEFT)
+        ttk.Entry(offset_bar, textvariable=self.dy_var, width=6).pack(side=tk.LEFT)
         ttk.Label(offset_bar, text="ΔZ").pack(side=tk.LEFT, padx=(8, 2))
-        ttk.Entry(offset_bar, textvariable=self.dz_var, width=8).pack(side=tk.LEFT)
-        ttk.Button(offset_bar, text="应用平移", command=self._apply_offset_clicked).pack(side=tk.LEFT, padx=8)
-        ttk.Button(offset_bar, text="X/Y 互换", command=self._swap_xy_clicked).pack(side=tk.LEFT)
+        ttk.Entry(offset_bar, textvariable=self.dz_var, width=6).pack(side=tk.LEFT)
+        ttk.Button(offset_bar, text="应用平移", width=COMPACT_BUTTON, command=self._apply_offset_clicked).pack(side=tk.LEFT, padx=8)
+        ttk.Button(offset_bar, text="X/Y 互换", width=COMPACT_BUTTON, command=self._swap_xy_clicked).pack(side=tk.LEFT)
         
         # 右侧：数据检查结果
         right_frame = ttk.LabelFrame(self, text="数据质量检查", padding=12)
         right_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=(6, 10), pady=10)
         
         # 底部按钮和统计信息先 pack（side=BOTTOM），窗口偏矮时由检查列表收缩，按钮不被挤掉
-        btn_frame = ttk.Frame(right_frame)
+        # 窗口较窄时两个按钮上下排列（主按钮在上），不会被挤掉
+        btn_frame = WrappingButtonRow(right_frame, align="right", gap=8)
         btn_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=(4, 0))
-        ttk.Button(
-            btn_frame,
-            text="确认无误，进入下一步",
-            command=self._confirm_points,
-            style="Accent.TButton",
-        ).pack(side=tk.RIGHT)
-        ttk.Button(btn_frame, text="导出检查报告", command=self._export_issues).pack(side=tk.RIGHT, padx=8)
+        btn_frame.add("导出检查报告", self._export_issues)
+        btn_frame.add("确认无误，进入下一步", self._confirm_points, style="Accent.TButton")
 
         # 统计信息（大地坐标时一行放不下，按宽度自动换行）
         stats_frame = ttk.Frame(right_frame)
@@ -149,10 +157,13 @@ class DataImportFrame(ttk.Frame):
         self.stats_var = tk.StringVar(value="等待导入数据...")
         stats_label = ttk.Label(stats_frame, textvariable=self.stats_var, style="Title.TLabel", justify=tk.LEFT)
         stats_label.pack(anchor=tk.W, fill=tk.X)
-        stats_label.bind("<Configure>", lambda event: stats_label.configure(wraplength=max(event.width, 100)))
+        # 换行宽度要扣掉标签内边距，否则请求宽度总比实际宽几像素
+        stats_label.bind("<Configure>", lambda event: stats_label.configure(wraplength=max(event.width - 6, 40)))
 
         # 检查结果列表
-        self.tree_issues = ttk.Treeview(right_frame, columns=('type', 'detail'), show='headings', height=20)
+        issues_box = fixed_request_box(right_frame, width=260, height=240)
+        issues_box.pack(fill=tk.BOTH, expand=True)
+        self.tree_issues = ttk.Treeview(issues_box, columns=('type', 'detail'), show='headings', height=20)
         self.tree_issues.heading('type', text='检查项')
         self.tree_issues.heading('detail', text='详情')
         self.tree_issues.column('type', width=120)

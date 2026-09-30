@@ -7,6 +7,76 @@ from tkinter import ttk
 from gui.theme import COLORS
 
 
+def fixed_request_box(parent, width: int, height: int) -> ttk.Frame:
+    """放表格的容器：请求尺寸固定为 width×height，内部表格照样随可用空间伸缩。
+
+    Treeview 的列被拉伸铺满后，拉伸后的列宽会成为它新的请求宽度，外层面板据此变宽、
+    越撑越宽，最终把并排的另一个面板挤没。容器不向外传递表格的尺寸，就不会出现这种情况。
+    """
+    box = ttk.Frame(parent, width=width, height=height)
+    box.grid_propagate(False)
+    box.pack_propagate(False)
+    return box
+
+
+class WrappingButtonRow(ttk.Frame):
+    """一排按钮：放得下时排成一行（左对齐或右对齐），宽度不够时自动折成多行等宽排列。
+
+    用 pack 排一行按钮时，窗口一窄最后几个按钮会被挤成 0 宽、直接消失。
+    """
+
+    def __init__(self, parent, align: str = "left", gap: int = 6, **kwargs):
+        super().__init__(parent, **kwargs)
+        self.align = align
+        self.gap = gap
+        self.buttons = []
+        self._layout = None
+        self.bind("<Configure>", self._relayout)
+
+    def add(self, text: str, command, **kwargs) -> ttk.Button:
+        button = ttk.Button(self, text=text, command=command, **kwargs)
+        self.buttons.append(button)
+        self._layout = None
+        self._relayout()
+        return button
+
+    def _natural_width(self) -> int:
+        return sum(b.winfo_reqwidth() for b in self.buttons) + self.gap * max(len(self.buttons) - 1, 0)
+
+    def _relayout(self, _event=None):
+        if not self.buttons:
+            return
+        width = self.winfo_width()
+        if width <= 1 or width >= self._natural_width():
+            layout = ("row",)
+        else:
+            cell = max(b.winfo_reqwidth() for b in self.buttons) + self.gap
+            layout = ("grid", max(1, min(len(self.buttons), (width + self.gap) // cell)))
+        if layout == self._layout:
+            return
+        self._layout = layout
+        for column in range(len(self.buttons) + 1):
+            self.grid_columnconfigure(column, weight=0, uniform="")
+        if layout[0] == "row":
+            # 空白列放在对齐方向的另一侧
+            offset = 1 if self.align == "right" else 0
+            self.grid_columnconfigure(0 if self.align == "right" else len(self.buttons), weight=1)
+            for index, button in enumerate(self.buttons):
+                button.grid(row=0, column=index + offset, sticky="ew",
+                            padx=(0 if index == 0 else self.gap, 0), pady=0)
+            return
+        columns = layout[1]
+        for column in range(columns):
+            self.grid_columnconfigure(column, weight=1, uniform="buttons")
+        order = self.buttons[::-1] if self.align == "right" else self.buttons
+        for index, button in enumerate(order):
+            row, column = divmod(index, columns)
+            if self.align == "right":
+                column = columns - 1 - column
+            button.grid(row=row, column=column, sticky="ew",
+                        padx=(0 if column == 0 else self.gap, 0), pady=(0 if row == 0 else self.gap, 0))
+
+
 class ScrollableFrame(ttk.Frame):
     """竖向可滚动的容器，内容放在 .body 里。
 

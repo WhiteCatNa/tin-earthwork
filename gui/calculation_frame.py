@@ -12,7 +12,7 @@ from core.surface import PlaneDesign
 from utils.plotter import EarthworkPlotter, create_standalone_figure
 from utils.data_handler import ISSUE_NAMES, DataExporter, DataImporter, DataValidator, report_labels
 from gui.theme import COLORS, style_text_widget
-from gui.widgets import ScrollableFrame
+from gui.widgets import ScrollableFrame, WrappingButtonRow
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import threading
 import queue
@@ -309,19 +309,18 @@ class CalculationFrame(ttk.Frame):
         right_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=(6, 10), pady=10)
 
         # 底部导出按钮：先于结果选项卡 pack（side=BOTTOM），窗口偏矮时由图形区收缩，按钮不被挤掉
-        export_frame = ttk.Frame(right_frame)
+        # 窗口较窄（如 1024×768 屏幕）时自动折成两行，按钮不会被挤掉
+        export_frame = WrappingButtonRow(right_frame)
         export_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=(8, 0))
-        for index, (text, command) in enumerate((
+        for text, command in (
             ("导出 Excel 报告", self._export_excel),
             ("导出 CSV 明细", self._export_csv),
             ("导出 DXF", self._export_dxf),
             ("导出 PDF 计算书", self._export_pdf),
             ("导出高清图片", self._export_image),
             ("生成文本报告", self._export_text),
-        )):
-            button = ttk.Button(export_frame, text=text, command=command)
-            button.pack(side=tk.LEFT, padx=(0, 6) if index == 0 else 6)
-            self._export_buttons.append(button)
+        ):
+            self._export_buttons.append(export_frame.add(text, command))
 
         # 结果选项卡
         self.notebook = ttk.Notebook(right_frame)
