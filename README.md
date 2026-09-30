@@ -7,6 +7,7 @@
 - **数据导入**：支持 Excel（.xlsx/.xls）、CSV、TXT、CASS .dat 格式；自动识别列映射，也可双击“源列名”手动改选；空值、非数字行会被拒绝并列出行号
 - **测点改错**：在测点表中双击修改、增删测点，支持坐标平移和 X/Y 互换（测量坐标 X 为北向时使用）
 - **边界设置**：在平面图上点击绘制计算边界（吸附到测点），或自动生成数据范围边界，或从 DXF / CSV / TXT 导入
+  - DXF 多段线中的圆弧段（圆角、曲线边）按圆弧计入：折线化后面积与圆弧严格相等，偏离圆弧不超过 5 mm
 - **TIN 构网**：基于 Delaunay 三角剖分；平面坐标重复但高程不同的点会报错，要求先处理，避免随机丢点
 - **土方计算**：
   - 跨越计算边界的三角形按边界**精确裁剪**，只计边界以内部分（凹边界同样精确）
@@ -51,7 +52,7 @@ tin_earthwork/
 │   └── calculation_frame.py   # 计算与结果、导出
 ├── utils/
 │   ├── data_handler.py        # 数据导入、检查与各类报告导出
-│   ├── dxf_io.py              # DXF 边界读取
+│   ├── dxf_io.py              # DXF 边界读取（含圆弧段）
 │   ├── plotter.py             # Matplotlib 绘图（界面图与导出图共用）
 │   ├── survey_edit.py         # 测点增删改、平移、X/Y 互换
 │   ├── recent_projects.py     # 最近工程列表
@@ -62,6 +63,7 @@ tin_earthwork/
     ├── test_calculator.py         # 计算核心（含解析解对比）
     ├── test_geometry.py           # 几何算法
     ├── test_data_handler.py       # 导入、导出、工程文件
+    ├── test_dxf_arcs.py           # DXF 边界圆弧段（面积、方量与解析解对比）
     ├── test_boundary.py           # 边界校验
     ├── test_plotter.py            # 绘图
     ├── test_calculation_frame.py  # 计算页
