@@ -22,6 +22,11 @@ from utils.recent_projects import forget_recent, load_recent, remember_recent
 from version import APP_NAME, COMPANY, __version__
 
 PROJECT_SUFFIXES = (".tinproj.json", ".json")
+# 工程文件中属于计算页的设置，与 CalculationFrame.apply_design_settings 的参数一一对应
+DESIGN_SETTING_KEYS = (
+    "design_elevation", "use_partition", "partition", "design_mode", "design_plane",
+    "compare_points", "compare_source", "grid_enabled", "grid_spacing",
+)
 DEFAULT_WINDOW_SIZE = (1400, 900)
 MIN_WINDOW_SIZE = (1200, 800)
 
@@ -50,6 +55,7 @@ class MainApplication(tk.Tk):
         self.boundary: list[tuple[float, float]] = []
         self.project_name_var = tk.StringVar(value=DEFAULT_PROJECT_NAME)
         self.project_path = None
+        self._pending_design_settings = None  # 打开工程时读到、等计算页创建后再应用的设置
         self._closing = False
         
         # 创建界面
@@ -59,26 +65,31 @@ class MainApplication(tk.Tk):
         self.protocol("WM_DELETE_WINDOW", self._on_closing)
         
     def _create_widgets(self):
+        # 页头一行：左侧名称与单位，右侧工程操作（原先三行，小屏上占掉太多高度）
         header = tk.Frame(self, bg=COLORS["accent"])
         header.pack(fill=tk.X)
+        row = tk.Frame(header, bg=COLORS["accent"])
+        row.pack(fill=tk.X, padx=16, pady=8)
+        titles = tk.Frame(row, bg=COLORS["accent"])
+        titles.pack(side=tk.LEFT)
         tk.Label(
-            header,
+            titles,
             text=APP_NAME,
             bg=COLORS["accent"],
             fg=COLORS["white"],
-            font=font(16, "bold"),
+            font=font(15, "bold"),
             anchor=tk.W,
-        ).pack(fill=tk.X, padx=16, pady=(12, 0))
+        ).pack(fill=tk.X)
         tk.Label(
-            header,
+            titles,
             text=COMPANY,
             bg=COLORS["accent"],
             fg=COLORS["header_sub"],
-            font=font(10),
+            font=font(9),
             anchor=tk.W,
-        ).pack(fill=tk.X, padx=16, pady=(2, 12))
-        actions = tk.Frame(header, bg=COLORS["accent"])
-        actions.pack(fill=tk.X, padx=16, pady=(0, 10))
+        ).pack(fill=tk.X)
+        actions = tk.Frame(row, bg=COLORS["accent"])
+        actions.pack(side=tk.RIGHT)
         ttk.Button(actions, text="打开工程", command=self._open_project).pack(side=tk.LEFT)
         ttk.Button(actions, text="保存工程", command=self._save_project).pack(side=tk.LEFT, padx=8)
         self.recent_btn = ttk.Menubutton(actions, text="最近工程")
@@ -88,13 +99,13 @@ class MainApplication(tk.Tk):
         self._rebuild_recent_menu()
         tk.Label(
             actions, text="项目名称", bg=COLORS["accent"], fg=COLORS["white"], font=font(10)
-        ).pack(side=tk.LEFT, padx=(24, 6))
-        ttk.Entry(actions, textvariable=self.project_name_var, width=28).pack(side=tk.LEFT)
+        ).pack(side=tk.LEFT, padx=(20, 6))
+        ttk.Entry(actions, textvariable=self.project_name_var, width=24).pack(side=tk.LEFT)
 
         stepper = tk.Frame(self, bg=COLORS["surface"])
         stepper.pack(fill=tk.X)
         inner = tk.Frame(stepper, bg=COLORS["surface"])
-        inner.pack(fill=tk.X, padx=16, pady=8)
+        inner.pack(fill=tk.X, padx=16, pady=5)
 
         self.progress_steps = []
         step_names = ["① 数据导入", "② 边界设置", "③ 计算结果"]
@@ -260,50 +271,44 @@ class MainApplication(tk.Tk):
             self.notebook.add(self.calc_frame, text="  ③ 计算设置与结果  ")
         else:
             self.calc_frame.update_inputs(self.points, self.boundary)
+        if self._pending_design_settings is not None:
+            settings, self._pending_design_settings = self._pending_design_settings, None
+            self.calc_frame.apply_design_settings(**settings)
             
         # 启用计算页面
         self.notebook.tab(2, state='normal')
         self.notebook.select(2)
 
-    def _collect_project_state(self) -> dict:
-        boundary = list(self.boundary) or list(self.boundary_frame.boundary)
-        design_elevation = 0.0
-        use_partition = False
-        partition = {}
+    def _collect_design_settings(self) -> dict:
+        """计算页的比较面与方格网设置；打开工程后尚未应用到计算页时，沿用工程里读到的设置。"""
+        if self._pending_design_settings is not None:
+            return dict(self._pending_design_settings)
         if self.calc_frame is not None:
-            design_elevation = self.calc_frame.design_elevation_value()
-            use_partition = bool(self.calc_frame.use_partition_var.get())
-            partition = dict(self.calc_frame.partition_data)
-        elif any(point.has_design_z for point in self.points):
+            return self.calc_frame.design_settings()
+        settings = {"design_elevation": 0.0, "use_partition": False, "partition": {}}
+        if any(point.has_design_z for point in self.points):
             designs = [point.design_z for point in self.points if point.has_design_z]
             unique = {round(value, 6) for value in designs}
             if len(unique) == 1:
-                design_elevation = designs[0]
+                settings["design_elevation"] = designs[0]
             else:
-                use_partition = True
-                partition = {point.id: point.design_z for point in self.points if point.has_design_z}
+                settings["use_partition"] = True
+                settings["partition"] = {point.id: point.design_z for point in self.points if point.has_design_z}
+        return settings
+
+    def _collect_project_state(self) -> dict:
         return {
             "points": self.points,
-            "boundary": boundary,
-            "design_elevation": design_elevation,
-            "use_partition": use_partition,
-            "partition": partition,
+            "boundary": list(self.boundary) or list(self.boundary_frame.boundary),
             "project_name": self.project_name,
+            **self._collect_design_settings(),
         }
 
     def save_project_to(self, filepath: str) -> None:
         if not self.points:
             raise ValueError("没有可保存的测量点")
         state = self._collect_project_state()
-        save_project(
-            filepath,
-            state["points"],
-            state["boundary"],
-            design_elevation=state["design_elevation"],
-            use_partition=state["use_partition"],
-            partition=state["partition"],
-            project_name=state["project_name"],
-        )
+        save_project(filepath, state.pop("points"), state.pop("boundary"), **state)
         self.project_path = filepath
         self._update_project_label()
         remember_recent(filepath)
@@ -318,16 +323,15 @@ class MainApplication(tk.Tk):
         self.boundary_frame.set_boundary([])
         self.import_frame.load_points(points)
         self._on_points_loaded(points)
+        settings = {key: data[key] for key in DESIGN_SETTING_KEYS if key in data}
+        settings.setdefault("design_elevation", 0.0)
+        settings["design_elevation"] = settings["design_elevation"] or 0.0
+        # 计算页在确认边界后才创建；先记下设置，创建时再应用
+        self._pending_design_settings = settings
         boundary = data.get("boundary") or []
         if boundary:
             self.boundary_frame.set_boundary(boundary)
             self._on_boundary_set(list(boundary))
-        if self.calc_frame is not None:
-            self.calc_frame.apply_design_settings(
-                data.get("design_elevation") or 0.0,
-                bool(data.get("use_partition")),
-                data.get("partition") or {},
-            )
         self._update_project_label()
 
     def load_project_from(self, filepath: str) -> None:

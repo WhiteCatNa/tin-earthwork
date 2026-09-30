@@ -20,6 +20,33 @@ from utils.dxf_io import read_text_with_encodings
 from utils.fileio import atomic_write_text
 from version import __version__
 
+def report_labels(result: CalculationResult) -> Dict[str, str]:
+    """报告用语：与设计面比较，或两期对比。"""
+    if result.is_compare:
+        return {
+            "natural": "前期高程",
+            "design": "后期高程",
+            "design_item": "比较面",
+            "cut": "前期高于后期部分（挖除）",
+            "fill": "后期高于前期部分（填筑）",
+            "method": "两期TIN叠加（前期、后期三角网精确求交，边界精确裁剪）",
+            "covered": "两期测量共同覆盖",
+        }
+    return {
+        "natural": "实测高程",
+        "design": "设计高程",
+        "design_item": "设计高程",
+        "cut": "实测高程高于设计高程部分",
+        "fill": "实测高程低于设计高程部分",
+        "method": "TIN三角网法（Delaunay剖分，边界精确裁剪）",
+        "covered": "有测点覆盖",
+    }
+
+
+def _percent(value: Optional[float]) -> str:
+    return "—" if value is None else f"{value:+.2f}%"
+
+
 ISSUE_NAMES = {
     'missing_values': '缺失值',
     'duplicate_coords': '重复坐标',
@@ -402,10 +429,47 @@ class DataExporter:
         '顶点3点号', '顶点3X', '顶点3Y', '顶点3实测高程', '顶点3设计高程', '顶点3高差',
         '边界内面积(m²)', '平均高差(m)', '挖方量(m³)', '填方量(m³)', '净体积(m³)', '是否混合', '是否被边界裁剪',
     ]
+    GRID_CORNER_HEADERS = ['角点(行-列)', '行', '列', 'X', 'Y', '{natural}', '{design}', '施工高度(m)', '备注']
+    GRID_CELL_HEADERS = ['方格(行-列)', '左下角点', '右下角点', '右上角点', '左上角点',
+                         '计算面积(m²)', '挖方量(m³)', '填方量(m³)', '净方量(m³)', '是否被边界裁剪']
 
     def __init__(self, project_name: str = "土方计算项目"):
         self.project_name = project_name
         self.calc_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    @classmethod
+    def detail_headers(cls, result: CalculationResult) -> List[str]:
+        labels = report_labels(result)
+        return [
+            header.replace("实测高程", labels["natural"]).replace("设计高程", labels["design"])
+            for header in cls.DETAIL_HEADERS
+        ]
+
+    @staticmethod
+    def grid_corner_rows(result: CalculationResult) -> List[List[Any]]:
+        grid = result.grid_check
+        if grid is None:
+            return []
+        rows = []
+        for corner in grid.corners:
+            if not corner.valid:
+                rows.append([corner.name, corner.row, corner.col, corner.x, corner.y, '', '', '', '无法取值'])
+                continue
+            note = '测区外，按相邻三角形外推，仅用于方格内插值' if corner.extrapolated else ''
+            rows.append([corner.name, corner.row, corner.col, corner.x, corner.y,
+                         round(corner.natural, 3), round(corner.design, 3), round(corner.height, 3), note])
+        return rows
+
+    @staticmethod
+    def grid_cell_rows(result: CalculationResult) -> List[List[Any]]:
+        grid = result.grid_check
+        if grid is None:
+            return []
+        return [
+            [cell.name, *cell.corners, round(cell.area, 3), round(cell.cut, 3), round(cell.fill, 3),
+             round(cell.net, 3), '是' if cell.clipped else '否']
+            for cell in grid.cells
+        ]
 
     @staticmethod
     def _detail_rows(result: CalculationResult):
@@ -429,21 +493,40 @@ class DataExporter:
     @staticmethod
     def summary_rows(result: CalculationResult) -> List[List[Any]]:
         """汇总表各行：项目、数值、单位、说明。界面汇总页与报告共用。"""
+        labels = report_labels(result)
         rows = [
-            ['总挖方量', round(result.total_cut, 3), 'm³', '实测高程高于设计高程部分'],
-            ['总填方量', round(result.total_fill, 3), 'm³', '实测高程低于设计高程部分'],
+            ['总挖方量', round(result.total_cut, 3), 'm³', labels["cut"]],
+            ['总填方量', round(result.total_fill, 3), 'm³', labels["fill"]],
             ['挖填差值', round(result.net_volume, 3), 'm³', '正值为挖方大（需外运），负值为填方大（需借方）'],
-            ['计算面积', round(result.computed_area, 3), 'm²', '计算边界内且有测点覆盖的水平面积'],
+            ['计算面积', round(result.computed_area, 3), 'm²', f'计算边界内且{labels["covered"]}的水平面积'],
         ]
         if result.boundary_area > 0:
             rows.append(['计算边界面积', round(result.boundary_area, 3), 'm²', ''])
             rows.append(['测点覆盖率', round(result.coverage_ratio * 100, 2), '%', '低于 99.5% 时请核对边界'])
+        if result.design_description:
+            # 斜面、两期对比的说明较长：数值列写类型，完整说明放在说明列
+            short = "两期对比" if result.is_compare else result.design_description.split("：", 1)[0]
+            rows.append([labels["design_item"], short, '', result.design_description])
+        else:
+            rows.append([labels["design_item"], result.design_text, '', ''])
+        if result.is_compare:
+            rows.append(['后期测点数', result.compare_point_count, '个', ''])
         rows += [
-            ['设计高程', result.design_text, '', ''],
-            ['三角形数', result.triangle_count, '个', '参与计算的三角形'],
+            ['三角形数', result.triangle_count, '个',
+             '两期三角网叠加后的计算单元' if result.is_compare else '参与计算的三角形'],
             ['混合三角形', result.mixed_triangle_count, '个', '跨越零填挖线，已按零线分割'],
             ['边界裁剪三角形', result.clipped_triangle_count, '个', '跨越计算边界，只计边界内部分'],
         ]
+        grid = result.grid_check
+        if grid is not None:
+            comparison = {label: (diff, relative) for label, _, _, diff, relative in grid.comparison(result)}
+            rows += [
+                ['方格网校核', f'边长 {grid.spacing:g} m', '', f'计入方格 {len(grid.cells)} 个，三角棱柱体法'],
+                ['方格网法挖方', round(grid.total_cut, 3), 'm³', f'与 TIN 法相差 {_percent(comparison["挖方"][1])}'],
+                ['方格网法填方', round(grid.total_fill, 3), 'm³', f'与 TIN 法相差 {_percent(comparison["填方"][1])}'],
+                ['方格网法挖填差值', round(grid.net_volume, 3), 'm³',
+                 f'与 TIN 法相差 {comparison["挖填差值"][0]:+.3f} m³'],
+            ]
         return rows
 
     @staticmethod
@@ -457,6 +540,9 @@ class DataExporter:
                 detail = "；".join(items[:limit]) + (f"；……共 {len(items)} 条" if len(items) > limit else "")
                 rows.append([name, len(items), detail or "未发现"])
         rows.append(["计算提示", len(result.warnings), "\n".join(result.warnings) or "无"])
+        if result.grid_check is not None:
+            grid_warnings = result.grid_check.warnings
+            rows.append(["方格网校核提示", len(grid_warnings), "\n".join(grid_warnings) or "无"])
         return rows
 
     def export_summary_excel(self, result: CalculationResult, filepath: str,
@@ -483,14 +569,15 @@ class DataExporter:
             cell.font = Font(bold=True, size=size)
             return cell
 
+        labels = report_labels(result)
         ws1 = wb.create_sheet("土方量汇总表")
         for column, width in zip("ABCDEF", (18, 26, 10, 44, 18, 18)):
             ws1.column_dimensions[column].width = width
         ws1.append([bold(ws1, self.project_name, 14)])
         ws1.append([bold(ws1, "土方量计算汇总表")])
         ws1.append([])
-        ws1.append(["计算日期", self.calc_date, "", "计算方法", "TIN三角网法（Delaunay剖分，边界精确裁剪）"])
-        ws1.append(["设计高程", result.design_text, "", "计算边界顶点数", len(result.boundary_points or [])])
+        ws1.append(["计算日期", self.calc_date, "", "计算方法", labels["method"]])
+        ws1.append([labels["design_item"], result.design_text, "", "计算边界顶点数", len(result.boundary_points or [])])
         ws1.append([])
         header(ws1, ['项目', '数值', '单位', '说明'])
         for row in self.summary_rows(result):
@@ -498,9 +585,10 @@ class DataExporter:
 
         ws2 = wb.create_sheet("三角形计算明细")
         ws2.freeze_panes = "B2"
-        for index in range(len(self.DETAIL_HEADERS)):
+        detail_headers = self.detail_headers(result)
+        for index in range(len(detail_headers)):
             ws2.column_dimensions[get_column_letter(index + 1)].width = 14
-        header(ws2, self.DETAIL_HEADERS)
+        header(ws2, detail_headers)
         for row in self._detail_rows(result):
             ws2.append(row)
 
@@ -512,6 +600,36 @@ class DataExporter:
         for row in self.check_rows(points, result):
             ws3.append(row)
 
+        grid = result.grid_check
+        if grid is not None:
+            ws4 = wb.create_sheet("方格网校核")
+            for column, width in zip("ABCDEF", (16, 16, 16, 16, 12, 30)):
+                ws4.column_dimensions[column].width = width
+            ws4.append([bold(ws4, f"方格网法校核（边长 {grid.spacing:g} m，三角棱柱体法）", 12)])
+            ws4.append(["方格网原点", f"({grid.origin[0]:.3f}, {grid.origin[1]:.3f})", "行 × 列",
+                        f"{grid.rows} × {grid.cols}", "计入方格", len(grid.cells)])
+            ws4.append([])
+            header(ws4, ["项目", "TIN 法", "方格网法", "差值", "相对差"])
+            for label, tin_value, grid_value, diff, relative in grid.comparison(result):
+                ws4.append([label, round(tin_value, 3), round(grid_value, 3), round(diff, 3), _percent(relative)])
+            ws4.append([])
+            ws4.append(["说明", "角点高程由三角网线性插值，每个方格沿左下—右上对角线分成两个三角形，"
+                        "按边界精确裁剪、按零线分割。与 TIN 法的差异反映方格取样密度的影响。"])
+            for warning in grid.warnings:
+                ws4.append(["提示", warning])
+
+            ws5 = wb.create_sheet("方格网角点")
+            ws5.freeze_panes = "A2"
+            header(ws5, [h.format(natural=labels["natural"], design=labels["design"]) for h in self.GRID_CORNER_HEADERS])
+            for row in self.grid_corner_rows(result):
+                ws5.append(row)
+
+            ws6 = wb.create_sheet("方格网方格")
+            ws6.freeze_panes = "A2"
+            header(ws6, self.GRID_CELL_HEADERS)
+            for row in self.grid_cell_rows(result):
+                ws6.append(row)
+
         # 先完整写入内存再落盘：目标文件被占用时不会留下半成品和临时文件
         buffer = io.BytesIO()
         wb.save(buffer)
@@ -520,7 +638,7 @@ class DataExporter:
 
     def export_triangles_csv(self, result: CalculationResult, filepath: str) -> bool:
         """导出三角形明细CSV"""
-        df = pd.DataFrame(list(self._detail_rows(result)), columns=self.DETAIL_HEADERS)
+        df = pd.DataFrame(list(self._detail_rows(result)), columns=self.detail_headers(result))
         df.to_csv(filepath, index=False, encoding='utf-8-sig')
         return True
 
@@ -536,6 +654,8 @@ class DataExporter:
         for polyline in chain_segments(extract_zero_contour_segments(result)):
             if len(polyline) >= 2:
                 parts.append(self._dxf_polyline("ZERO_CONTOUR", polyline, closed=False))
+        if result.grid_check is not None:
+            parts.extend(self._dxf_grid(result.grid_check))
         parts.append("0\nENDSEC\n0\nEOF\n")
         with open(filepath, "w", encoding="utf-8") as handle:
             handle.write("".join(parts))
@@ -549,8 +669,47 @@ class DataExporter:
         lines.append(f"0\nSEQEND\n8\n{layer}\n")
         return "".join(lines)
 
+    @staticmethod
+    def _dxf_text(layer: str, x: float, y: float, height: float, text: str) -> str:
+        return f"0\nTEXT\n8\n{layer}\n10\n{float(x)!r}\n20\n{float(y)!r}\n30\n0.0\n40\n{float(height)!r}\n1\n{text}\n"
+
+    @classmethod
+    def _dxf_grid(cls, grid) -> List[str]:
+        """方格网图：GRID 方格线、GRID_HEIGHT 角点施工高度、GRID_ELEV 角点 地面/设计 高程、GRID_VOLUME 方格方量。
+
+        方格线铺满计算范围的外接矩形；方量只计计算范围以内的部分。
+
+        文字只含数字和符号，R12 下无需处理中文编码。
+        """
+        a = grid.spacing
+        x0, y0 = grid.origin
+        x1, y1 = x0 + grid.cols * a, y0 + grid.rows * a
+        parts = [cls._dxf_polyline("GRID", [(x0 + i * a, y0), (x0 + i * a, y1)], closed=False)
+                 for i in range(grid.cols + 1)]
+        parts += [cls._dxf_polyline("GRID", [(x0, y0 + j * a), (x1, y0 + j * a)], closed=False)
+                  for j in range(grid.rows + 1)]
+        size = a * 0.08
+        for corner in grid.corners:
+            # 测区外外推的角点不是实测值，图上不标注
+            if not corner.valid or corner.extrapolated:
+                continue
+            parts.append(cls._dxf_text("GRID_HEIGHT", corner.x + size * 0.5, corner.y + size * 0.5, size,
+                                       f"{corner.height:+.2f}"))
+            parts.append(cls._dxf_text("GRID_ELEV", corner.x + size * 0.5, corner.y - size * 1.5, size * 0.8,
+                                       f"{corner.natural:.2f}/{corner.design:.2f}"))
+        for cell in grid.cells:
+            cx = x0 + (cell.col - 0.5) * a
+            cy = y0 + (cell.row - 0.5) * a
+            if cell.cut > 0 and cell.fill > 0:
+                text = f"+{cell.cut:.1f}/-{cell.fill:.1f}"
+            else:
+                text = f"{cell.net:+.1f}"
+            parts.append(cls._dxf_text("GRID_VOLUME", cx - a * 0.3, cy, size, text))
+        return parts
+
     def generate_report_text(self, result: CalculationResult, point_count: int) -> str:
         """生成文本报告"""
+        labels = report_labels(result)
         if result.net_volume > 0:
             balance = "(挖方大于填方，需外运)"
         elif result.net_volume < 0:
@@ -564,6 +723,39 @@ class DataExporter:
                 f"（测点覆盖率 {result.coverage_ratio * 100:.2f}%）"
             )
         warnings = "\n".join(f"- {item}" for item in result.warnings) or "无"
+        point_lines = f"测量点数: {point_count}"
+        if result.is_compare:
+            point_lines = f"前期测点数: {point_count}\n后期测点数: {result.compare_point_count}"
+            notes = (
+                "1. 前期、后期测点分别构建TIN三角网，两网精确叠加后，每个计算单元内两期地面均为平面。\n"
+                "2. 高差 = 前期高程 − 后期高程；正为挖除，负为填筑。\n"
+                "3. 跨越计算边界的单元按边界精确裁剪；只计算两期都有测点覆盖的部分。\n"
+                "4. 混合挖填单元已按零填挖线分割计算，避免正负高差抵消。\n"
+                "5. 计算结果仅供工程参考，正式计量请以复核成果为准。"
+            )
+        else:
+            notes = (
+                "1. 本成果基于实测点构建TIN三角网，按水平投影面积×平均高差法计算。\n"
+                "2. 跨越计算边界的三角形按边界精确裁剪，只计边界以内部分。\n"
+                "3. 混合挖填三角形已按零填挖线分割计算，避免正负高差抵消。\n"
+                "4. 所有三角形均保留面积、顶点高程、高差及分项体积，可逐项复核。\n"
+                "5. 计算结果仅供工程参考，正式计量请以复核成果为准。"
+            )
+        grid_section = ""
+        grid = result.grid_check
+        if grid is not None:
+            lines = [
+                f"方格边长: {grid.spacing:g} m，方格网 {grid.rows} 行 × {grid.cols} 列，计入方格 {len(grid.cells)} 个",
+                "计算方法: 角点高程由三角网插值，每格沿对角线分为两个三角形（三角棱柱体法）",
+            ]
+            for label, tin_value, grid_value, diff, relative in grid.comparison(result):
+                unit = "m²" if label == "计算面积" else "m³"
+                lines.append(
+                    f"{label}: 方格网法 {grid_value:.3f} {unit}，TIN 法 {tin_value:.3f} {unit}，"
+                    f"相差 {diff:+.3f} {unit}（{_percent(relative)}）"
+                )
+            lines += [f"- {item}" for item in grid.warnings]
+            grid_section = "\n【方格网校核】\n" + "\n".join(lines) + "\n"
         return f"""
 ============================================================
               {self.project_name} - 土方计算报告
@@ -571,13 +763,13 @@ class DataExporter:
 
 【项目基本信息】
 计算日期: {self.calc_date}
-计算方法: TIN三角网法 (Delaunay三角剖分，边界精确裁剪)
-测量点数: {point_count}
+计算方法: {labels["method"]}
+{point_lines}
 三角形总数: {result.triangle_count}
 混合挖填三角形: {result.mixed_triangle_count}
 边界裁剪三角形: {result.clipped_triangle_count}
 计算边界顶点数: {len(result.boundary_points) if result.boundary_points else 0}
-设计高程: {result.design_text}
+{labels["design_item"]}: {result.design_text}
 {area_lines}
 
 【计算结果汇总】
@@ -585,16 +777,12 @@ class DataExporter:
 总填方量: {result.total_fill:.3f} m³
 挖填差值: {result.net_volume:.3f} m³
 {balance}
-
+{grid_section}
 【计算提示】
 {warnings}
 
 【说明】
-1. 本成果基于实测点构建TIN三角网，按水平投影面积×平均高差法计算。
-2. 跨越计算边界的三角形按边界精确裁剪，只计边界以内部分。
-3. 混合挖填三角形已按零填挖线分割计算，避免正负高差抵消。
-4. 所有三角形均保留面积、顶点高程、高差及分项体积，可逐项复核。
-5. 计算结果仅供工程参考，正式计量请以复核成果为准。
+{notes}
 
 ============================================================
 """
@@ -634,48 +822,27 @@ class DataExporter:
         return True
 
 
-def save_project(
-    filepath: str,
-    points: List[SurveyPoint],
-    boundary: List[Tuple[float, float]],
-    design_elevation: float = 0.0,
-    use_partition: bool = False,
-    partition: Optional[Dict[str, float]] = None,
-    project_name: str = "TIN土方计算项目",
-) -> None:
-    """保存可再次打开的工程文件（测点、边界、设计高程）。"""
-    payload = {
-        "format": "tin-earthwork-project",
-        "format_version": 1,
-        "app_version": __version__,
-        "project_name": project_name,
-        "design_elevation": float(design_elevation),
-        "use_partition": bool(use_partition),
-        "partition": {str(key): float(value) for key, value in (partition or {}).items()},
-        "boundary": [[float(x), float(y)] for x, y in boundary],
-        "points": [
-            {
-                "id": point.id,
-                "x": point.x,
-                "y": point.y,
-                "z": point.z,
-                "design_z": point.design_z,
-                "has_design_z": bool(point.has_design_z),
-            }
-            for point in points
-        ],
-    }
-    atomic_write_text(filepath, json.dumps(payload, ensure_ascii=False, indent=2))
+PROJECT_FORMAT_VERSION = 2
+DESIGN_MODES = ("flat", "plane", "compare")
 
 
-def load_project(filepath: str) -> Dict[str, Any]:
-    """读取工程文件，返回测点对象和计算设置。"""
-    with open(filepath, "r", encoding="utf-8") as handle:
-        payload = json.load(handle)
-    if payload.get("format") not in (None, "tin-earthwork-project"):
-        raise ValueError("不是 TIN 土方工程文件")
+def _point_rows(points: List[SurveyPoint]) -> List[Dict[str, Any]]:
+    return [
+        {
+            "id": point.id,
+            "x": point.x,
+            "y": point.y,
+            "z": point.z,
+            "design_z": point.design_z,
+            "has_design_z": bool(point.has_design_z),
+        }
+        for point in points
+    ]
+
+
+def _points_from_rows(rows) -> List[SurveyPoint]:
     points = []
-    for row in payload.get("points") or []:
+    for row in rows or []:
         design_z = float(row.get("design_z", 0.0))
         has_design_z = bool(row.get("has_design_z", "design_z" in row))
         z_value = float(row["z"])
@@ -690,13 +857,72 @@ def load_project(filepath: str) -> Dict[str, Any]:
                 has_design_z=has_design_z,
             )
         )
+    return points
+
+
+def save_project(
+    filepath: str,
+    points: List[SurveyPoint],
+    boundary: List[Tuple[float, float]],
+    design_elevation: float = 0.0,
+    use_partition: bool = False,
+    partition: Optional[Dict[str, float]] = None,
+    project_name: str = "TIN土方计算项目",
+    design_mode: str = "flat",
+    design_plane: Optional[Dict[str, float]] = None,
+    compare_points: Optional[List[SurveyPoint]] = None,
+    compare_source: str = "",
+    grid_enabled: bool = False,
+    grid_spacing: Optional[float] = None,
+) -> None:
+    """保存可再次打开的工程文件（测点、边界、设计面、后期测点、方格网设置）。"""
+    if design_mode not in DESIGN_MODES:
+        raise ValueError(f"未知的设计面类型: {design_mode}")
+    payload = {
+        "format": "tin-earthwork-project",
+        "format_version": PROJECT_FORMAT_VERSION,
+        "app_version": __version__,
+        "project_name": project_name,
+        "design_mode": design_mode,
+        "design_elevation": float(design_elevation),
+        "design_plane": {key: float(value) for key, value in (design_plane or {}).items()} or None,
+        "use_partition": bool(use_partition),
+        "partition": {str(key): float(value) for key, value in (partition or {}).items()},
+        "grid_check": {"enabled": bool(grid_enabled), "spacing": None if grid_spacing is None else float(grid_spacing)},
+        "compare_source": compare_source,
+        "boundary": [[float(x), float(y)] for x, y in boundary],
+        "points": _point_rows(points),
+        "compare_points": _point_rows(compare_points or []),
+    }
+    atomic_write_text(filepath, json.dumps(payload, ensure_ascii=False, indent=2))
+
+
+def load_project(filepath: str) -> Dict[str, Any]:
+    """读取工程文件（兼容 1.x 的格式），返回测点对象和计算设置。"""
+    with open(filepath, "r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    if payload.get("format") not in (None, "tin-earthwork-project"):
+        raise ValueError("不是 TIN 土方工程文件")
+    if int(payload.get("format_version") or 1) > PROJECT_FORMAT_VERSION:
+        raise ValueError("工程文件由更新版本的程序保存，请升级后再打开")
     boundary = [(float(x), float(y)) for x, y in (payload.get("boundary") or [])]
     partition = {str(key): float(value) for key, value in (payload.get("partition") or {}).items()}
+    compare_points = _points_from_rows(payload.get("compare_points"))
+    design_mode = payload.get("design_mode") or ("compare" if compare_points else "flat")
+    if design_mode not in DESIGN_MODES:
+        design_mode = "flat"
+    grid = payload.get("grid_check") or {}
     return {
         "project_name": payload.get("project_name") or "TIN土方计算项目",
+        "design_mode": design_mode,
         "design_elevation": float(payload.get("design_elevation") or 0.0),
+        "design_plane": payload.get("design_plane") or None,
         "use_partition": bool(payload.get("use_partition")),
         "partition": partition,
+        "grid_enabled": bool(grid.get("enabled")),
+        "grid_spacing": None if grid.get("spacing") is None else float(grid["spacing"]),
+        "compare_source": payload.get("compare_source") or "",
         "boundary": boundary,
-        "points": points,
+        "points": _points_from_rows(payload.get("points")),
+        "compare_points": compare_points,
     }

@@ -112,9 +112,25 @@ class BoundaryFrame(ttk.Frame):
                     "3. 点会自动吸附到附近测量点；右键或“撤销”可回退\n"
                     "4. 至少 3 个点，系统会自动闭合；确认前检查状态提示\n"
                     "5. 也可导入 DXF 多段线或 CSV/TXT（前两列为 X、Y）")
-        ttk.Label(ctrl_frame, text=info_text, justify=tk.LEFT, style="Hint.TLabel").grid(
-            row=6, column=0, sticky="w", pady=(10, 0)
-        )
+        self.info_label = ttk.Label(ctrl_frame, text=info_text, justify=tk.LEFT, style="Hint.TLabel")
+        self.info_label.grid(row=6, column=0, sticky="w", pady=(10, 0))
+        self.ctrl_frame, self.list_frame = ctrl_frame, list_frame
+        ctrl_frame.bind("<Configure>", self._adapt_hint)
+
+    # 坐标列表至少保留的高度（表头 + 约 4 行）
+    LIST_MIN_HEIGHT = 140
+
+    def _adapt_hint(self, _event=None):
+        """面板偏矮时隐藏操作说明，把高度留给坐标列表；变高后再显示。"""
+        shown = bool(self.info_label.winfo_manager())
+        info_height = self.info_label.winfo_reqheight() + 10
+        without_info = self.ctrl_frame.winfo_reqheight() - (info_height if shown else 0)
+        needed = without_info - self.list_frame.winfo_reqheight() + self.LIST_MIN_HEIGHT + info_height
+        if self.ctrl_frame.winfo_height() >= needed:
+            if not shown:
+                self.info_label.grid()
+        elif shown:
+            self.info_label.grid_remove()
         
     def _toggle_edit_mode(self):
         self.edit_mode = self.edit_var.get()

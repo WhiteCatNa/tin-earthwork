@@ -228,7 +228,8 @@ class EarthworkPlotter:
             line.set_visible(show_contour)
         if self._artist_scatter is not None:
             self._artist_scatter.set_visible(show_points)
-            self._colorbar = self.fig.colorbar(self._artist_scatter, ax=self.ax, shrink=0.8, label='实测高程 (m)')
+            self._colorbar = self.fig.colorbar(self._artist_scatter, ax=self.ax, shrink=0.8,
+                                               label=f'{natural_label(result)} (m)')
             self._colorbar.ax.set_visible(show_points)
         if self._artist_boundary is not None:
             self._artist_boundary.set_visible(show_boundary)
@@ -409,6 +410,11 @@ class EarthworkPlotter:
 RASTERIZE_TRIANGLES = 5000
 
 
+def natural_label(result: CalculationResult) -> str:
+    """测点散点的含义：与设计面比较时是实测高程，两期对比时是前期高程。"""
+    return "前期高程" if result.is_compare else "实测高程"
+
+
 def _result_geometry(result: CalculationResult):
     """整理绘图用的几何数据：挖方/填方多边形、TIN 三角形、零填挖线。"""
     cut, fill, mesh, tris = [], [], [], []
@@ -505,10 +511,10 @@ def create_standalone_figure(result: CalculationResult,
     ax.set_facecolor(COLORS["sheet"])
     artists = draw_result(ax, result, points, boundary, dict(PLOT_COLORS), fine=True)
     if artists["scatter"] is not None:
-        fig.colorbar(artists["scatter"], ax=ax, shrink=0.8, label='实测高程 (m)')
+        fig.colorbar(artists["scatter"], ax=ax, shrink=0.8, label=f'{natural_label(result)} (m)')
     ax.set_title(
         f'{project_name}\n挖方:{result.total_cut:.1f}m³  填方:{result.total_fill:.1f}m³  '
-        f'净:{result.net_volume:.1f}m³  设计高程:{result.design_text}',
+        f'净:{result.net_volume:.1f}m³\n{"比较面" if result.is_compare else "设计高程"}: {result.design_text}',
         fontsize=13, pad=15)
     if artists["legend"]:
         ax.legend(handles=artists["legend"], loc='upper right', fontsize=11, framealpha=0.95)

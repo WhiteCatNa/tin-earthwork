@@ -62,23 +62,32 @@ class DataImportFrame(ttk.Frame):
         # 进度条占位（不创建，仅在导入时动态添加）
         self.progress_bar: Optional[ttk.Progressbar] = None
         
-        # 列映射只有 5 行，不参与伸缩；多出的高度留给下面的测点表
+        # 列映射只有 5 行，不参与伸缩；多出的高度留给下面的测点表。
+        # 可收起为一行摘要：小屏上把高度让给测点表，识别不全时自动展开
         map_frame = ttk.LabelFrame(left_frame, text="列映射（自动识别；双击“源列名”可改选）", padding=8)
         map_frame.pack(fill=tk.X, pady=(0, 8))
+        map_header = ttk.Frame(map_frame)
+        map_header.pack(fill=tk.X)
+        self.mapping_toggle = ttk.Button(map_header, text="收起", width=6, command=self._toggle_mapping)
+        self.mapping_toggle.pack(side=tk.RIGHT)
+        self.mapping_summary_var = tk.StringVar(value="尚未导入数据")
+        ttk.Label(map_header, textvariable=self.mapping_summary_var, style="Muted.TLabel").pack(side=tk.LEFT)
 
+        self.mapping_body = ttk.Frame(map_frame)
         # 映射编辑按钮放在表格右侧，省出一行高度
-        map_btn_frame = ttk.Frame(map_frame)
+        map_btn_frame = ttk.Frame(self.mapping_body)
         map_btn_frame.pack(side=tk.RIGHT, fill=tk.Y, padx=(8, 0))
         ttk.Button(map_btn_frame, text="应用映射", command=self._apply_mapping).pack(fill=tk.X)
         ttk.Button(map_btn_frame, text="重置自动识别", command=self._auto_detect_mapping).pack(fill=tk.X, pady=(8, 0))
 
-        self.tree_map = ttk.Treeview(map_frame, columns=('target', 'source'), show='headings', height=5)
+        self.tree_map = ttk.Treeview(self.mapping_body, columns=('target', 'source'), show='headings', height=5)
         self.tree_map.heading('target', text='目标字段')
         self.tree_map.heading('source', text='源列名')
         self.tree_map.column('target', width=170)
         self.tree_map.column('source', width=150)
         self.tree_map.pack(side=tk.LEFT, fill=tk.X, expand=True)
         self.tree_map.bind("<Double-1>", self._on_mapping_double_click)
+        self.set_mapping_expanded(self.winfo_screenheight() >= 900)
 
         # 数据预览（可编辑）
         preview_frame = ttk.LabelFrame(left_frame, text="测点表（双击单元格修改）", padding=8)
@@ -219,6 +228,25 @@ class DataImportFrame(ttk.Frame):
         for target, label in MAPPING_TARGETS:
             source = self.column_mapping.get(target)
             self.tree_map.insert('', 'end', iid=target, values=(label, NOT_USED if source is None else str(source)))
+        names = {"id": "点号", "x": "X", "y": "Y", "z": "高程", "design_z": "设计高程"}
+        parts = [f"{names[key]}←{self.column_mapping[key]}" for key in names if key in self.column_mapping]
+        missing = [names[key] for key in ("x", "y", "z") if key not in self.column_mapping]
+        summary = "，".join(parts)
+        if missing:
+            summary += f"（未识别：{'、'.join(missing)}）"
+            self.set_mapping_expanded(True)
+        self.mapping_summary_var.set(summary or "未识别到任何列")
+
+    def set_mapping_expanded(self, expanded: bool) -> None:
+        if expanded:
+            self.mapping_body.pack(fill=tk.X, pady=(6, 0))
+        else:
+            self._destroy_mapping_editor()
+            self.mapping_body.pack_forget()
+        self.mapping_toggle.config(text="收起" if expanded else "展开")
+
+    def _toggle_mapping(self):
+        self.set_mapping_expanded(not self.mapping_body.winfo_manager())
 
     def _auto_detect_mapping(self):
         self._update_mapping_display()
