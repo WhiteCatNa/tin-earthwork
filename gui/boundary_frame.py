@@ -31,7 +31,6 @@ HISTORY_LIMIT = 100
 # 边界内测点覆盖不到这个比例时，图上标出无测点区域、状态里写明
 FULL_COVERAGE = 0.9995
 SHORTCUT_MODIFIER = "Command" if sys.platform == "darwin" else "Control"
-STATUS_WRAP_PIXELS = 300
 
 
 def scroll_steps(event) -> float:
@@ -98,13 +97,33 @@ class BoundaryFrame(ttk.Frame):
         self.backdrop_check = ttk.Checkbutton(view_bar, text="底图", variable=self.backdrop_var,
                                               command=self._refresh_plot, state="disabled")
         self.backdrop_check.pack(side=tk.LEFT, padx=(8, 0))
-        # 光标坐标靠右先占位，窗口偏窄时被截短的是中间的操作提示
         self.coord_var = tk.StringVar(value="X: --  Y: --")
         ttk.Label(view_bar, textvariable=self.coord_var, style="Muted.TLabel").pack(side=tk.RIGHT)
+
+        # 第二行：编辑选项；操作提示在窗口偏窄时被截短
+        option_bar = ttk.Frame(plot_frame)
+        option_bar.pack(side=tk.TOP, fill=tk.X, pady=(0, 4))
+        self.edit_var = tk.BooleanVar(value=True)
+        self.snap_var = tk.BooleanVar(value=True)
+        self.show_ids_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(option_bar, text="编辑边界", variable=self.edit_var,
+                       command=self._toggle_edit_mode).pack(side=tk.LEFT)
+        ttk.Checkbutton(option_bar, text="吸附测点", variable=self.snap_var).pack(side=tk.LEFT, padx=(10, 0))
+        ttk.Checkbutton(option_bar, text="显示点号", variable=self.show_ids_var,
+                       command=self._refresh_point_labels).pack(side=tk.LEFT, padx=(10, 0))
         ttk.Label(
-            view_bar, style="Hint.TLabel",
+            option_bar, style="Hint.TLabel",
             text="滚轮缩放 · 拖空白处平移 · 单击加点 · 点边插入 · 拖顶点 · 右键删点",
-        ).pack(side=tk.LEFT, padx=(8, 8))
+        ).pack(side=tk.LEFT, padx=(12, 0))
+
+        # 边界状态放在图的下方，按绘图区宽度折行：交叉位置、无测点面积等说明较长，
+        # 放在右侧面板里会挤掉坐标列表（Windows 字体更大时尤其明显）
+        self.boundary_status_var = tk.StringVar(value="待添加边界点")
+        self.status_label = ttk.Label(plot_frame, textvariable=self.boundary_status_var, style="Accent.TLabel",
+                                      justify=tk.LEFT, wraplength=600)
+        self.status_label.pack(side=tk.BOTTOM, fill=tk.X, pady=(4, 0))
+        plot_frame.bind("<Configure>", lambda event: self.status_label.configure(
+            wraplength=max(200, event.width - 30)))
 
         self.plotter = EarthworkPlotter(figsize=(8, 6))
         self.canvas = FigureCanvasTkAgg(self.plotter.fig, master=plot_frame)
@@ -126,21 +145,9 @@ class BoundaryFrame(ttk.Frame):
         ctrl_frame.grid_columnconfigure(0, weight=1)
         ctrl_frame.grid_rowconfigure(2, weight=1)
 
-        # 模式选择
-        mode_frame = ttk.Frame(ctrl_frame)
-        mode_frame.grid(row=0, column=0, sticky="ew", pady=(0, 4))
-        self.edit_var = tk.BooleanVar(value=True)
-        self.snap_var = tk.BooleanVar(value=True)
-        self.show_ids_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(mode_frame, text="编辑边界", variable=self.edit_var,
-                       command=self._toggle_edit_mode).pack(side=tk.LEFT)
-        ttk.Checkbutton(mode_frame, text="吸附测点", variable=self.snap_var).pack(side=tk.LEFT, padx=(10, 0))
-        ttk.Checkbutton(mode_frame, text="显示点号", variable=self.show_ids_var,
-                       command=self._refresh_point_labels).pack(side=tk.LEFT, padx=(10, 0))
-
         # 边界点列表（双击改坐标）
         list_frame = ttk.Frame(ctrl_frame)
-        list_frame.grid(row=2, column=0, sticky="nsew", pady=(4, 8))
+        list_frame.grid(row=2, column=0, sticky="nsew", pady=(0, 8))
 
         self.tree_boundary = ttk.Treeview(list_frame, columns=('idx', 'id', 'x', 'y'), show='headings', height=8,
                                           selectmode='extended')
@@ -205,12 +212,6 @@ class BoundaryFrame(ttk.Frame):
         ttk.Button(btn_frame, text="确认边界", command=self._confirm_boundary,
                   style='Accent.TButton').pack(side=tk.TOP, fill=tk.X, pady=2)
 
-        self.boundary_status_var = tk.StringVar(value="待添加边界点")
-        # 状态可能较长（交叉位置、无测点面积），按坐标列表的宽度折行；
-        # 折行宽度是固定值，不随面板变，免得长文字把面板越撑越宽
-        self.status_label = ttk.Label(ctrl_frame, textvariable=self.boundary_status_var, style="Accent.TLabel",
-                                      justify=tk.LEFT, wraplength=STATUS_WRAP_PIXELS)
-        self.status_label.grid(row=5, column=0, sticky="w", pady=(6, 0))
         self._update_boundary_status()
 
         # 信息提示

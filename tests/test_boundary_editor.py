@@ -310,15 +310,19 @@ def _tk_event(main_window, frame, sequence, x, y):
     main_window.update()
 
 
-def test_real_tk_events_click_drag_and_right_click(main_window, frame):
-    """走一遍 Tk → matplotlib → 边界页的完整事件链：按键编号、按下/松开配对、坐标换算。"""
+def _make_window_receive_events(main_window, frame):
+    """Windows 上测试窗口是 withdraw 隐藏的，Tk 不给没显示的窗口发鼠标、键盘事件；改成透明显示。"""
     if not frame.canvas.get_tk_widget().winfo_ismapped():
-        # Windows 上测试窗口是 withdraw 隐藏的，Tk 不给没显示的窗口发鼠标事件；改成透明显示
         main_window.attributes("-alpha", 0.0)
         main_window.deiconify()
         main_window.update()
     if not frame.canvas.get_tk_widget().winfo_ismapped():
-        pytest.skip("这个环境下测试窗口无法显示，发不了真实鼠标事件")
+        pytest.skip("这个环境下测试窗口无法显示，发不了真实的鼠标、键盘事件")
+
+
+def test_real_tk_events_click_drag_and_right_click(main_window, frame):
+    """走一遍 Tk → matplotlib → 边界页的完整事件链：按键编号、按下/松开配对、坐标换算。"""
+    _make_window_receive_events(main_window, frame)
     for x, y in [(0.0, 0.0), (100.0, 0.0), (100.0, 100.0), (0.0, 100.0)]:
         _tk_event(main_window, frame, "<ButtonPress-1>", x, y)
         _tk_event(main_window, frame, "<ButtonRelease-1>", x, y)
@@ -440,6 +444,7 @@ def test_keyboard_shortcuts_are_bound(frame):
 def test_undo_and_delete_by_keyboard(main_window, frame):
     from gui.boundary_frame import SHORTCUT_MODIFIER
 
+    _make_window_receive_events(main_window, frame)
     frame.set_boundary([(0.0, 0.0), (100.0, 0.0), (100.0, 100.0), (0.0, 100.0)])
     tree = frame.tree_boundary
     tree.focus_set()
