@@ -208,11 +208,13 @@ def run(point_count):
     for i, (x, y) in enumerate([(50, 50), (100, 75), (150, 100), (60, 120)], 1):
         with timed(f"点击三角形 {i}", 0.8):
             fire(ccanvas, cax, 'button_press_event', x, y, MouseButton.LEFT)
+            fire(ccanvas, cax, 'button_release_event', x, y, MouseButton.LEFT)
             pump(app, 0.1)
 
     with timed("连续点击同一位置 x10", 3.0):
         for _ in range(10):
             fire(ccanvas, cax, 'button_press_event', 100, 75, MouseButton.LEFT)
+            fire(ccanvas, cax, 'button_release_event', 100, 75, MouseButton.LEFT)
         pump(app, 0.2)
 
     print("\n--- 阶段 5: 选项卡切换 ---")
