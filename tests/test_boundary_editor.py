@@ -333,3 +333,192 @@ def test_real_tk_events_click_drag_and_right_click(main_window, frame):
     right = "<ButtonPress-2>" if main_window.tk.call("tk", "windowingsystem") == "aqua" else "<ButtonPress-3>"
     _tk_event(main_window, frame, right, 100.0, 0.0)                    # 右键点在顶点上：删掉它
     assert frame.boundary == [(0.0, 0.0), (80.0, 80.0), (0.0, 100.0)]
+
+
+# ---------- 边界检查：交叉、重合、测点覆盖 ----------
+
+def test_crossing_is_located_and_untangled(frame):
+    frame.id_sequence_var.set("1,121,11,111")            # 1→121 与 11→111 两条对角线交叉
+    frame._connect_by_ids()
+    assert frame._problems[0] == [(0, 2)]
+    assert "第 1→2 点与第 3→4 点的连线交叉" in frame.boundary_status_var.get()
+    frame._untangle()
+    assert frame._boundary_is_valid() and sorted(frame.boundary) == sorted(
+        [(0.0, 0.0), (100.0, 100.0), (100.0, 0.0), (0.0, 100.0)])
+    assert "边界有效" in frame.boundary_status_var.get()
+    frame._undo_last_point()
+    assert frame._problems[0] == [(0, 2)]
+    frame._redo_last()
+    assert frame._boundary_is_valid()
+    frame._redo_last()                                    # 没有可重做的：不报错
+    assert frame._boundary_is_valid()
+
+
+def test_untangle_on_a_valid_boundary_does_nothing(frame):
+    messages = []
+    frame.notify = messages.append
+    frame._create_auto_boundary()
+    before = list(frame.boundary)
+    frame._untangle()
+    assert frame.boundary == before and "不需要" in messages[-1]
+
+
+def test_duplicate_point_is_reported(frame):
+    frame.set_boundary([(0.0, 0.0), (100.0, 0.0), (100.0, 100.0), (100.0, 0.0), (0.0, 100.0)])
+    assert "第 4 点与第 2 点重合" in frame.boundary_status_var.get()
+    assert frame._problems[1] == [3]
+
+
+def test_uncovered_part_of_the_boundary_is_reported_before_confirming(frame):
+    frame.set_boundary([(0.0, 0.0), (140.0, 0.0), (140.0, 100.0), (0.0, 100.0)])   # 右边伸出测点 40 m
+    status = frame.boundary_status_var.get()
+    assert "4000.0 m²（28.6%）不在测点范围内" in status
+    assert frame._problems[2] == pytest.approx(4000.0)
+    patches = [p for p in frame.plotter.ax.patches if p.get_label().startswith("无测点区域")]
+    assert len(patches) == 1 and patches[0].get_clip_path() is not None
+    frame._create_outline_boundary()                     # 沿外轮廓：全在测点范围内
+    assert "不在测点范围内" not in frame.boundary_status_var.get()
+    assert frame._problems[2] == 0.0
+
+
+# ---------- 坐标录入：双击修改、粘贴、导出 ----------
+
+def test_double_click_edits_a_vertex_by_coordinates_or_point_number(frame, monkeypatch):
+    frame.set_boundary([(0.0, 0.0), (100.0, 0.0), (100.0, 100.0), (0.0, 100.0)])
+    frame.tree_boundary.selection_set("2")
+    answers = iter(["95.5，88.25", "61", "hello", "0, 0"])
+    monkeypatch.setattr("tkinter.simpledialog.askstring", lambda *a, **k: next(answers))
+    frame._edit_vertex()
+    assert frame.boundary[2] == (95.5, 88.25)
+    frame.tree_boundary.selection_set("2")
+    frame._edit_vertex()                                  # 填点号：用第 61 个测点的坐标（第 6 行第 6 个）
+    assert frame.boundary[2] == (50.0, 50.0)
+    frame.tree_boundary.selection_set("2")
+    frame._edit_vertex()
+    assert "没看懂" in frame.warnings[-1] and frame.boundary[2] == (50.0, 50.0)
+    frame.tree_boundary.selection_set("2")
+    frame._edit_vertex()                                  # 与第 1 点重合：不改
+    assert "已经有边界点" in frame.warnings[-1] and frame.boundary[2] == (50.0, 50.0)
+    frame._undo_last_point()
+    assert frame.boundary[2] == (95.5, 88.25)
+
+
+def test_paste_coordinates_from_the_clipboard(frame, monkeypatch):
+    monkeypatch.setattr(frame, "clipboard_get", lambda: "点号\tX\tY\nJ1\t10\t10\nJ2\t90\t10\nJ3\t90\t80\nJ4\t10\t80\n")
+    frame._paste_coordinates()
+    assert frame.boundary == [(10.0, 10.0), (90.0, 10.0), (90.0, 80.0), (10.0, 80.0)]
+    monkeypatch.setattr(frame, "clipboard_get", lambda: "")
+    frame._paste_coordinates()
+    assert "剪贴板里没有文字" in frame.warnings[-1]
+    assert len(frame.boundary) == 4
+
+
+@pytest.mark.parametrize("suffix", [".csv", ".dxf"])
+def test_export_boundary_and_read_it_back(frame, tmp_path, monkeypatch, suffix):
+    from utils.boundary_io import read_boundary_points
+    from utils.dxf_io import import_boundary_from_dxf
+
+    ring = [(0.0, 0.0), (100.0, 0.0), (100.0, 100.0), (45.5, 100.0)]
+    frame.set_boundary(ring)
+    path = tmp_path / f"边界{suffix}"
+    monkeypatch.setattr("tkinter.filedialog.asksaveasfilename", lambda *a, **k: str(path))
+    frame._export_boundary()
+    back = import_boundary_from_dxf(path) if suffix == ".dxf" else read_boundary_points(path).points
+    assert back == ring
+
+
+# ---------- 快捷键 ----------
+
+def test_keyboard_shortcuts_are_bound(frame):
+    from gui.boundary_frame import SHORTCUT_MODIFIER
+
+    for widget in (frame.canvas.get_tk_widget(), frame.tree_boundary):
+        for sequence in (f"<{SHORTCUT_MODIFIER}-Key-z>", f"<{SHORTCUT_MODIFIER}-Key-y>", "<Key-Delete>", "<Key-Escape>"):
+            assert widget.bind(sequence), sequence
+
+
+def test_undo_and_delete_by_keyboard(main_window, frame):
+    from gui.boundary_frame import SHORTCUT_MODIFIER
+
+    frame.set_boundary([(0.0, 0.0), (100.0, 0.0), (100.0, 100.0), (0.0, 100.0)])
+    tree = frame.tree_boundary
+    tree.focus_set()
+    tree.selection_set("1")
+    main_window.update()
+    tree.event_generate("<Delete>")
+    main_window.update()
+    assert frame.boundary == [(0.0, 0.0), (100.0, 100.0), (0.0, 100.0)]
+    tree.event_generate(f"<{SHORTCUT_MODIFIER}-z>")
+    main_window.update()
+    assert len(frame.boundary) == 4
+
+
+# ---------- CAD 底图 ----------
+
+def _backdrop_dxf(tmp_path, name="底图.dxf", offset=0.0):
+    """两条闭合多段线（场地红线、房屋）和一条道路中线。"""
+    def lw(layer, points, closed=True):
+        body = "".join(f"10\n{x + offset}\n20\n{y + offset}\n" for x, y in points)
+        return f"0\nLWPOLYLINE\n8\n{layer}\n90\n{len(points)}\n70\n{1 if closed else 0}\n{body}"
+    text = ("0\nSECTION\n2\nENTITIES\n"
+            + lw("红线", [(5.0, 5.0), (95.0, 5.0), (95.0, 72.5), (5.0, 72.5)])
+            + lw("房屋", [(40.0, 40.0), (60.0, 40.0), (60.0, 55.0), (40.0, 55.0)])
+            + f"0\nLINE\n8\n道路\n10\n{-20 + offset}\n20\n{85 + offset}\n11\n{120 + offset}\n21\n{85 + offset}\n"
+            + "0\nENDSEC\n0\nEOF\n")
+    path = tmp_path / name
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def test_backdrop_tracing_snaps_to_drawing_vertices(frame, tmp_path, monkeypatch):
+    monkeypatch.setattr("tkinter.filedialog.askopenfilename", lambda *a, **k: str(_backdrop_dxf(tmp_path)))
+    frame._import_backdrop()
+    assert len(frame._backdrop) == 3 and str(frame.backdrop_check.cget("state")) == "normal"
+    # (95, 72.5) 不是测点，是底图的顶点：单击附近会吸附到它
+    _click(frame, 95.6, 72.1)
+    assert frame.boundary == [(95.0, 72.5)]
+    # 关掉底图后不再吸附底图顶点
+    frame.backdrop_var.set(False)
+    frame._refresh_plot()
+    frame.snap_var.set(False)
+    _click(frame, 5.4, 72.9)
+    assert frame.boundary[-1] == (5.4, 72.9)
+
+
+def test_pick_a_backdrop_polyline_as_the_boundary(frame, tmp_path, monkeypatch):
+    monkeypatch.setattr("tkinter.filedialog.askopenfilename", lambda *a, **k: str(_backdrop_dxf(tmp_path)))
+    frame._import_backdrop()
+    frame._set_pick_mode(True)
+    assert frame.pick_button.cget("text") == "取消选线"
+    frame._on_canvas_motion(_event(frame, 50.0, 40.2))   # 悬停在“房屋”下边：高亮
+    assert len(frame.plotter._backdrop_highlight.get_xdata()) == 5
+    _click(frame, 50.0, 40.2)
+    assert frame.boundary == [(40.0, 40.0), (60.0, 40.0), (60.0, 55.0), (40.0, 55.0)]
+    assert not frame._pick_mode
+
+    frame._set_pick_mode(True)
+    _click(frame, 50.0, 85.3)                              # 道路中线只有两个点：围不成边界
+    assert "只有 2 个点" in frame.warnings[-1] and frame._pick_mode
+    frame._escape()
+    assert not frame._pick_mode and frame.pick_button.cget("text") == "选底图线"
+
+
+def test_pick_mode_needs_a_backdrop(frame):
+    frame._set_pick_mode(True)
+    assert not frame._pick_mode and "还没有底图" in frame.warnings[-1]
+
+
+def test_dxf_boundary_with_several_lines_keeps_the_drawing_as_backdrop(frame, tmp_path, monkeypatch):
+    messages = []
+    frame.notify = messages.append
+    monkeypatch.setattr("tkinter.filedialog.askopenfilename", lambda *a, **k: str(_backdrop_dxf(tmp_path)))
+    frame._import_boundary()
+    assert frame.boundary == [(5.0, 5.0), (95.0, 5.0), (95.0, 72.5), (5.0, 72.5)]   # 自动选了“红线”
+    assert len(frame._backdrop) == 3 and "有 3 条线" in messages[-1]
+
+
+def test_backdrop_far_from_the_points_warns_about_axes(frame, tmp_path, monkeypatch):
+    far = _backdrop_dxf(tmp_path, "far.dxf", offset=5000.0)
+    monkeypatch.setattr("tkinter.filedialog.askopenfilename", lambda *a, **k: str(far))
+    frame._import_backdrop()
+    assert "X/Y 互换" in frame.warnings[-1]

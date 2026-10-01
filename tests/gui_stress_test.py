@@ -163,6 +163,46 @@ def run(point_count):
     if bf.boundary != [(p.x, p.y) for p in nearest]:
         ERRORS.append(("connect_by_ids", f"按点号连线结果不对: {bf.boundary}"))
 
+    with timed("理顺交叉的连线", 1.0):
+        bf.id_sequence_var.set(",".join(str(p.id) for p in (nearest[0], nearest[2], nearest[1], nearest[3])))
+        bf._connect_by_ids()
+        bf._untangle()
+        pump(app, 0.1)
+    if not bf._boundary_is_valid():
+        ERRORS.append(("untangle", f"理顺后边界仍无效: {bf.boundary}"))
+
+    with timed("粘贴坐标", 1.0):
+        bf.clipboard_get = lambda: "点号\tX\tY\nJ1\t20\t20\nJ2\t160\t20\nJ3\t160\t120\nJ4\t20\t120\n"
+        bf._paste_coordinates()
+        del bf.clipboard_get
+        pump(app, 0.1)
+    if bf.boundary != [(20.0, 20.0), (160.0, 20.0), (160.0, 120.0), (20.0, 120.0)]:
+        ERRORS.append(("paste", f"粘贴坐标结果不对: {bf.boundary}"))
+
+    with timed("导出边界 CSV + DXF", 1.0):
+        from tkinter import filedialog
+        export_dir = tempfile.mkdtemp(prefix="tin_boundary_")
+        for name in ("边界.csv", "边界.dxf"):
+            filedialog.asksaveasfilename = lambda *a, _name=name, **k: os.path.join(export_dir, _name)
+            bf._export_boundary()
+        pump(app, 0.05)
+    if sorted(os.listdir(export_dir)) != ["边界.csv", "边界.dxf"]:
+        ERRORS.append(("export_boundary", f"导出的文件: {os.listdir(export_dir)}"))
+
+    with timed("导入底图 + 选底图线", 2.0):
+        backdrop_path = os.path.join(export_dir, "底图.dxf")
+        with open(backdrop_path, "w", encoding="utf-8") as handle:
+            handle.write("0\nSECTION\n2\nENTITIES\n0\nLWPOLYLINE\n8\n红线\n90\n4\n70\n1\n"
+                         "10\n30\n20\n30\n10\n150\n20\n30\n10\n150\n20\n110\n10\n30\n20\n110\n"
+                         "0\nLINE\n8\n道路\n10\n0\n20\n140\n11\n200\n21\n140\n0\nENDSEC\n0\nEOF\n")
+        filedialog.askopenfilename = lambda *a, **k: backdrop_path
+        bf._import_backdrop()
+        bf._set_pick_mode(True)
+        click(bcanvas, bax, 90, 30)
+        pump(app, 0.1)
+    if bf.boundary != [(30.0, 30.0), (150.0, 30.0), (150.0, 110.0), (30.0, 110.0)]:
+        ERRORS.append(("pick_backdrop", f"选底图线结果不对: {bf.boundary}"))
+
     with timed("清空边界按钮", 0.5):
         bf._clear_boundary()
         pump(app, 0.1)

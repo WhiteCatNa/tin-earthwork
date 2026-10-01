@@ -281,3 +281,35 @@ def read_boundary_from_dxf(filepath: str) -> Tuple[List[Tuple[float, float]], in
 def import_boundary_from_dxf(filepath: str) -> List[Tuple[float, float]]:
     """从 DXF 取出一条计算边界多边形。"""
     return read_boundary_from_dxf(filepath)[0]
+
+
+def _parse_dxf_lines(text: str) -> List[DxfPolyline]:
+    """LINE 实体，每条作为两点的多段线（底图显示、吸附用）。"""
+    lines: List[DxfPolyline] = []
+    current: Optional[dict] = None
+
+    def finish():
+        if current is not None and all(key in current for key in (10, 20, 11, 21)):
+            lines.append(DxfPolyline(layer=current.get(8, "0"), closed=False,
+                                     points=[(current[10], current[20]), (current[11], current[21])]))
+
+    for code, value in _iter_group_pairs(text):
+        if code == 0:
+            finish()
+            current = {} if value.upper() == "LINE" else None
+        elif current is not None:
+            if code == 8:
+                current[8] = value
+            elif code in (10, 20, 11, 21):
+                number = _as_float(value)
+                if number is not None:
+                    current[code] = number
+    finish()
+    return lines
+
+
+def read_dxf_backdrop(filepath: str) -> List[DxfPolyline]:
+    """读取 DXF 里的多段线（圆弧已折线化）和直线，作为边界页的底图。块（INSERT）里的图形不读。"""
+    text = read_text_with_encodings(filepath)
+    polylines = [item for item in parse_dxf_polylines(filepath) if len(item.points) >= 2]
+    return polylines + _parse_dxf_lines(text)

@@ -4,7 +4,7 @@
 import math
 import sys
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from tkinter import ttk, filedialog, messagebox, simpledialog
 from typing import Dict, List, Tuple, Callable, Optional
 from utils.plotter import EarthworkPlotter
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
@@ -15,9 +15,10 @@ import numpy as np
 XY = Tuple[float, float]
 
 # 鼠标操作的手感，单位都是屏幕像素（按系统显示缩放折算），与图的缩放无关
-SNAP_PIXELS = 12          # 光标离测点这么近时吸附上去
+SNAP_PIXELS = 12          # 光标离测点（或底图顶点）这么近时吸附上去
 VERTEX_PICK_PIXELS = 9    # 离边界顶点这么近算点中顶点
 EDGE_PICK_PIXELS = 6      # 离边界线这么近算点在边上
+BACKDROP_PICK_PIXELS = 8  # 选底图线时，离线这么近算点中
 DRAG_PIXELS = 4           # 按下后移动超过这个距离算拖动，否则算单击
 ZOOM_STEP = 1.25          # 滚轮每格的缩放倍数
 MAX_SCROLL_STEPS = 3.0    # 一次滚轮事件最多算几格
@@ -27,6 +28,10 @@ MAC_SCROLL_UNIT = 0.35
 # 图还没画出来、算不出像素比例时的吸附距离（米）
 FALLBACK_SNAP_DISTANCE = 5.0
 HISTORY_LIMIT = 100
+# 边界内测点覆盖不到这个比例时，图上标出无测点区域、状态里写明
+FULL_COVERAGE = 0.9995
+SHORTCUT_MODIFIER = "Command" if sys.platform == "darwin" else "Control"
+STATUS_WRAP_PIXELS = 300
 
 
 def scroll_steps(event) -> float:
@@ -59,10 +64,21 @@ class BoundaryFrame(ttk.Frame):
         self._point_ids: List[str] = []
         self._point_id_at: Dict[XY, str] = {}    # 坐标 -> 点号，列表里显示边界点对应的测点
         self._history: List[List[XY]] = []       # 撤销用：每次修改前的边界
+        self._redo: List[List[XY]] = []          # 重做用：撤销掉的边界
         self._selected: Optional[int] = None     # 选中的边界顶点
         self._view = None                        # 用户缩放/平移后的视野 (xlim, ylim)；None 为全图
         self._press: Optional[dict] = None       # 鼠标按下到松开之间的状态
         self._auto_edge_text = ""                # 程序自动填的“最长边”，测点变了要重算
+        self._hull: Optional[List[XY]] = None    # 测点覆盖范围（凸包），测点变了要重算
+        self._hull_ready = False
+        self._problems = ([], [], 0.0)           # 当前边界的（交叉的边, 重合的点, 无测点面积）
+        # CAD 底图：线（点列）、全部顶点（吸附用）、所有线段及其所属的线（点选用）
+        self._backdrop: List[np.ndarray] = []
+        self._backdrop_layers: List[str] = []
+        self._backdrop_xy = np.empty((0, 2), dtype=float)
+        self._backdrop_segments = np.empty((0, 2, 2), dtype=float)
+        self._backdrop_owner = np.empty(0, dtype=int)
+        self._pick_mode = False
 
         self._create_widgets()
         self._refresh_plot()
@@ -75,12 +91,19 @@ class BoundaryFrame(ttk.Frame):
         view_bar = ttk.Frame(plot_frame)
         view_bar.pack(side=tk.TOP, fill=tk.X, pady=(0, 4))
         ttk.Button(view_bar, text="全图", width=6, command=self._reset_view).pack(side=tk.LEFT)
+        ttk.Button(view_bar, text="导入底图", command=self._import_backdrop).pack(side=tk.LEFT, padx=(6, 0))
+        self.pick_button = ttk.Button(view_bar, text="选底图线", command=self._toggle_pick_mode)
+        self.pick_button.pack(side=tk.LEFT, padx=(6, 0))
+        self.backdrop_var = tk.BooleanVar(value=True)
+        self.backdrop_check = ttk.Checkbutton(view_bar, text="底图", variable=self.backdrop_var,
+                                              command=self._refresh_plot, state="disabled")
+        self.backdrop_check.pack(side=tk.LEFT, padx=(8, 0))
         # 光标坐标靠右先占位，窗口偏窄时被截短的是中间的操作提示
         self.coord_var = tk.StringVar(value="X: --  Y: --")
         ttk.Label(view_bar, textvariable=self.coord_var, style="Muted.TLabel").pack(side=tk.RIGHT)
         ttk.Label(
             view_bar, style="Hint.TLabel",
-            text="滚轮缩放 · 拖动空白处平移 · 单击加点 · 点在边上插入 · 拖动顶点 · 右键删点",
+            text="滚轮缩放 · 拖空白处平移 · 单击加点 · 点边插入 · 拖顶点 · 右键删点",
         ).pack(side=tk.LEFT, padx=(8, 8))
 
         self.plotter = EarthworkPlotter(figsize=(8, 6))
@@ -115,7 +138,7 @@ class BoundaryFrame(ttk.Frame):
         ttk.Checkbutton(mode_frame, text="显示点号", variable=self.show_ids_var,
                        command=self._refresh_point_labels).pack(side=tk.LEFT, padx=(10, 0))
 
-        # 边界点列表
+        # 边界点列表（双击改坐标）
         list_frame = ttk.Frame(ctrl_frame)
         list_frame.grid(row=2, column=0, sticky="nsew", pady=(4, 8))
 
@@ -131,71 +154,89 @@ class BoundaryFrame(ttk.Frame):
         self.tree_boundary.column('y', width=98, anchor='center')
         self.tree_boundary.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         self.tree_boundary.bind("<<TreeviewSelect>>", self._on_tree_select)
-        self.tree_boundary.bind("<Delete>", lambda _event: self._delete_selected())
+        self.tree_boundary.bind("<Double-1>", self._edit_vertex)
 
         vsb = ttk.Scrollbar(list_frame, orient="vertical", command=self.tree_boundary.yview)
         self.tree_boundary.configure(yscrollcommand=vsb.set)
         vsb.pack(side=tk.RIGHT, fill=tk.Y)
 
-        # 生成与编辑按钮
+        # 生成、录入与编辑按钮：每行一个框，按钮按文字宽度分配，整行铺满
         btn_frame = ttk.Frame(ctrl_frame)
         btn_frame.grid(row=3, column=0, sticky="ew", pady=4)
-        btn_frame.grid_columnconfigure(tuple(range(6)), weight=1, uniform="boundary_buttons")
 
-        def place(widget, row, column, span):
-            widget.grid(row=row, column=column, columnspan=span, sticky="ew",
-                        padx=(0 if column == 0 else 2, 0 if column + span == 6 else 2), pady=2)
+        def row():
+            frame = ttk.Frame(btn_frame)
+            frame.pack(side=tk.TOP, fill=tk.X, pady=2)
+            return frame
 
-        place(ttk.Button(btn_frame, text="自动生成数据范围边界", command=self._create_auto_boundary), 0, 0, 3)
-        place(ttk.Button(btn_frame, text="导入边界文件", command=self._import_boundary), 0, 3, 3)
+        def buttons(frame, specs):
+            # width=0：按文字宽度，不用主题默认的“至少 11 个字宽”，一行放得下四五个按钮
+            for index, (text, command) in enumerate(specs):
+                ttk.Button(frame, text=text, command=command, width=0).pack(
+                    side=tk.LEFT, fill=tk.X, expand=True, padx=(0 if index == 0 else 2, 0))
 
-        # 沿测点外轮廓生成：最长边留空时按测点疏密自动取值
-        place(ttk.Button(btn_frame, text="沿测点外轮廓生成", command=self._create_outline_boundary), 1, 0, 3)
-        edge_frame = ttk.Frame(btn_frame)
-        place(edge_frame, 1, 3, 3)
-        ttk.Label(edge_frame, text="最长边").pack(side=tk.LEFT)
+        # 生成：数据范围矩形，或沿测点外轮廓（最长边留空时按测点疏密自动取值）
+        generate = row()
+        buttons(generate, [("数据范围矩形", self._create_auto_boundary),
+                           ("沿测点外轮廓", self._create_outline_boundary)])
+        ttk.Label(generate, text="最长边").pack(side=tk.LEFT, padx=(6, 0))
         self.outline_edge_var = tk.StringVar()
-        edge_entry = ttk.Entry(edge_frame, textvariable=self.outline_edge_var, width=6)
-        edge_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=4)
+        edge_entry = ttk.Entry(generate, textvariable=self.outline_edge_var, width=5)
+        edge_entry.pack(side=tk.LEFT, padx=2)
         edge_entry.bind("<Return>", lambda _event: self._create_outline_boundary())
-        ttk.Label(edge_frame, text="m").pack(side=tk.LEFT)
+        ttk.Label(generate, text="m").pack(side=tk.LEFT)
 
         # 按点号连线：现场沿边界测的点，输入点号按顺序连成边界
-        id_frame = ttk.Frame(btn_frame)
-        place(id_frame, 2, 0, 6)
-        ttk.Label(id_frame, text="点号").pack(side=tk.LEFT)
+        by_ids = row()
+        ttk.Label(by_ids, text="点号").pack(side=tk.LEFT)
         self.id_sequence_var = tk.StringVar()
-        id_entry = ttk.Entry(id_frame, textvariable=self.id_sequence_var, width=10)
+        id_entry = ttk.Entry(by_ids, textvariable=self.id_sequence_var, width=10)
         id_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=4)
         id_entry.bind("<Return>", lambda _event: self._connect_by_ids())
-        ttk.Button(id_frame, text="按点号连线", command=self._connect_by_ids).pack(side=tk.LEFT)
+        ttk.Button(by_ids, text="按点号连线", command=self._connect_by_ids, width=0).pack(side=tk.LEFT)
 
-        place(ttk.Button(btn_frame, text="撤销上一步", command=self._undo_last_point), 3, 0, 2)
-        place(ttk.Button(btn_frame, text="删除选中点", command=self._delete_selected), 3, 2, 2)
-        place(ttk.Button(btn_frame, text="清空边界", command=self._clear_boundary), 3, 4, 2)
+        buttons(row(), [("导入边界文件", self._import_boundary), ("粘贴坐标", self._paste_coordinates),
+                        ("导出边界", self._export_boundary)])
+        buttons(row(), [("撤销", self._undo_last_point), ("重做", self._redo_last),
+                        ("理顺顺序", self._untangle), ("删除选中点", self._delete_selected),
+                        ("清空边界", self._clear_boundary)])
 
-        ttk.Separator(btn_frame, orient='horizontal').grid(row=4, column=0, columnspan=6, sticky="ew", pady=8)
+        ttk.Separator(btn_frame, orient='horizontal').pack(side=tk.TOP, fill=tk.X, pady=4)
         ttk.Button(btn_frame, text="确认边界", command=self._confirm_boundary,
-                  style='Accent.TButton').grid(row=5, column=0, columnspan=6, sticky="ew", pady=2)
+                  style='Accent.TButton').pack(side=tk.TOP, fill=tk.X, pady=2)
 
         self.boundary_status_var = tk.StringVar(value="待添加边界点")
-        ttk.Label(ctrl_frame, textvariable=self.boundary_status_var, style="Accent.TLabel").grid(
-            row=5, column=0, sticky="w", pady=(6, 0)
-        )
+        # 状态可能较长（交叉位置、无测点面积），按坐标列表的宽度折行；
+        # 折行宽度是固定值，不随面板变，免得长文字把面板越撑越宽
+        self.status_label = ttk.Label(ctrl_frame, textvariable=self.boundary_status_var, style="Accent.TLabel",
+                                      justify=tk.LEFT, wraplength=STATUS_WRAP_PIXELS)
+        self.status_label.grid(row=5, column=0, sticky="w", pady=(6, 0))
         self._update_boundary_status()
 
         # 信息提示
         info_text = ("操作说明:\n"
                     "1. 现场测了边界点：输入点号（如 5,6,7,12-18 或 B*）连线，\n"
-                    "   或导入边界点文件（Excel/CSV/TXT/CASS .dat，可带点号）\n"
-                    "2. 没有边界点：点“沿测点外轮廓生成”，或在图上逐点单击\n"
-                    "3. 放大后显示测点点号；单击自动吸附到附近测点\n"
-                    "4. 至少 3 个点，系统会自动闭合；确认前检查状态提示\n"
-                    "5. 图纸边界可导入 DXF 多段线（圆弧按圆弧计）")
+                    "   或导入/粘贴边界点坐标（可带点号、表头）\n"
+                    "2. 没有边界点：点“沿测点外轮廓”，或在图上逐点单击\n"
+                    "3. 有 CAD 图：“导入底图”后沿图描，或“选底图线”直接点一条\n"
+                    "4. 连线交叉时标红，可点“理顺顺序”；双击列表可改坐标\n"
+                    "5. 斜线区域不在测点范围内，不计方量；确认前看状态提示")
         self.info_label = ttk.Label(ctrl_frame, text=info_text, justify=tk.LEFT, style="Hint.TLabel")
         self.info_label.grid(row=6, column=0, sticky="w", pady=(10, 0))
         self.ctrl_frame, self.list_frame = ctrl_frame, list_frame
         ctrl_frame.bind("<Configure>", self._adapt_hint)
+
+        # 快捷键：撤销、重做、删除选中点、Esc 取消选线/选中
+        for widget in (self.canvas.get_tk_widget(), self.tree_boundary):
+            for sequence, handler in (
+                (f"<{SHORTCUT_MODIFIER}-z>", self._undo_last_point),
+                (f"<{SHORTCUT_MODIFIER}-Z>", self._redo_last),          # Shift+Z
+                (f"<{SHORTCUT_MODIFIER}-y>", self._redo_last),
+                ("<Delete>", self._delete_selected),
+                ("<BackSpace>", self._delete_selected),
+                ("<Escape>", self._escape),
+            ):
+                widget.bind(sequence, lambda _event, handler=handler: handler() or "break")
 
     # 坐标列表至少保留的高度（表头 + 约 4 行）
     LIST_MIN_HEIGHT = 140
@@ -223,6 +264,9 @@ class BoundaryFrame(ttk.Frame):
         if event.inaxes != self.plotter.ax:
             return
         if event.button == 3:
+            if self._pick_mode:
+                self._set_pick_mode(False)
+                return
             # 右键：点在顶点上删这个顶点，否则删最后一点
             if self.edit_mode and self.boundary:
                 index = self._vertex_at(event)
@@ -237,7 +281,8 @@ class BoundaryFrame(ttk.Frame):
             "view": self.plotter.get_view(),
             "scale": self.plotter.data_per_pixel(),
             # 左键按在顶点上是拖动这个顶点；按在别处（或中键）是平移
-            "vertex": self._vertex_at(event) if event.button == 1 and self.edit_mode else None,
+            "vertex": (self._vertex_at(event)
+                       if event.button == 1 and self.edit_mode and not self._pick_mode else None),
             "dragging": False,
             "preview": None,
         }
@@ -283,7 +328,9 @@ class BoundaryFrame(ttk.Frame):
                     self.notify("这个位置已经有边界点了，顶点没有移动")
                 self._refresh_plot()
             return
-        if press["button"] == 1 and self.edit_mode:
+        if press["button"] == 1 and self._pick_mode:
+            self._pick_backdrop(event)
+        elif press["button"] == 1 and self.edit_mode:
             self._click(event)
 
     def _click(self, event):
@@ -326,6 +373,11 @@ class BoundaryFrame(ttk.Frame):
         """没按键时移动鼠标：显示坐标和附近的测点点号，预览下一点会落在哪。"""
         if event.inaxes != self.plotter.ax or event.xdata is None or event.ydata is None:
             return
+        if self._pick_mode:
+            line = self._backdrop_line_at(event)
+            self.plotter.highlight_backdrop(None if line is None else self._backdrop[line])
+            self.coord_var.set("单击高亮的线作为边界（右键或 Esc 取消）" if line is not None else "把光标移到底图的线上")
+            return
         position, point_index = self._snap(event.xdata, event.ydata)
         self._show_coordinates(position, point_index)
         if not self.edit_mode:
@@ -364,6 +416,13 @@ class BoundaryFrame(ttk.Frame):
         index = int(np.argmin(distances))
         return index if distances[index] <= self._pixels(VERTEX_PICK_PIXELS) else None
 
+    @staticmethod
+    def _segment_distances(starts: np.ndarray, ends: np.ndarray, cursor: np.ndarray) -> np.ndarray:
+        direction = ends - starts
+        length_sq = np.maximum((direction ** 2).sum(axis=1), 1e-12)
+        along = np.clip(((cursor - starts) * direction).sum(axis=1) / length_sq, 0.0, 1.0)
+        return np.hypot(*(starts + direction * along[:, None] - cursor).T)
+
     def _edge_at(self, event) -> Optional[int]:
         """光标下的边的序号 i（连接第 i 点和下一点；最后一条是回到起点的闭合边）。"""
         count = len(self.boundary)
@@ -373,12 +432,7 @@ class BoundaryFrame(ttk.Frame):
         ends = np.roll(starts, -1, axis=0)
         if count == 2:
             starts, ends = starts[:1], ends[:1]   # 两个点之间只有一条边
-        direction = ends - starts
-        length_sq = np.maximum((direction ** 2).sum(axis=1), 1e-12)
-        cursor = np.array([event.x, event.y], dtype=float)
-        along = np.clip(((cursor - starts) * direction).sum(axis=1) / length_sq, 0.0, 1.0)
-        nearest = starts + direction * along[:, None]
-        distances = np.hypot(*(nearest - cursor).T)
+        distances = self._segment_distances(starts, ends, np.array([event.x, event.y], dtype=float))
         index = int(np.argmin(distances))
         return index if distances[index] <= self._pixels(EDGE_PICK_PIXELS) else None
 
@@ -407,22 +461,66 @@ class BoundaryFrame(ttk.Frame):
         return float(self._point_xy[point_index, 0]), float(self._point_xy[point_index, 1])
 
     def _snap(self, x: float, y: float) -> Tuple[XY, Optional[int]]:
-        """按当前缩放把光标位置吸附到附近测点，返回（位置, 吸附到的测点序号）。"""
+        """按当前缩放把光标位置吸附到附近测点或底图顶点，返回（位置, 吸附到的测点序号）。"""
         scale = self.plotter.data_per_pixel()
         threshold = self._pixels(SNAP_PIXELS) * scale if scale > 0 else FALLBACK_SNAP_DISTANCE
         point_index = self._nearest_point(x, y, threshold)
-        if point_index is None or not self.snap_var.get():
+        if not self.snap_var.get():
             return (float(x), float(y)), point_index   # 不吸附时仍返回附近测点，用来显示点号
-        return (float(self._point_xy[point_index, 0]), float(self._point_xy[point_index, 1])), point_index
+        best, best_distance = None, threshold
+        if point_index is not None:
+            best = (float(self._point_xy[point_index, 0]), float(self._point_xy[point_index, 1]))
+            best_distance = math.hypot(best[0] - x, best[1] - y)
+        if self._backdrop_shown() and len(self._backdrop_xy):
+            distances = np.hypot(self._backdrop_xy[:, 0] - x, self._backdrop_xy[:, 1] - y)
+            index = int(np.argmin(distances))
+            if distances[index] < best_distance:
+                return (float(self._backdrop_xy[index, 0]), float(self._backdrop_xy[index, 1])), None
+        if best is None:
+            return (float(x), float(y)), None
+        return best, point_index
 
     # ------------------------------------------------------------------ 显示
 
+    def _backdrop_shown(self) -> bool:
+        return bool(self._backdrop) and self.backdrop_var.get()
+
     def _refresh_plot(self):
+        self._problems = self._find_problems()
+        crossings, duplicates, uncovered = self._problems
         self.plotter.plot_boundary_edit(
-            self.points, self.boundary, self.current_point, view=self._view, selected=self._selected
+            self.points, self.boundary, self.current_point, view=self._view, selected=self._selected,
+            backdrop=self._backdrop if self._backdrop_shown() else None,
+            crossings=crossings, duplicates=duplicates,
+            hull=self._hull if uncovered > 0 else None,
         )
         self._refresh_point_labels()
         self._update_boundary_status()
+
+    def _find_problems(self):
+        """当前边界的问题：交叉的边、重合的点、落在测点范围以外的面积。"""
+        from core.boundary_check import covered_area, duplicate_vertices, find_crossings
+
+        if len(self.boundary) < 3:
+            return [], [], 0.0
+        duplicates = duplicate_vertices(self.boundary)
+        crossings = find_crossings(self.boundary)
+        uncovered = 0.0
+        hull = self._points_hull()
+        if hull and not duplicates and not crossings:
+            area = abs(signed_area(np.asarray(self.boundary, dtype=float)))
+            covered = covered_area(self.boundary, hull)
+            if area > 0 and covered < area * FULL_COVERAGE:
+                uncovered = area - covered
+        return crossings, duplicates, uncovered
+
+    def _points_hull(self) -> Optional[List[XY]]:
+        if not self._hull_ready:
+            from core.boundary_check import convex_hull
+
+            self._hull = convex_hull([(point.x, point.y) for point in self.points]) if self.points else None
+            self._hull_ready = True
+        return self._hull
 
     def _refresh_point_labels(self):
         self._ensure_point_cache()
@@ -436,15 +534,27 @@ class BoundaryFrame(ttk.Frame):
         if not hasattr(self, 'boundary_status_var'):
             return
         count = len(self.boundary)
+        crossings, duplicates, uncovered = self._problems
         if count < 3:
             self.boundary_status_var.set(f"当前 {count} 个点；至少还需 {3 - count} 个点")
-        elif self._boundary_is_valid():
-            area = abs(signed_area(np.asarray(self.boundary, dtype=float)))
-            self.boundary_status_var.set(f"当前 {count} 个点，面积 {area:.1f} m²；边界有效，确认后可计算")
-        elif len(set(self.boundary)) != count:
-            self.boundary_status_var.set("边界无效：有重复的点，请删除")
+        elif duplicates:
+            index = duplicates[0]
+            first = self.boundary.index(self.boundary[index])
+            self.boundary_status_var.set(
+                f"边界无效：第 {index + 1} 点与第 {first + 1} 点重合（图中 ×），请删掉一个")
+        elif crossings:
+            i, j = crossings[0]
+            more = f"等 {len(crossings)} 处" if len(crossings) > 1 else ""
+            self.boundary_status_var.set(
+                f"边界无效：第 {i + 1}→{(i + 1) % count + 1} 点与第 {j + 1}→{(j + 1) % count + 1} 点的连线交叉"
+                f"{more}（图中红线）；可点“理顺顺序”或拖动顶点")
         else:
-            self.boundary_status_var.set("边界无效：连线有交叉，请调整顺序或删点")
+            area = abs(signed_area(np.asarray(self.boundary, dtype=float)))
+            text = f"当前 {count} 个点，面积 {area:.1f} m²；边界有效，确认后可计算"
+            if uncovered > 0:
+                text += (f"\n其中 {uncovered:.1f} m²（{uncovered / area * 100:.1f}%）不在测点范围内"
+                         f"（图中斜线），这部分不计方量")
+            self.boundary_status_var.set(text)
 
     def _boundary_is_valid(self) -> bool:
         if len(self.boundary) < 3:
@@ -490,6 +600,14 @@ class BoundaryFrame(ttk.Frame):
             self._selected = index
             self.plotter.update_boundary_line(self.boundary, index)
 
+    def _escape(self):
+        """Esc：退出选底图线，取消选中和“下一点”预览。"""
+        if self._pick_mode:
+            self._set_pick_mode(False)
+        self.current_point = None
+        self.plotter.update_boundary_preview(self.boundary, None)
+        self._select_vertex(None)
+
     # ------------------------------------------------------------------ 修改边界
 
     def _apply_boundary(self, boundary, fit_view: bool = False, message: Optional[str] = None):
@@ -498,6 +616,7 @@ class BoundaryFrame(ttk.Frame):
         if new_boundary != self.boundary:
             self._history.append(list(self.boundary))
             del self._history[:-HISTORY_LIMIT]
+            self._redo.clear()
         self.boundary = new_boundary
         self.current_point = None
         if self._selected is not None and self._selected >= len(new_boundary):
@@ -509,6 +628,13 @@ class BoundaryFrame(ttk.Frame):
         if message:
             self.notify(message)
 
+    def _restore(self, boundary: List[XY]):
+        self.boundary = boundary
+        self.current_point = None
+        self._selected = None
+        self._refresh_plot()
+        self._update_boundary_list()
+
     def _remove_vertices(self, indices):
         doomed = set(indices)
         self._selected = None
@@ -518,6 +644,7 @@ class BoundaryFrame(ttk.Frame):
         """更新测点（使吸附坐标缓存失效）并重绘。"""
         self.points = points
         self._point_xy = None
+        self._hull_ready = False
         self._view = None
         if self.outline_edge_var.get() == self._auto_edge_text:
             self.outline_edge_var.set("")   # 自动取的“最长边”随测点重算；用户自己填的保留
@@ -532,6 +659,7 @@ class BoundaryFrame(ttk.Frame):
         """对边界每个顶点做同一变换（平移、X/Y 互换）。"""
         self.boundary = [func(x, y) for x, y in self.boundary]
         self._history = [[func(x, y) for x, y in previous] for previous in self._history]
+        self._redo = [[func(x, y) for x, y in previous] for previous in self._redo]
         self.current_point = None
         self._view = None
         self._update_boundary_list()
@@ -606,11 +734,122 @@ class BoundaryFrame(ttk.Frame):
         """撤销上一步修改（加点、移动、删点、导入、生成都算一步）。"""
         if not self._history:
             return
-        self.boundary = self._history.pop()
-        self.current_point = None
+        self._redo.append(list(self.boundary))
+        self._restore(self._history.pop())
+
+    def _redo_last(self):
+        """重做刚撤销的那一步。"""
+        if not self._redo:
+            return
+        self._history.append(list(self.boundary))
+        self._restore(self._redo.pop())
+
+    def _untangle(self):
+        """连线交叉时调整连线顺序（点不增不减），直到没有交叉。"""
+        from core.boundary_check import untangle
+
+        if len(self.boundary) < 4 or not self._problems[0]:
+            self.notify("连线没有交叉，不需要理顺")
+            return
+        try:
+            ordered = untangle(self.boundary)
+        except ValueError as error:
+            messagebox.showwarning("理顺顺序", str(error))
+            return
         self._selected = None
-        self._refresh_plot()
-        self._update_boundary_list()
+        self._apply_boundary(ordered, message="已理顺连线顺序（点没有增减）；不满意可以撤销")
+
+    def _edit_vertex(self, event=None):
+        """双击列表的一行：输入新坐标“X, Y”，或输入一个测点点号改用它的坐标。"""
+        from utils.boundary_io import find_point
+
+        if event is not None:
+            row = self.tree_boundary.identify_row(event.y)   # 双击在表头或空白处：不改
+        else:
+            selection = self.tree_boundary.selection()
+            row = selection[0] if selection else ""
+        if not row:
+            return
+        index = int(row)
+        x, y = self.boundary[index]
+        answer = simpledialog.askstring(
+            "修改边界点", f"第 {index + 1} 点的新坐标（X, Y），或填一个测点点号：",
+            initialvalue=f"{x:.3f}, {y:.3f}", parent=self,
+        )
+        if answer is None or not answer.strip():
+            return
+        numbers = [part for part in answer.replace("，", ",").replace(",", " ").split() if part]
+        try:
+            if len(numbers) == 2:
+                position = (float(numbers[0]), float(numbers[1]))
+                if not all(math.isfinite(value) for value in position):
+                    raise ValueError
+            else:
+                point = find_point(answer, self.points)
+                if point is None:
+                    raise ValueError
+                position = (float(point.x), float(point.y))
+        except ValueError:
+            messagebox.showwarning("修改边界点", f"没看懂“{answer}”：请填“X, Y”两个数，或一个测点点号")
+            return
+        if position in self.boundary and self.boundary.index(position) != index:
+            messagebox.showwarning("修改边界点", "这个位置已经有边界点了")
+            return
+        boundary = list(self.boundary)
+        boundary[index] = position
+        self._selected = index
+        self._apply_boundary(boundary)
+
+    def _paste_coordinates(self):
+        """把剪贴板里的坐标（如从 Excel 复制的点号、X、Y 几列）作为边界。"""
+        from utils.boundary_io import read_boundary_text
+
+        try:
+            text = self.clipboard_get()
+        except tk.TclError:
+            text = ""
+        if not text.strip():
+            messagebox.showwarning("粘贴坐标", "剪贴板里没有文字。\n先在 Excel 等处选中点号、X、Y 几列复制，再点“粘贴坐标”。")
+            return
+        try:
+            result = read_boundary_text(text)
+        except ValueError as error:
+            messagebox.showwarning("粘贴坐标", str(error))
+            return
+        self._selected = None
+        self._apply_boundary(
+            result.points, fit_view=True,
+            message=f"已粘贴边界点 {len(result.points)} 个（按 {result.layout} 读取），检查无误后点“确认边界”",
+        )
+        self._warn_skipped(result.skipped)
+
+    def _export_boundary(self):
+        """当前边界导出成 CSV 坐标表或 DXF，下次可用“导入边界文件”读回。"""
+        if len(self.boundary) < 3:
+            messagebox.showwarning("导出边界", "边界至少需要 3 个点")
+            return
+        filepath = filedialog.asksaveasfilename(
+            title="导出边界", defaultextension=".csv", initialfile="计算边界",
+            filetypes=[("CSV 坐标表", "*.csv"), ("DXF图形", "*.dxf")],
+        )
+        if not filepath:
+            return
+        try:
+            if filepath.lower().endswith(".dxf"):
+                from utils.data_handler import DataExporter
+                DataExporter().export_boundary_only_dxf(self.boundary, filepath, self.points)
+            else:
+                from utils.boundary_io import write_boundary_csv
+                write_boundary_csv(filepath, self.boundary, self.points)
+        except OSError as error:
+            messagebox.showerror("导出边界", f"导出失败: {error}")
+            return
+        self.notify(f"边界已导出：{filepath}")
+
+    def _warn_skipped(self, skipped: List[str]):
+        if skipped:
+            shown = "\n".join(skipped[:10]) + (f"\n……共 {len(skipped)} 行" if len(skipped) > 10 else "")
+            messagebox.showwarning("部分行未导入", f"以下行没有读出坐标，已跳过：\n{shown}")
 
     def _import_boundary(self):
         filepath = filedialog.askopenfilename(
@@ -627,11 +866,13 @@ class BoundaryFrame(ttk.Frame):
             return
 
         skipped: List[str] = []
+        backdrop = []
         try:
             if filepath.lower().endswith(".dxf"):
-                from utils.dxf_io import read_boundary_from_dxf
+                from utils.dxf_io import read_boundary_from_dxf, read_dxf_backdrop
                 boundary, arc_count = read_boundary_from_dxf(filepath)
                 detail = f"（含 {arc_count} 段圆弧，已按圆弧折线化）" if arc_count else ""
+                backdrop = read_dxf_backdrop(filepath)
             else:
                 from utils.boundary_io import read_boundary_points
                 result = read_boundary_points(filepath)
@@ -643,14 +884,112 @@ class BoundaryFrame(ttk.Frame):
         except Exception as error:
             messagebox.showerror("错误", f"导入失败: {error}")
             return
+        message = f"已导入边界点 {len(boundary)} 个{detail}，检查无误后点“确认边界”"
+        if len(backdrop) > 1:
+            # 图里不止一条线：整张图作为底图，自动选的不对可以点选别的
+            self._set_backdrop(backdrop)
+            message = (f"DXF 里有 {len(backdrop)} 条线，已自动选了一条作边界{detail}；"
+                       f"不对的话点“选底图线”，在图上点要用的那条")
         self._selected = None
-        self._apply_boundary(
-            boundary, fit_view=True,
-            message=f"已导入边界点 {len(boundary)} 个{detail}，检查无误后点“确认边界”",
-        )
-        if skipped:
-            shown = "\n".join(skipped[:10]) + (f"\n……共 {len(skipped)} 行" if len(skipped) > 10 else "")
-            messagebox.showwarning("部分行未导入", f"以下行没有读出坐标，已跳过：\n{shown}")
+        self._apply_boundary(boundary, fit_view=True, message=message)
+        self._warn_skipped(skipped)
+
+    # ------------------------------------------------------------------ CAD 底图
+
+    def _import_backdrop(self):
+        filepath = filedialog.askopenfilename(title="导入底图（DXF）", filetypes=[("DXF图形", "*.dxf"), ("所有文件", "*.*")])
+        if not filepath:
+            return
+        from utils.dxf_io import read_dxf_backdrop
+
+        try:
+            backdrop = read_dxf_backdrop(filepath)
+        except Exception as error:
+            messagebox.showerror("导入底图", f"读取失败: {error}")
+            return
+        if not backdrop:
+            messagebox.showwarning(
+                "导入底图", "DXF 里没有找到直线或多段线。\n如果图形在图块里，请先在 CAD 里把图块炸开（EXPLODE）再存一份。")
+            return
+        self._set_backdrop(backdrop)
+        self._refresh_plot()
+        message = f"已载入底图：{len(backdrop)} 条线。可沿图单击描边界（会吸附到图上的顶点），或点“选底图线”直接选一条"
+        if self.points and not self._backdrop_overlaps_points():
+            messagebox.showwarning(
+                "底图与测点不重叠",
+                "底图和测点的范围完全不重叠，可能是坐标系不同，或测点的 X/Y 与图纸方向相反"
+                "（可在数据导入页点“X/Y 互换”）。")
+        self.notify(message)
+
+    def _set_backdrop(self, polylines):
+        """载入底图：记下每条线的点列、所有顶点和线段，供显示、吸附和点选。"""
+        lines, layers = [], []
+        for item in polylines:
+            points = np.asarray(item.points, dtype=float).reshape(-1, 2)
+            if item.closed and len(points) >= 3 and not np.array_equal(points[0], points[-1]):
+                points = np.vstack([points, points[:1]])
+            if len(points) >= 2:
+                lines.append(points)
+                layers.append(item.layer)
+        self._backdrop, self._backdrop_layers = lines, layers
+        self._backdrop_xy = np.unique(np.vstack(lines), axis=0) if lines else np.empty((0, 2), dtype=float)
+        if lines:
+            self._backdrop_segments = np.concatenate([np.stack([line[:-1], line[1:]], axis=1) for line in lines])
+            self._backdrop_owner = np.concatenate([np.full(len(line) - 1, index) for index, line in enumerate(lines)])
+        else:
+            self._backdrop_segments = np.empty((0, 2, 2), dtype=float)
+            self._backdrop_owner = np.empty(0, dtype=int)
+        self.backdrop_var.set(True)
+        self.backdrop_check.configure(state="normal" if lines else "disabled")
+
+    def _backdrop_overlaps_points(self) -> bool:
+        low, high = self._backdrop_xy.min(axis=0), self._backdrop_xy.max(axis=0)
+        self._ensure_point_cache()
+        plow, phigh = self._point_xy.min(axis=0), self._point_xy.max(axis=0)
+        return bool(np.all(low <= phigh) and np.all(plow <= high))
+
+    def _toggle_pick_mode(self):
+        self._set_pick_mode(not self._pick_mode)
+
+    def _set_pick_mode(self, active: bool):
+        if active and not self._backdrop:
+            messagebox.showwarning("选底图线", "还没有底图。先点“导入底图”选一个 DXF 文件。")
+            return
+        if active and not self.backdrop_var.get():
+            self.backdrop_var.set(True)
+            self._refresh_plot()
+        self._pick_mode = active
+        self.pick_button.configure(text="取消选线" if active else "选底图线")
+        self.plotter.highlight_backdrop(None)
+        if active:
+            self.current_point = None
+            self.plotter.update_boundary_preview(self.boundary, None)
+            self.notify("选底图线：把光标移到要用的线上（会高亮），单击选用；右键或 Esc 取消")
+
+    def _backdrop_line_at(self, event) -> Optional[int]:
+        """光标下的底图线的序号。"""
+        if not len(self._backdrop_segments):
+            return None
+        transform = self.plotter.ax.transData.transform
+        starts = transform(self._backdrop_segments[:, 0])
+        ends = transform(self._backdrop_segments[:, 1])
+        distances = self._segment_distances(starts, ends, np.array([event.x, event.y], dtype=float))
+        index = int(np.argmin(distances))
+        return int(self._backdrop_owner[index]) if distances[index] <= self._pixels(BACKDROP_PICK_PIXELS) else None
+
+    def _pick_backdrop(self, event):
+        line = self._backdrop_line_at(event)
+        if line is None:
+            return
+        points = [(float(x), float(y)) for x, y in self._backdrop[line]]
+        if len(points) >= 2 and points[0] == points[-1]:
+            points = points[:-1]
+        if len(points) < 3:
+            messagebox.showwarning("选底图线", f"这条线只有 {len(points)} 个点，围不成边界；请选闭合的多段线，或沿图单击描出边界")
+            return
+        self._set_pick_mode(False)
+        self._selected = None
+        self._apply_boundary(points, message=f"已选用底图图层“{self._backdrop_layers[line]}”上的一条线作边界，共 {len(points)} 个点")
 
     def _clear_boundary(self):
         self._selected = None
@@ -665,7 +1004,7 @@ class BoundaryFrame(ttk.Frame):
 
     def _confirm_boundary(self):
         if not self._boundary_is_valid():
-            messagebox.showwarning("提示", "边界至少需要 3 个不重复点，且边线不能交叉。可使用“撤销上一步”修正。")
+            messagebox.showwarning("提示", "边界至少需要 3 个不重复点，且边线不能交叉。可使用“撤销”或“理顺顺序”修正。")
             return
         if not self._overlaps_points() and not messagebox.askokcancel(
             "边界与测点不重叠",
@@ -681,6 +1020,7 @@ class BoundaryFrame(ttk.Frame):
         """外部设置边界"""
         self.boundary = list(boundary)
         self._history = []
+        self._redo = []
         self._selected = None
         self._view = None
         self._refresh_plot()

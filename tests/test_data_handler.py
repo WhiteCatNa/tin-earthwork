@@ -221,7 +221,7 @@ def test_exports_are_created_and_readable(tmp_path):
     assert exporter.export_summary_excel(result, excel_path, points)
     assert exporter.export_triangles_csv(result, csv_path)
     workbook = openpyxl.load_workbook(excel_path)
-    assert workbook.sheetnames == ["土方量汇总表", "三角形计算明细", "异常数据检查"]
+    assert workbook.sheetnames == ["土方量汇总表", "三角形计算明细", "异常数据检查"]   # 没设边界：没有“计算边界”表
     assert workbook["土方量汇总表"]["A1"].value == "测试项目"
     assert not pd.read_csv(csv_path, encoding="utf-8-sig").empty
     assert "总挖方量" in exporter.generate_report_text(result, len(points))

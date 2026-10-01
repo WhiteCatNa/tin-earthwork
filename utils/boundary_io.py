@@ -65,6 +65,16 @@ def _split_fields(line: str) -> List[str]:
     return line.split()
 
 
+def _rows_from_text(text: str) -> List[List[object]]:
+    rows = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith(("#", "*", "//")) or line.upper() in {"BEGIN", "END"}:
+            continue
+        rows.append(_split_fields(line))
+    return rows
+
+
 def _read_rows(filepath: str) -> List[List[object]]:
     """把文件读成一行行的单元格，不假定有表头。"""
     suffix = Path(filepath).suffix.lower()
@@ -72,12 +82,7 @@ def _read_rows(filepath: str) -> List[List[object]]:
         frame = pd.read_excel(filepath, header=None, dtype=object)
         rows = [[None if pd.isna(cell) else cell for cell in row] for row in frame.itertuples(index=False)]
     else:
-        rows = []
-        for raw in read_text_with_encodings(filepath).splitlines():
-            line = raw.strip()
-            if not line or line.startswith(("#", "*", "//")) or line.upper() in {"BEGIN", "END"}:
-                continue
-            rows.append(_split_fields(line))
+        rows = _rows_from_text(read_text_with_encodings(filepath))
     return [row for row in rows if any(_text(cell) for cell in row)]
 
 
@@ -153,13 +158,21 @@ def read_boundary_points(filepath: str) -> BoundaryPoints:
     带表头时按列名认 X、Y（规则与测点导入相同）；没有表头时按内容判断是
     “点号、X、Y(、高程)”还是“X、Y(、高程)”。CASS .dat 的东坐标作 X、北坐标作 Y，也与测点导入一致。
     """
-    rows = _read_rows(filepath)
+    return _boundary_from_rows(_read_rows(filepath), is_dat=Path(filepath).suffix.lower() == ".dat")
+
+
+def read_boundary_text(text: str) -> BoundaryPoints:
+    """从粘贴的文字（如从 Excel、微信里复制的几列坐标）读边界点，规则同 read_boundary_points()。"""
+    rows = [row for row in _rows_from_text(text) if any(_text(cell) for cell in row)]
+    return _boundary_from_rows(rows, is_dat=False)
+
+
+def _boundary_from_rows(rows: List[List[object]], is_dat: bool) -> BoundaryPoints:
     first_data = next((index for index, row in enumerate(rows) if _numeric_count(row) >= 2), None)
     if first_data is None:
-        raise ValueError("文件里没有找到坐标数据（每行至少要有 X、Y 两个数字）")
+        raise ValueError("没有找到坐标数据（每行至少要有 X、Y 两个数字）")
     header = rows[first_data - 1] if first_data > 0 else None
     data = rows[first_data:]
-    is_dat = Path(filepath).suffix.lower() == ".dat"
 
     columns = _columns_from_header(header) if header is not None else None
     result = BoundaryPoints()
@@ -312,3 +325,39 @@ def parse_point_sequence(text: str, points: Sequence[SurveyPoint]) -> List[Surve
     if len(ordered) < 3:
         raise ValueError(f"只有 {len(ordered)} 个点，边界至少需要 3 个点")
     return ordered
+
+
+def find_point(token: str, points: Sequence[SurveyPoint]) -> Optional[SurveyPoint]:
+    """按点号找一个测点（大小写、Excel 带出的“.0”不敏感）；没有返回 None，重复时报错。"""
+    return _PointIndex(points).find(token.strip())
+
+
+def vertex_ids(ring: Sequence[XY], points: Sequence[SurveyPoint]) -> List[str]:
+    """边界各顶点对应的测点点号（坐标完全相同才算），不是测点的为空串。"""
+    by_xy: Dict[XY, str] = {}
+    for point in points:
+        by_xy.setdefault((float(point.x), float(point.y)), str(point.id))
+    return [by_xy.get((float(x), float(y)), "") for x, y in ring]
+
+
+BOUNDARY_TABLE_HEADERS = ["序号", "点号", "X", "Y", "至下一点边长(m)"]
+
+
+def boundary_table(ring: Sequence[XY], points: Sequence[SurveyPoint] = ()) -> List[List[object]]:
+    """边界坐标表：序号、对应测点点号、X、Y、到下一点的边长（最后一行是回到起点的闭合边）。"""
+    from core.boundary_check import edge_lengths
+
+    ids = vertex_ids(ring, points)
+    lengths = edge_lengths(ring)
+    return [
+        [index, ids[index - 1], round(float(x), 4), round(float(y), 4), round(lengths[index - 1], 3)]
+        for index, (x, y) in enumerate(ring, 1)
+    ]
+
+
+def write_boundary_csv(filepath: str, ring: Sequence[XY], points: Sequence[SurveyPoint] = ()) -> None:
+    """边界导出成 CSV（带表头，Excel 直接打开不乱码）；本程序“导入边界文件”可原样读回。"""
+    lines = [",".join(BOUNDARY_TABLE_HEADERS)]
+    for number, point_id, x, y, length in boundary_table(ring, points):
+        lines.append(f"{number},{point_id},{x!r},{y!r},{length!r}")
+    Path(filepath).write_text("\n".join(lines) + "\n", encoding="utf-8-sig")

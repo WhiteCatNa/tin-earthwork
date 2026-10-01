@@ -7,10 +7,12 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolb
 from matplotlib.figure import Figure
 from matplotlib.lines import Line2D
 from matplotlib.patches import Polygon, Patch
+from matplotlib.path import Path
 from matplotlib.collections import PolyCollection, LineCollection
 import numpy as np
 from typing import List, Tuple, Optional
 from core.calculator import SurveyPoint, Triangle, CalculationResult, extract_zero_contour_segments
+from core.geometry import signed_area
 from gui.theme import COLORS, PLOT_COLORS
 
 # 设置中文字体
@@ -66,6 +68,7 @@ class EarthworkPlotter:
         self._boundary_preview_artists = None
         self._boundary_artists = None      # 边界线、闭合线、起点、选中标记、顶点序号
         self._point_label_artists: list = []
+        self._backdrop_highlight = None
         self._colorbar = None
         self._connection_ids = []
         self._current_result = None
@@ -337,8 +340,18 @@ class EarthworkPlotter:
                            boundary: List[Tuple[float, float]],
                            current_point: Optional[Tuple[float, float]] = None,
                            view: Optional[Tuple[Tuple[float, float], Tuple[float, float]]] = None,
-                           selected: Optional[int] = None):
-        """边界编辑模式绘制。view 为 (xlim, ylim) 时保持这个视野，否则显示全图。"""
+                           selected: Optional[int] = None,
+                           backdrop=None,
+                           crossings=(),
+                           duplicates=(),
+                           hull=None):
+        """边界编辑模式绘制。
+
+        view：(xlim, ylim) 时保持这个视野，否则显示测点和边界的全图。
+        backdrop：CAD 底图的线（每条是点列），画在最底层，不参与“全图”的范围。
+        crossings / duplicates：交叉的边、重合的顶点，标红提示。
+        hull：测点覆盖范围（凸包）；给出时画虚线，并把边界伸出覆盖范围的部分打斜线。
+        """
         self._remove_colorbar()
         self.ax.clear()
         self._style_axes()
@@ -346,6 +359,13 @@ class EarthworkPlotter:
         self._boundary_preview_artists = None
         self._boundary_artists = None
         self._point_label_artists = []
+        self._backdrop_highlight = None
+        if backdrop:
+            lines = LineCollection([np.asarray(line, dtype=float) for line in backdrop],
+                                   colors=COLORS["dim"], linewidths=0.9, alpha=0.55, zorder=0.5)
+            self.ax.add_collection(lines, autolim=False)
+            self._backdrop_highlight, = self.ax.plot([], [], color=self.colors['selected'], linewidth=3,
+                                                     alpha=0.8, zorder=5)
         if points:
             xs = [p.x for p in points]
             ys = [p.y for p in points]
@@ -399,6 +419,7 @@ class EarthworkPlotter:
                 ]
             self._boundary_artists = (line, closing, start, chosen, numbers)
             self.update_boundary_line(boundary, selected, redraw=False)
+            self._draw_boundary_problems(boundary, crossings, duplicates, hull)
 
         # 当前正在添加的点由可复用 artist 绘制，避免鼠标移动时不断创建新对象。
 
@@ -416,6 +437,50 @@ class EarthworkPlotter:
             self.ax.set_ylim(view[1])
         if current_point:
             self.update_boundary_preview(boundary, current_point)
+        if self.canvas:
+            self.canvas.draw_idle()
+
+    def _draw_boundary_problems(self, boundary, crossings, duplicates, hull):
+        """交叉的边、重合的点标红；边界伸出测点覆盖范围的部分打斜线。"""
+        count = len(boundary)
+        if crossings:
+            segments = []
+            for i, j in crossings:
+                segments += [[boundary[i], boundary[(i + 1) % count]], [boundary[j], boundary[(j + 1) % count]]]
+            self.ax.add_collection(LineCollection(segments, colors=self.colors['cut'], linewidths=3.5, zorder=4,
+                                                  label='交叉的连线'))
+        if duplicates:
+            self.ax.plot([boundary[i][0] for i in duplicates], [boundary[i][1] for i in duplicates],
+                         linestyle='None', marker='x', markersize=13, markeredgewidth=2.5,
+                         color=self.colors['cut'], zorder=6, label='重合的点')
+        if hull and count >= 3:
+            ring = np.asarray(hull + hull[:1], dtype=float)
+            self.ax.plot(ring[:, 0], ring[:, 1], color=COLORS["dim"], linestyle='--', linewidth=1.2,
+                         zorder=2, label='测点覆盖范围')
+            # 裁剪路径 = 大矩形挖去覆盖范围（反向的环是洞），斜线只画在覆盖范围以外
+            both = np.vstack([np.asarray(boundary, dtype=float), ring])
+            (x0, y0), (x1, y1) = both.min(axis=0), both.max(axis=0)
+            pad = max(x1 - x0, y1 - y0) + 1.0
+            outer = [(x0 - pad, y0 - pad), (x1 + pad, y0 - pad), (x1 + pad, y1 + pad), (x0 - pad, y1 + pad), (0, 0)]
+            hole = [tuple(point) for point in ring[::-1]]
+            if signed_area(np.asarray(hull, dtype=float)) < 0:
+                hole = [tuple(point) for point in ring]
+            codes = [Path.MOVETO] + [Path.LINETO] * 3 + [Path.CLOSEPOLY] \
+                + [Path.MOVETO] + [Path.LINETO] * (len(hole) - 2) + [Path.CLOSEPOLY]
+            outside = Polygon(boundary, closed=True, facecolor='none', edgecolor=self.colors['cut'],
+                              hatch='////', linewidth=0, alpha=0.7, zorder=1.5, label='无测点区域（不计方量）')
+            self.ax.add_patch(outside)
+            outside.set_clip_path(Path(outer + hole, codes), transform=self.ax.transData)
+
+    def highlight_backdrop(self, line):
+        """选底图线时，把光标下的那条线高亮。"""
+        if self._backdrop_highlight is None:
+            return
+        if line is None:
+            self._backdrop_highlight.set_data([], [])
+        else:
+            data = np.asarray(line, dtype=float)
+            self._backdrop_highlight.set_data(data[:, 0], data[:, 1])
         if self.canvas:
             self.canvas.draw_idle()
 

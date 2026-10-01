@@ -6,7 +6,7 @@ import json
 import math
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import openpyxl
@@ -609,6 +609,9 @@ class DataExporter:
         for row in self.summary_rows(result):
             ws1.append(row)
 
+        if result.boundary_points:
+            self._write_boundary_sheet(wb.create_sheet("计算边界"), result, points or [], header, bold)
+
         ws2 = wb.create_sheet("三角形计算明细")
         ws2.freeze_panes = "B2"
         detail_headers = self.detail_headers(result)
@@ -662,14 +665,34 @@ class DataExporter:
         Path(filepath).write_bytes(buffer.getvalue())
         return True
 
+    @staticmethod
+    def _write_boundary_sheet(ws, result: CalculationResult, points: List[SurveyPoint], header, bold) -> None:
+        """计算边界坐标表：顶点坐标、对应测点点号、边长，末尾写周长和面积。"""
+        from core.boundary_check import edge_lengths
+        from utils.boundary_io import BOUNDARY_TABLE_HEADERS, boundary_table
+
+        ring = result.boundary_points
+        for column, width in zip("ABCDE", (8, 14, 18, 18, 18)):
+            ws.column_dimensions[column].width = width
+        ws.append([bold(ws, "计算边界坐标表", 12)])
+        ws.append([f"共 {len(ring)} 个顶点，按连线顺序排列；“点号”为与该顶点重合的测点，空白表示不是测点"])
+        ws.append([])
+        header(ws, BOUNDARY_TABLE_HEADERS)
+        for row in boundary_table(ring, points):
+            ws.append(row)
+        ws.append([])
+        ws.append(["周长", "", "", "", round(sum(edge_lengths(ring)), 3)])
+        ws.append(["面积", "", "", "", round(result.boundary_area, 3)])
+
     def export_triangles_csv(self, result: CalculationResult, filepath: str) -> bool:
         """导出三角形明细CSV"""
         df = pd.DataFrame(list(self._detail_rows(result)), columns=self.detail_headers(result))
         df.to_csv(filepath, index=False, encoding='utf-8-sig')
         return True
 
-    def export_boundary_dxf(self, result: CalculationResult, filepath: str) -> bool:
-        """导出计算边界（闭合多段线）和零填挖线到 DXF。
+    def export_boundary_dxf(self, result: CalculationResult, filepath: str,
+                            points: Optional[List[SurveyPoint]] = None) -> bool:
+        """导出计算边界（闭合多段线，顶点标点号）和零填挖线到 DXF。
 
         采用 R12 格式的 POLYLINE，AutoCAD、CASS 等都能直接打开。
         """
@@ -677,6 +700,7 @@ class DataExporter:
                  "0\nSECTION\n2\nENTITIES\n"]
         if result.boundary_points:
             parts.append(self._dxf_polyline("BOUNDARY", result.boundary_points, closed=True))
+            parts.extend(self._dxf_boundary_labels(result.boundary_points, points or []))
         for polyline in chain_segments(extract_zero_contour_segments(result)):
             if len(polyline) >= 2:
                 parts.append(self._dxf_polyline("ZERO_CONTOUR", polyline, closed=False))
@@ -686,6 +710,40 @@ class DataExporter:
         with open(filepath, "w", encoding="utf-8") as handle:
             handle.write("".join(parts))
         return True
+
+    def export_boundary_only_dxf(self, ring: Sequence[Tuple[float, float]], filepath: str,
+                                 points: Optional[List[SurveyPoint]] = None) -> bool:
+        """只导出计算边界（边界页“导出边界”用），本程序“导入边界文件”可原样读回。"""
+        parts = ["0\nSECTION\n2\nHEADER\n9\n$ACADVER\n1\nAC1009\n0\nENDSEC\n",
+                 "0\nSECTION\n2\nENTITIES\n",
+                 self._dxf_polyline("BOUNDARY", ring, closed=True)]
+        parts.extend(self._dxf_boundary_labels(ring, points or []))
+        parts.append("0\nENDSEC\n0\nEOF\n")
+        with open(filepath, "w", encoding="utf-8") as handle:
+            handle.write("".join(parts))
+        return True
+
+    # 顶点多于这个数（如圆弧折线化后的边界）时不标注，免得图上糊成一片
+    BOUNDARY_LABEL_LIMIT = 500
+
+    @classmethod
+    def _dxf_boundary_labels(cls, ring, points: List[SurveyPoint]) -> List[str]:
+        """BOUNDARY_POINT 图层：每个边界顶点标对应的测点点号，不是测点的标序号。
+
+        R12 的文字按图纸代码页解释，含中文的点号改标序号，避免乱码。
+        """
+        if not ring or len(ring) > cls.BOUNDARY_LABEL_LIMIT:
+            return []
+        from utils.boundary_io import vertex_ids
+
+        xs = [float(x) for x, _ in ring]
+        ys = [float(y) for _, y in ring]
+        size = max(max(xs) - min(xs), max(ys) - min(ys)) * 0.012 or 0.5
+        labels = []
+        for index, ((x, y), point_id) in enumerate(zip(ring, vertex_ids(ring, points)), 1):
+            text = point_id if point_id and point_id.isascii() else str(index)
+            labels.append(cls._dxf_text("BOUNDARY_POINT", float(x) + size * 0.4, float(y) + size * 0.4, size, text))
+        return labels
 
     @staticmethod
     def _dxf_polyline(layer: str, points, closed: bool) -> str:
@@ -843,9 +901,54 @@ class DataExporter:
             )
             pdf.savefig(summary)
 
+            for page in self._boundary_pages(boundary or result.boundary_points, points, result):
+                pdf.savefig(page)
+
             figure = create_standalone_figure(result, points, boundary, self.project_name)
             pdf.savefig(figure)
         return True
+
+    # 计算书里的边界坐标表：每页行数、最多列出的顶点数（更多时指向 Excel 报告）
+    PDF_BOUNDARY_ROWS_PER_PAGE = 40
+    PDF_BOUNDARY_ROW_LIMIT = 120
+
+    def _boundary_pages(self, ring, points: List[SurveyPoint], result: CalculationResult):
+        """计算书的“计算边界坐标表”页。"""
+        from matplotlib.figure import Figure
+        from core.boundary_check import edge_lengths
+        from utils.boundary_io import BOUNDARY_TABLE_HEADERS, boundary_table
+
+        if not ring:
+            return []
+        summary = (f"共 {len(ring)} 个顶点，周长 {sum(edge_lengths(ring)):.3f} m，"
+                   f"面积 {abs(result.boundary_area):.3f} m²")
+        rows = boundary_table(ring, points)
+        if len(rows) > self.PDF_BOUNDARY_ROW_LIMIT:
+            page = Figure(figsize=(8.27, 11.69))
+            axis = page.add_subplot(111)
+            axis.axis("off")
+            axis.text(0.06, 0.97, f"计算边界坐标表\n\n{summary}\n顶点较多（多为圆弧折线化），"
+                      f"坐标见 Excel 报告的“计算边界”表。", va="top", ha="left", fontsize=10,
+                      transform=axis.transAxes)
+            return [page]
+        pages = []
+        per_page = self.PDF_BOUNDARY_ROWS_PER_PAGE
+        for start in range(0, len(rows), per_page):
+            page = Figure(figsize=(8.27, 11.69))
+            axis = page.add_subplot(111)
+            axis.axis("off")
+            title = "计算边界坐标表" + (f"（续 {start // per_page + 1}）" if start else "")
+            axis.set_title(f"{self.project_name}  {title}\n{summary}", fontsize=10, loc="left")
+            chunk = rows[start:start + per_page]
+            cells = [[str(n), point_id or "", f"{x:.3f}", f"{y:.3f}", f"{length:.3f}"]
+                     for n, point_id, x, y, length in chunk]
+            table = axis.table(cellText=cells, colLabels=BOUNDARY_TABLE_HEADERS, loc="upper center",
+                               colWidths=[0.08, 0.16, 0.24, 0.24, 0.2], cellLoc="center")
+            table.auto_set_font_size(False)
+            table.set_fontsize(8)
+            table.scale(1, 1.25)
+            pages.append(page)
+        return pages
 
 
 PROJECT_FORMAT_VERSION = 2
