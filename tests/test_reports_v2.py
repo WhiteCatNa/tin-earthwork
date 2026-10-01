@@ -61,7 +61,8 @@ def test_grid_check_in_summary_excel_text_and_dxf(tmp_path):
     dxf = tmp_path / "grid.dxf"
     exporter.export_boundary_dxf(result, dxf)
     content = dxf.read_text(encoding="utf-8")
-    assert content.count("\nTEXT\n") == 25 * 2 + 16
+    assert content.count("\nTEXT\n8\nGRID_") == 25 * 2 + 16
+    assert content.count("\nTEXT\n8\nBOUNDARY_POINT\n") == len(result.boundary_points)
     for layer in ("GRID", "GRID_HEIGHT", "GRID_ELEV", "GRID_VOLUME"):
         assert f"\n8\n{layer}\n" in content
     # 方格线不会被当成计算边界读回

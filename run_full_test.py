@@ -99,7 +99,7 @@ def run_full_pipeline(output_dir="."):
     _require(report_path.is_file() and report_path.stat().st_size > 0, "Excel 报告为空")
     _require(csv_path.is_file() and csv_path.stat().st_size > 0, "CSV 明细为空")
     _require(txt_path.is_file() and txt_path.stat().st_size > 0, "文本报告为空")
-    _require(load_workbook(report_path).sheetnames == ["土方量汇总表", "三角形计算明细", "异常数据检查"], "Excel 工作表不完整")
+    _require(load_workbook(report_path).sheetnames == ["土方量汇总表", "计算边界", "三角形计算明细", "异常数据检查"], "Excel 工作表不完整")
     _require(not pd.read_csv(csv_path, encoding="utf-8-sig").empty, "CSV 明细没有数据")
     print(f"[5/9] Excel/CSV/文本报告导出通过")
 

@@ -1005,11 +1005,11 @@ class CalculationFrame(ttk.Frame):
         if not filepath:
             return
         exporter = DataExporter(self._project_name())
-        result = self.result
+        result, points = self.result, list(self.points)
         self._run_export(
             "导出 DXF",
-            lambda: exporter.export_boundary_dxf(result, filepath),
-            "DXF 已导出（BOUNDARY 边界 / ZERO_CONTOUR 零填挖线）",
+            lambda: exporter.export_boundary_dxf(result, filepath, points),
+            "DXF 已导出（BOUNDARY 边界 / BOUNDARY_POINT 边界点号 / ZERO_CONTOUR 零填挖线）",
         )
 
     def _export_pdf(self):
@@ -1021,7 +1021,7 @@ class CalculationFrame(ttk.Frame):
         self._run_export(
             "导出 PDF 计算书",
             lambda: exporter.export_pdf_report(result, len(points), points, result.boundary_points, filepath),
-            "PDF 计算书已导出（汇总页 + 成果图）",
+            "PDF 计算书已导出（汇总页 + 边界坐标表 + 成果图）",
         )
 
     def _export_image(self):
