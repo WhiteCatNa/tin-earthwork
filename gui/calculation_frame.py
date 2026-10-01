@@ -340,7 +340,10 @@ class CalculationFrame(ttk.Frame):
         self.plotter = EarthworkPlotter(figsize=(10, 7))
         self.canvas = FigureCanvasTkAgg(self.plotter.fig, master=self.plot_frame)
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
-        self.plotter.bind_canvas(self.canvas)
+        self.plotter.bind_canvas(self.canvas, enable_navigation=True)
+        # 图上滚轮缩放、拖动平移、双击复位；显示开关一栏在小屏已排满，复位按钮浮在图的左下角
+        ttk.Button(self.canvas.get_tk_widget(), text="重置视图", command=self._reset_plot_view).place(
+            relx=0, rely=1, x=6, y=-6, anchor=tk.SW)
         self.plotter.on_triangle_click = self._on_triangle_selected
         
         # 选项卡2：汇总表
@@ -665,7 +668,10 @@ class CalculationFrame(ttk.Frame):
             )
         else:
             self.plotter.plot_points_only(self.points)
-            
+
+    def _reset_plot_view(self):
+        self.plotter.reset_view()
+
     def _update_summary_table(self):
         """立即更新体积汇总；大明细表由后台事件循环分批填充。"""
         if not self.result:
