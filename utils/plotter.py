@@ -42,6 +42,7 @@ setup_chinese_font()
 
 ZOOM_STEP = 1.2          # 滚轮每格的缩放倍数
 DRAG_THRESHOLD_PX = 4    # 按下后移动超过该像素数才算拖动，否则算点击
+LEGEND_GAP_PX = 8        # 结果图图例与左下角按钮之间至少留的空隙
 
 
 class EarthworkPlotter:
@@ -73,6 +74,10 @@ class EarthworkPlotter:
         self._artist_scatter: Optional[object] = None
         self._artist_boundary: Optional[object] = None
         self._highlight_artists: list = []
+        self._result_legend = None   # 结果图的图例（图级，放在坐标轴下方）
+        self._legend_handles: list = []
+        # 图左下角要给浮在图上的控件（计算页的“重置视图”按钮）让出的宽度，逻辑像素
+        self.legend_left_reserve = 0
         self._pick_xy: Optional[np.ndarray] = None
         self._pick_tris: List[Triangle] = []
 
@@ -97,6 +102,7 @@ class EarthworkPlotter:
         if toolbar_frame:
             self.toolbar = NavigationToolbar2Tk(canvas, toolbar_frame)
             self.toolbar.update()
+        self._connection_ids.append(self.canvas.mpl_connect('resize_event', self._fit_result_legend))
         if enable_navigation:
             self._connection_ids += [
                 self.canvas.mpl_connect('button_press_event', self._on_press),
@@ -108,6 +114,39 @@ class EarthworkPlotter:
         self._connection_ids.append(self.canvas.mpl_connect('button_press_event', self._on_click))
         if enable_hover:
             self._connection_ids.append(self.canvas.mpl_connect('motion_notify_event', self._on_hover))
+
+    def _set_result_legend_columns(self, ncols: int):
+        """按给定列数（重新）创建结果图图例；Legend 建好后改列数不会重新排版，只能重建。"""
+        visible = True
+        if self._result_legend is not None:
+            if getattr(self._result_legend, "_ncols", None) == ncols:
+                return
+            visible = self._result_legend.get_visible()
+            self._result_legend.remove()
+        self._result_legend = self.fig.legend(
+            handles=self._legend_handles, loc='outside lower right',
+            ncol=ncols, fontsize=9, frameon=False)
+        self._result_legend.set_visible(visible)
+
+    def _fit_result_legend(self, _event=None):
+        """图例一行放不下时减少列数（排成两行或多行），左侧让出 legend_left_reserve。
+
+        窗口改变大小时也会调用：窄窗口里一行图例会伸到左下角的按钮底下。
+        """
+        if self._result_legend is None or not self._legend_handles:
+            return
+        try:
+            renderer = self.fig.canvas.get_renderer()
+        except AttributeError:
+            return
+        # Figure 的像素是设备像素，Retina 屏上是逻辑像素的 2 倍
+        ratio = getattr(self.fig.canvas, "device_pixel_ratio", 1) or 1
+        available = self.fig.bbox.width - (self.legend_left_reserve + LEGEND_GAP_PX) * ratio
+        count = len(self._legend_handles)
+        for ncols in sorted({count, (count + 1) // 2, 1}, reverse=True):
+            self._set_result_legend_columns(ncols)
+            if self._result_legend.get_window_extent(renderer).width <= available:
+                break
 
     def _on_click(self, event):
         """鼠标点击事件"""
@@ -265,6 +304,10 @@ class EarthworkPlotter:
         self._pick_xy = None
         self._pick_tris = []
         self._home_view = None
+        if self._result_legend is not None:
+            self._result_legend.remove()
+            self._result_legend = None
+        self._legend_handles = []
 
     def plot_result(self, result: CalculationResult,
                     points: List[SurveyPoint],
@@ -301,9 +344,8 @@ class EarthworkPlotter:
             if self._artist_boundary is not None:
                 self._artist_boundary.set_visible(show_boundary)
             # 图例同步
-            legend = self.ax.get_legend()
-            if legend:
-                legend.set_visible(show_legend)
+            if self._result_legend is not None:
+                self._result_legend.set_visible(show_legend)
             if self.canvas:
                 self.canvas.draw_idle()
             return
@@ -344,7 +386,12 @@ class EarthworkPlotter:
             self.selected_triangle = None
 
         if show_legend and artists["legend"]:
-            self.ax.legend(handles=artists["legend"], loc='upper right', fontsize=9, framealpha=0.9)
+            # 图例放在坐标轴下方一行，不遮挡边界角上的挖填区域。用图级图例的 outside 位置，
+            # 由约束布局给它留出高度；固定偏移在图较矮时会和 X 轴标题叠在一起。
+            # 靠右对齐：左下角留给计算页浮在图上的“重置视图”按钮
+            self._legend_handles = list(artists["legend"])
+            self._set_result_legend_columns(len(self._legend_handles))
+            self._fit_result_legend()
         self.ax.set_title(
             f'土方计算结果 - 挖方:{result.total_cut:.1f}m³  填方:{result.total_fill:.1f}m³  净:{result.net_volume:.1f}m³',
             fontsize=11, pad=10)

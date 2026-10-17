@@ -62,6 +62,7 @@ def silence_dialogs():
     messagebox.showwarning = lambda *a, **k: "ok"
     messagebox.showerror = lambda *a, **k: "ok"
     messagebox.askokcancel = lambda *a, **k: True
+    messagebox.askyesnocancel = lambda *a, **k: False  # 退出时不保存
 
 
 def data_to_pixel(ax, x, y):
