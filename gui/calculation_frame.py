@@ -391,8 +391,10 @@ class CalculationFrame(ttk.Frame):
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
         self.plotter.bind_canvas(self.canvas, enable_navigation=True)
         # 图上滚轮缩放、拖动平移、双击复位；显示开关一栏在小屏已排满，复位按钮浮在图的左下角
-        ttk.Button(self.canvas.get_tk_widget(), text="重置视图", command=self._reset_plot_view).place(
-            relx=0, rely=1, x=6, y=-6, anchor=tk.SW)
+        reset_button = ttk.Button(self.canvas.get_tk_widget(), text="重置视图", command=self._reset_plot_view)
+        reset_button.place(relx=0, rely=1, x=6, y=-6, anchor=tk.SW)
+        # 图例在图下方靠右；窗口窄时图例自动换行，给按钮让出位置（按钮宽度随系统字体不同）
+        self.plotter.legend_left_reserve = reset_button.winfo_reqwidth() + 6
         self.plotter.on_triangle_click = self._on_triangle_selected
         
         # 选项卡2：汇总表
