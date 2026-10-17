@@ -69,11 +69,31 @@ def data_to_pixel(ax, x, y):
     return ax.transData.transform((x, y))
 
 
-def fire(canvas, ax, name, x, y, button=None):
-    """在数据坐标 (x, y) 处合成一个 matplotlib 鼠标事件。"""
-    px, py = data_to_pixel(ax, x, y)
-    event = MouseEvent(name, canvas, px, py, button=button)
+def fire_pixel(canvas, name, px, py, button=None, step=0):
+    """在画布像素位置 (px, py) 处合成一个 matplotlib 鼠标事件。"""
+    event = MouseEvent(name, canvas, px, py, button=button, step=step)
     canvas.callbacks.process(name, event)
+
+
+def fire(canvas, ax, name, x, y, button=None, step=0):
+    """在数据坐标 (x, y) 处合成一个 matplotlib 鼠标事件。"""
+    fire_pixel(canvas, name, *data_to_pixel(ax, x, y), button=button, step=step)
+
+
+def click(canvas, ax, x, y, button=MouseButton.LEFT):
+    """单击 = 按下 + 松开（边界页按住拖动是平移或移动顶点，松开时没动才算单击）。"""
+    fire(canvas, ax, 'button_press_event', x, y, button)
+    fire(canvas, ax, 'button_release_event', x, y, button)
+
+
+def drag(canvas, ax, start, end, steps=8):
+    """按住左键从 start 拖到 end（数据坐标）。像素位置按起拖时的视野算，拖动中视野可能在变。"""
+    x0, y0 = data_to_pixel(ax, *start)
+    x1, y1 = data_to_pixel(ax, *end)
+    fire_pixel(canvas, 'button_press_event', x0, y0, MouseButton.LEFT)
+    for i in range(1, steps + 1):
+        fire_pixel(canvas, 'motion_notify_event', x0 + (x1 - x0) * i / steps, y0 + (y1 - y0) * i / steps)
+    fire_pixel(canvas, 'button_release_event', x1, y1, MouseButton.LEFT)
 
 
 def pump(root, seconds=0.05):
@@ -128,6 +148,61 @@ def run(point_count):
         bf._create_auto_boundary()
         pump(app, 0.1)
 
+    with timed("沿测点外轮廓生成", 2.0):
+        bf._create_outline_boundary()
+        pump(app, 0.1)
+    if not bf._boundary_is_valid():
+        ERRORS.append(("outline", f"外轮廓边界无效: {len(bf.boundary)} 点"))
+
+    with timed("按点号连线", 1.0):
+        corners = [(10, 10), (180, 12), (185, 140), (15, 138)]
+        nearest = [min(points, key=lambda p: (p.x - x) ** 2 + (p.y - y) ** 2) for x, y in corners]
+        bf.id_sequence_var.set(",".join(str(p.id) for p in nearest))
+        bf._connect_by_ids()
+        pump(app, 0.1)
+    if bf.boundary != [(p.x, p.y) for p in nearest]:
+        ERRORS.append(("connect_by_ids", f"按点号连线结果不对: {bf.boundary}"))
+
+    with timed("理顺交叉的连线", 1.0):
+        bf.id_sequence_var.set(",".join(str(p.id) for p in (nearest[0], nearest[2], nearest[1], nearest[3])))
+        bf._connect_by_ids()
+        bf._untangle()
+        pump(app, 0.1)
+    if not bf._boundary_is_valid():
+        ERRORS.append(("untangle", f"理顺后边界仍无效: {bf.boundary}"))
+
+    with timed("粘贴坐标", 1.0):
+        bf.clipboard_get = lambda: "点号\tX\tY\nJ1\t20\t20\nJ2\t160\t20\nJ3\t160\t120\nJ4\t20\t120\n"
+        bf._paste_coordinates()
+        del bf.clipboard_get
+        pump(app, 0.1)
+    if bf.boundary != [(20.0, 20.0), (160.0, 20.0), (160.0, 120.0), (20.0, 120.0)]:
+        ERRORS.append(("paste", f"粘贴坐标结果不对: {bf.boundary}"))
+
+    with timed("导出边界 CSV + DXF", 1.0):
+        from tkinter import filedialog
+        export_dir = tempfile.mkdtemp(prefix="tin_boundary_")
+        for name in ("边界.csv", "边界.dxf"):
+            filedialog.asksaveasfilename = lambda *a, _name=name, **k: os.path.join(export_dir, _name)
+            bf._export_boundary()
+        pump(app, 0.05)
+    if sorted(os.listdir(export_dir)) != ["边界.csv", "边界.dxf"]:
+        ERRORS.append(("export_boundary", f"导出的文件: {os.listdir(export_dir)}"))
+
+    with timed("导入底图 + 选底图线", 2.0):
+        backdrop_path = os.path.join(export_dir, "底图.dxf")
+        with open(backdrop_path, "w", encoding="utf-8") as handle:
+            handle.write("0\nSECTION\n2\nENTITIES\n0\nLWPOLYLINE\n8\n红线\n90\n4\n70\n1\n"
+                         "10\n30\n20\n30\n10\n150\n20\n30\n10\n150\n20\n110\n10\n30\n20\n110\n"
+                         "0\nLINE\n8\n道路\n10\n0\n20\n140\n11\n200\n21\n140\n0\nENDSEC\n0\nEOF\n")
+        filedialog.askopenfilename = lambda *a, **k: backdrop_path
+        bf._import_backdrop()
+        bf._set_pick_mode(True)
+        click(bcanvas, bax, 90, 30)
+        pump(app, 0.1)
+    if bf.boundary != [(30.0, 30.0), (150.0, 30.0), (150.0, 110.0), (30.0, 110.0)]:
+        ERRORS.append(("pick_backdrop", f"选底图线结果不对: {bf.boundary}"))
+
     with timed("清空边界按钮", 0.5):
         bf._clear_boundary()
         pump(app, 0.1)
@@ -136,8 +211,10 @@ def run(point_count):
     click_pts = [(10, 10), (180, 12), (185, 140), (15, 138), (100, 145)]
     for i, (x, y) in enumerate(click_pts, 1):
         with timed(f"左键添加边界点 {i}", 0.5):
-            fire(bcanvas, bax, 'button_press_event', x, y, MouseButton.LEFT)
+            click(bcanvas, bax, x, y)
             pump(app, 0.05)
+    if len(bf.boundary) != len(click_pts):
+        ERRORS.append(("click_add", f"单击 {len(click_pts)} 次后边界有 {len(bf.boundary)} 个点"))
 
     # 鼠标移动 (橡皮筋预览) —— 高频事件
     with timed("鼠标移动 x60 (边界预览)", 1.5):
@@ -145,16 +222,53 @@ def run(point_count):
             fire(bcanvas, bax, 'motion_notify_event', 20 + i * 2, 60 + i)
         pump(app, 0.1)
 
-    with timed("右键删除最后一点", 0.5):
-        fire(bcanvas, bax, 'button_press_event', 100, 145, MouseButton.RIGHT)
+    with timed("滚轮放大 x4 再缩小 x4", 1.5):
+        for step in (1, 1, 1, 1, -1, -1, -1, -1):
+            fire(bcanvas, bax, 'scroll_event', 90, 70, button='up' if step > 0 else 'down', step=step)
+            pump(app, 0.02)
+
+    with timed("拖动空白处平移", 1.0):
+        drag(bcanvas, bax, (90, 70), (60, 50))
+        pump(app, 0.05)
+    if len(bf.boundary) != len(click_pts):
+        ERRORS.append(("pan", f"平移后边界点数变了: {len(bf.boundary)}"))
+
+    with timed("全图按钮", 0.5):
+        bf._reset_view()
         pump(app, 0.05)
 
-    with timed("撤销上一点按钮", 0.5):
+    with timed("拖动顶点", 1.0):
+        before = bf.boundary[4]
+        drag(bcanvas, bax, before, (before[0] + 12, before[1] - 25))
+        pump(app, 0.05)
+    if bf.boundary[4] == before or len(bf.boundary) != len(click_pts):
+        ERRORS.append(("drag_vertex", f"拖动顶点没有生效: {bf.boundary}"))
+
+    with timed("点在边上插入顶点", 0.5):
+        (ax0, ay0), (ax1, ay1) = bf.boundary[0], bf.boundary[1]
+        click(bcanvas, bax, (ax0 + ax1) / 2, (ay0 + ay1) / 2)
+        pump(app, 0.05)
+    if len(bf.boundary) != len(click_pts) + 1:
+        ERRORS.append(("insert_vertex", f"点在边上后边界有 {len(bf.boundary)} 个点"))
+
+    with timed("右键删除光标下的顶点", 0.5):
+        fire(bcanvas, bax, 'button_press_event', *bf.boundary[1], MouseButton.RIGHT)
+        pump(app, 0.05)
+
+    with timed("右键删除最后一点", 0.5):
+        fire(bcanvas, bax, 'button_press_event', 100, 70, MouseButton.RIGHT)
+        pump(app, 0.05)
+    if len(bf.boundary) != 4:
+        ERRORS.append(("right_click", f"两次右键删除后边界有 {len(bf.boundary)} 个点"))
+
+    with timed("撤销上一步按钮", 0.5):
         bf._undo_last_point()
         pump(app, 0.05)
+    if len(bf.boundary) != 5:
+        ERRORS.append(("undo", f"撤销后边界有 {len(bf.boundary)} 个点"))
 
-    with timed("重新补点 + 确认边界", 1.0):
-        fire(bcanvas, bax, 'button_press_event', 15, 138, MouseButton.LEFT)
+    with timed("再删最后一点 + 确认边界", 1.0):
+        fire(bcanvas, bax, 'button_press_event', 100, 70, MouseButton.RIGHT)
         pump(app, 0.05)
         bf._confirm_boundary()
         pump(app, 0.3)
