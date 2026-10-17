@@ -208,3 +208,35 @@ def test_tables_do_not_grow_and_squeeze_neighbour_panel(app):
         app.update()
     assert _squeezed_controls(frame) == []
     _assert_fully_inside_window(app, _find(frame, "确认无误，进入下一步"), "确认无误，进入下一步")
+
+
+@pytest.mark.parametrize("size", WINDOW_SIZES, ids=["default", "1366x768", "1024x768"])
+def test_reset_view_button_does_not_cover_result_legend(app, size):
+    """结果图左下角浮着“重置视图”按钮，图例在图下方一行：窗口再窄两者也不能叠在一起。"""
+    app.geometry("{}x{}".format(*size))
+    app.import_frame.load_points(generate_test_data())
+    app.import_frame._confirm_points()
+    app.boundary_frame._create_auto_boundary()
+    app.boundary_frame._confirm_boundary()
+    cf = app.calc_frame
+    cf.design_elevation_var.set(50.0)
+    cf.start_calculation()
+    for _ in range(3000):
+        app.update()
+        if cf.result is not None:
+            break
+    app.update()
+    cf.canvas.draw()
+
+    widget = cf.canvas.get_tk_widget()
+    button = _find(widget, "重置视图")
+    canvas = cf.plotter.fig.canvas
+    ratio = getattr(canvas, "device_pixel_ratio", 1) or 1
+    box = cf.plotter._result_legend.get_window_extent(canvas.get_renderer())
+    height = widget.winfo_height()
+    # matplotlib 像素原点在左下、按设备像素计；Tk 原点在左上、按逻辑像素计
+    legend = (box.x0 / ratio, height - box.y1 / ratio, box.x1 / ratio, height - box.y0 / ratio)
+    left, top = button.winfo_x(), button.winfo_y()
+    right, bottom = left + button.winfo_width(), top + button.winfo_height()
+    apart = right <= legend[0] or left >= legend[2] or bottom <= legend[1] or top >= legend[3]
+    assert apart, f"按钮 {left}-{right}×{top}-{bottom} 与图例 {legend} 重叠"
