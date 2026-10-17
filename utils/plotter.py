@@ -2,6 +2,7 @@
 可视化模块：matplotlib 绘图嵌入 Tkinter
 """
 import matplotlib.pyplot as plt
+from matplotlib.backend_bases import MouseButton, cursors
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 from matplotlib.figure import Figure
@@ -39,6 +40,9 @@ def setup_chinese_font():
 
 setup_chinese_font()
 
+ZOOM_STEP = 1.2          # 滚轮每格的缩放倍数
+DRAG_THRESHOLD_PX = 4    # 按下后移动超过该像素数才算拖动，否则算点击
+
 
 class EarthworkPlotter:
     """土方计算结果可视化"""
@@ -55,6 +59,9 @@ class EarthworkPlotter:
         self._colorbar = None
         self._connection_ids = []
         self._current_result = None
+        self._home_view = None
+        self._pan = None
+        self._enable_hover = True
 
         # 结果图 artist 缓存：result 不变时只切换可见性，跳过全量重建
         self._cached_result_id: Optional[int] = None  # id(result)
@@ -73,19 +80,35 @@ class EarthworkPlotter:
         self.colors = dict(PLOT_COLORS)
         self._style_axes()
         
-    def bind_canvas(self, canvas: FigureCanvasTkAgg, toolbar_frame=None, enable_hover=True):
-        """绑定画布和工具栏"""
+    def bind_canvas(self, canvas: FigureCanvasTkAgg, toolbar_frame=None, enable_hover=True,
+                    enable_navigation=False):
+        """绑定画布和工具栏。
+
+        enable_navigation=True 时开启滚轮缩放、左键/中键拖动平移、左键双击复位，
+        此时左键松开且未拖动才算点击（选中三角形）。
+        """
         self.canvas = canvas
         self._last_hover_time: float = 0.0
-        widget = canvas.get_tk_widget()
-        widget.configure(background=COLORS["sheet"], highlightthickness=0)
+        self._enable_hover = enable_hover
+        self._pan = None
+        if hasattr(canvas, "get_tk_widget"):
+            widget = canvas.get_tk_widget()
+            widget.configure(background=COLORS["sheet"], highlightthickness=0)
         if toolbar_frame:
             self.toolbar = NavigationToolbar2Tk(canvas, toolbar_frame)
             self.toolbar.update()
+        if enable_navigation:
+            self._connection_ids += [
+                self.canvas.mpl_connect('button_press_event', self._on_press),
+                self.canvas.mpl_connect('button_release_event', self._on_release),
+                self.canvas.mpl_connect('motion_notify_event', self._on_motion),
+                self.canvas.mpl_connect('scroll_event', self._on_scroll),
+            ]
+            return
         self._connection_ids.append(self.canvas.mpl_connect('button_press_event', self._on_click))
         if enable_hover:
             self._connection_ids.append(self.canvas.mpl_connect('motion_notify_event', self._on_hover))
-        
+
     def _on_click(self, event):
         """鼠标点击事件"""
         if event.inaxes != self.ax or event.button != 1:
@@ -101,6 +124,86 @@ class EarthworkPlotter:
                 self.canvas.draw_idle()
             if self.on_triangle_click:
                 self.on_triangle_click(tri)
+
+    # ---------------- 缩放 / 平移 ----------------
+
+    def _on_press(self, event):
+        """左键或中键按下：记录起点，移动超过阈值后进入平移；左键双击复位视图。"""
+        if event.inaxes != self.ax or event.button not in (MouseButton.LEFT, MouseButton.MIDDLE):
+            return
+        if event.dblclick and event.button == MouseButton.LEFT:
+            self._pan = None
+            self.reset_view()
+            return
+        self._pan = {
+            "button": event.button, "x": event.x, "y": event.y, "moved": False,
+            "xlim": self.ax.get_xlim(), "ylim": self.ax.get_ylim(),
+        }
+
+    def _on_motion(self, event):
+        pan = self._pan
+        if pan is None:
+            if self._enable_hover:
+                self._on_hover(event)
+            return
+        dx, dy = event.x - pan["x"], event.y - pan["y"]
+        if not pan["moved"]:
+            if np.hypot(dx, dy) < DRAG_THRESHOLD_PX:
+                return
+            pan["moved"] = True
+            self._set_cursor(cursors.MOVE)
+        bbox = self.ax.bbox
+        (x0, x1), (y0, y1) = pan["xlim"], pan["ylim"]
+        sx = (x1 - x0) / bbox.width
+        sy = (y1 - y0) / bbox.height
+        self.ax.set_xlim(x0 - dx * sx, x1 - dx * sx)
+        self.ax.set_ylim(y0 - dy * sy, y1 - dy * sy)
+        if self.canvas:
+            self.canvas.draw_idle()
+
+    def _on_release(self, event):
+        pan, self._pan = self._pan, None
+        if pan is None or pan["button"] != event.button:
+            return
+        if pan["moved"]:
+            self._set_cursor(cursors.POINTER)
+            return
+        self._on_click(event)
+
+    def _on_scroll(self, event):
+        """滚轮以鼠标位置为中心缩放：向上放大，向下缩小。"""
+        if event.inaxes != self.ax or event.xdata is None or not event.step:
+            return
+        self.zoom_at(event.xdata, event.ydata, ZOOM_STEP ** -event.step)
+
+    def zoom_at(self, x: float, y: float, scale: float):
+        """以 (x, y) 为中心缩放视图，scale < 1 放大，> 1 缩小。"""
+        x0, x1 = self.ax.get_xlim()
+        y0, y1 = self.ax.get_ylim()
+        self.ax.set_xlim(x - (x - x0) * scale, x + (x1 - x) * scale)
+        self.ax.set_ylim(y - (y - y0) * scale, y + (y1 - y) * scale)
+        if self.canvas:
+            self.canvas.draw_idle()
+
+    def reset_view(self):
+        """恢复到绘图完成时的完整视图。"""
+        if self._home_view is None:
+            return
+        xlim, ylim = self._home_view
+        self.ax.set_xlim(xlim)
+        self.ax.set_ylim(ylim)
+        if self.canvas:
+            self.canvas.draw_idle()
+
+    def _save_home_view(self):
+        self._home_view = (self.ax.get_xlim(), self.ax.get_ylim())
+
+    def _set_cursor(self, cursor):
+        if self.canvas is not None:
+            try:
+                self.canvas.set_cursor(cursor)
+            except Exception:
+                pass
 
     def _on_hover(self, event):
         """鼠标悬停事件 - 显示坐标（限速：最多 30 fps，约 33 ms/帧）"""
@@ -161,6 +264,7 @@ class EarthworkPlotter:
         self._highlight_artists = []
         self._pick_xy = None
         self._pick_tris = []
+        self._home_view = None
 
     def plot_result(self, result: CalculationResult,
                     points: List[SurveyPoint],
@@ -244,6 +348,7 @@ class EarthworkPlotter:
         self.ax.set_title(
             f'土方计算结果 - 挖方:{result.total_cut:.1f}m³  填方:{result.total_fill:.1f}m³  净:{result.net_volume:.1f}m³',
             fontsize=11, pad=10)
+        self._save_home_view()
 
         if self.canvas:
             self.canvas.draw_idle()
@@ -303,6 +408,7 @@ class EarthworkPlotter:
         self.ax.set_ylabel('Y 坐标 (m)')
         self.ax.set_title(f'测量点分布 - 共 {len(points)} 个点')
         self.ax.grid(True, linestyle=':', alpha=0.3)
+        self._save_home_view()
         if self.canvas:
             self.canvas.draw_idle()
 
