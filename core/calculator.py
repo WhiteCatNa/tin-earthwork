@@ -631,14 +631,14 @@ class TINEarthworkCalculator:
         if self._tin_a is None:
             raise ValueError("请先构建三角网")
         tin_a, unique_a = self._tin_a
-        surface_a = TinSurface(tin_a, {
+        surface_a = TinSurface(tin_a.points, tin_a.simplices, {
             "z": np.array([self.points[i].z for i in unique_a]),
             "design_z": np.array([self.points[i].design_z for i in unique_a]),
         })
         if self._tin_b is None:
             return surface_a, "z", surface_a, "design_z"
         tin_b, unique_b = self._tin_b
-        surface_b = TinSurface(tin_b, {"z": np.array([self.compare_points[i].z for i in unique_b])})
+        surface_b = TinSurface(tin_b.points, tin_b.simplices, {"z": np.array([self.compare_points[i].z for i in unique_b])})
         return surface_a, "z", surface_b, "z"
 
     def sample_surfaces(self, xy: np.ndarray, extrapolate: bool = False) -> Tuple[np.ndarray, np.ndarray]:

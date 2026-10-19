@@ -41,6 +41,7 @@ tin_earthwork/
 │   ├── geometry.py            # 平面几何：多边形裁剪、积分、点在多边形内
 │   ├── surface.py             # 斜面设计面、TIN 曲面插值与外推
 │   ├── overlay.py             # 两个三角网的精确叠加（两期对比）
+│   ├── cdt.py                 # 约束 Delaunay 三角剖分（特征线构网，尚未接入计算）
 │   └── grid_check.py          # 方格网法校核
 ├── gui/
 │   ├── theme.py               # 界面配色与字体
@@ -68,6 +69,7 @@ tin_earthwork/
     ├── test_layout.py             # 窗口排版（默认尺寸与 1366×768 下按钮不被挤出窗口）
     ├── test_design_surfaces.py    # 斜面设计面、两期对比（解析解与独立算法对照）
     ├── test_grid_check.py         # 方格网校核
+    ├── test_cdt.py                # 约束三角剖分（特征线）
     ├── test_reports_v2.py         # 2.0 报告、DXF、工程文件 v2
     ├── test_gui_v20.py            # 2.0 界面流程
     └── gui_stress_test.py         # 界面自动化点击压力测试（独立脚本）
