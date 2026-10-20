@@ -41,7 +41,8 @@ tin_earthwork/
 │   ├── geometry.py            # 平面几何：多边形裁剪、积分、点在多边形内
 │   ├── surface.py             # 斜面设计面、TIN 曲面插值与外推
 │   ├── overlay.py             # 两个三角网的精确叠加（两期对比）
-│   ├── cdt.py                 # 约束 Delaunay 三角剖分（特征线构网，尚未接入计算）
+│   ├── cdt.py                 # 约束 Delaunay 三角剖分（特征线构网）
+│   ├── breaklines.py          # 特征线数据结构
 │   └── grid_check.py          # 方格网法校核
 ├── gui/
 │   ├── theme.py               # 界面配色与字体
@@ -70,6 +71,7 @@ tin_earthwork/
     ├── test_design_surfaces.py    # 斜面设计面、两期对比（解析解与独立算法对照）
     ├── test_grid_check.py         # 方格网校核
     ├── test_cdt.py                # 约束三角剖分（特征线）
+    ├── test_breaklines.py         # 特征线接入计算（解析解对照）
     ├── test_reports_v2.py         # 2.0 报告、DXF、工程文件 v2
     ├── test_gui_v20.py            # 2.0 界面流程
     └── gui_stress_test.py         # 界面自动化点击压力测试（独立脚本）
@@ -160,6 +162,7 @@ python tests/gui_stress_test.py
 
 - **新增导出格式**：扩展 `utils/data_handler.py` 中的 `DataExporter` 类
 - **修改计算逻辑**：编辑 `core/calculator.py` 中的 `TINEarthworkCalculator` 类；几何算法在 `core/geometry.py`。各种比较面最终都落到“三角形顶点高差 = 实测 − 比较面”：斜面、分区直接给测点赋设计高程，两期对比由 `core/overlay.py` 叠加出新的三角网，方格网校核通过 `build_from_mesh()` 复用同一套计算
+- **特征线**：`TINEarthworkCalculator.set_breaklines(前期, 后期)` 传入 `core/breaklines.py` 的 `Breakline`，构网时按约束三角剖分（`core/cdt.py`）；不带高程的顶点须落在测点上，带高程且不在测点上的顶点、特征线交点作为新增顶点（`breakline_points`）。界面、导入和报告尚未接入
 - **调整界面流程**：修改 `gui/` 下各 Frame 类，页面之间通过公开方法（如 `set_points`、`update_inputs`）同步
 - **版本号**：只改 `version.py`
 
