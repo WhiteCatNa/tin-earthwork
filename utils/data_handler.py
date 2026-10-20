@@ -15,6 +15,7 @@ from openpyxl.cell import WriteOnlyCell
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
+from core.breaklines import Breakline
 from core.calculator import CalculationResult, SurveyPoint, chain_segments, extract_zero_contour_segments
 from utils.dxf_io import read_text_with_encodings
 from utils.fileio import atomic_write_text
@@ -822,7 +823,9 @@ class DataExporter:
         return True
 
 
-PROJECT_FORMAT_VERSION = 2
+PROJECT_FORMAT_VERSION = 3
+# 没有特征线的工程仍按第 2 版保存，2.0 版程序也能打开
+PROJECT_FORMAT_VERSION_NO_BREAKLINES = 2
 DESIGN_MODES = ("flat", "plane", "compare")
 
 
@@ -874,13 +877,16 @@ def save_project(
     compare_source: str = "",
     grid_enabled: bool = False,
     grid_spacing: Optional[float] = None,
+    breaklines: Optional[List[Breakline]] = None,
+    compare_breaklines: Optional[List[Breakline]] = None,
 ) -> None:
-    """保存可再次打开的工程文件（测点、边界、设计面、后期测点、方格网设置）。"""
+    """保存可再次打开的工程文件（测点、边界、设计面、后期测点、方格网设置、特征线）。"""
     if design_mode not in DESIGN_MODES:
         raise ValueError(f"未知的设计面类型: {design_mode}")
     payload = {
         "format": "tin-earthwork-project",
-        "format_version": PROJECT_FORMAT_VERSION,
+        "format_version": PROJECT_FORMAT_VERSION if (breaklines or compare_breaklines)
+        else PROJECT_FORMAT_VERSION_NO_BREAKLINES,
         "app_version": __version__,
         "project_name": project_name,
         "design_mode": design_mode,
@@ -894,6 +900,9 @@ def save_project(
         "points": _point_rows(points),
         "compare_points": _point_rows(compare_points or []),
     }
+    if breaklines or compare_breaklines:
+        payload["breaklines"] = [line.to_dict() for line in breaklines or []]
+        payload["compare_breaklines"] = [line.to_dict() for line in compare_breaklines or []]
     atomic_write_text(filepath, json.dumps(payload, ensure_ascii=False, indent=2))
 
 
@@ -925,4 +934,6 @@ def load_project(filepath: str) -> Dict[str, Any]:
         "boundary": boundary,
         "points": _points_from_rows(payload.get("points")),
         "compare_points": compare_points,
+        "breaklines": [Breakline.from_dict(item) for item in payload.get("breaklines") or []],
+        "compare_breaklines": [Breakline.from_dict(item) for item in payload.get("compare_breaklines") or []],
     }

@@ -52,7 +52,7 @@ tin_earthwork/
 │   └── calculation_frame.py   # 计算与结果、导出
 ├── utils/
 │   ├── data_handler.py        # 数据导入、检查与各类报告导出
-│   ├── dxf_io.py              # DXF 边界读取
+│   ├── dxf_io.py              # DXF 边界、特征线读取
 │   ├── plotter.py             # Matplotlib 绘图（界面图与导出图共用）
 │   ├── survey_edit.py         # 测点增删改、平移、X/Y 互换
 │   ├── recent_projects.py     # 最近工程列表
@@ -72,6 +72,7 @@ tin_earthwork/
     ├── test_grid_check.py         # 方格网校核
     ├── test_cdt.py                # 约束三角剖分（特征线）
     ├── test_breaklines.py         # 特征线接入计算（解析解对照）
+    ├── test_breakline_io.py       # 特征线 DXF 导入、工程文件保存
     ├── test_reports_v2.py         # 2.0 报告、DXF、工程文件 v2
     ├── test_gui_v20.py            # 2.0 界面流程
     └── gui_stress_test.py         # 界面自动化点击压力测试（独立脚本）
@@ -162,7 +163,7 @@ python tests/gui_stress_test.py
 
 - **新增导出格式**：扩展 `utils/data_handler.py` 中的 `DataExporter` 类
 - **修改计算逻辑**：编辑 `core/calculator.py` 中的 `TINEarthworkCalculator` 类；几何算法在 `core/geometry.py`。各种比较面最终都落到“三角形顶点高差 = 实测 − 比较面”：斜面、分区直接给测点赋设计高程，两期对比由 `core/overlay.py` 叠加出新的三角网，方格网校核通过 `build_from_mesh()` 复用同一套计算
-- **特征线**：`TINEarthworkCalculator.set_breaklines(前期, 后期)` 传入 `core/breaklines.py` 的 `Breakline`，构网时按约束三角剖分（`core/cdt.py`）；不带高程的顶点须落在测点上，带高程且不在测点上的顶点、特征线交点作为新增顶点（`breakline_points`）。界面、导入和报告尚未接入
+- **特征线**：`TINEarthworkCalculator.set_breaklines(前期, 后期)` 传入 `core/breaklines.py` 的 `Breakline`，构网时按约束三角剖分（`core/cdt.py`）；不带高程的顶点须落在测点上，带高程且不在测点上的顶点、特征线交点作为新增顶点（`breakline_points`）。`utils/dxf_io.py` 的 `import_breaklines_from_dxf(文件, 图层)` 按图层读入多段线和直线（3D 线带高程，2D 线不带）；工程文件有特征线时按第 3 版保存。界面和报告尚未接入
 - **调整界面流程**：修改 `gui/` 下各 Frame 类，页面之间通过公开方法（如 `set_points`、`update_inputs`）同步
 - **版本号**：只改 `version.py`
 
