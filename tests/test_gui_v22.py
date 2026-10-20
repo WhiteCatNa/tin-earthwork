@@ -148,3 +148,24 @@ def test_terrain_dialogs(app, tmp_path):
     dialog.method_var.set("center")
     dialog.ok()
     assert dialog.result == (5.0, "center", False)
+
+
+def test_haul_window(app, tmp_path, monkeypatch):
+    cf = _load(app, draw_hole=False)
+    cf.design_elevation_var.set(11.0)
+    _calculate(app, cf)
+    cf._open_haul()
+    window = cf.haul_window
+    assert window.result is not None
+    window.size_var.set("10")
+    window.compute()
+    assert {z.name for z in window.result.zones} == {"A1", "A2", "B1", "B2"}
+    assert len(window.move_tree.get_children()) == 2
+    path = tmp_path / "h.xlsx"
+    monkeypatch.setattr("tkinter.filedialog.asksaveasfilename", lambda **k: str(path))
+    window._export()
+    assert path.exists()
+    window.size_var.set("x")
+    window.compute()            # 错误输入：保留上次结果
+    assert window.result is not None
+    window.destroy()

@@ -15,6 +15,7 @@ from core.grid_check import run_grid_check, suggest_spacing
 from core.surface import PlaneDesign
 from utils.view3d import surface_faces
 from gui.view3d_window import View3DWindow, cancel_idle_draw
+from gui.haul_window import HaulWindow
 from utils.plotter import EarthworkPlotter, create_standalone_figure, draw_section
 from matplotlib.figure import Figure
 from utils.data_handler import ISSUE_NAMES, DataExporter, DataImporter, DataValidator, report_labels
@@ -89,6 +90,7 @@ class CalculationFrame(ttk.Frame):
         self._export_buttons: List[ttk.Button] = []
         self._closing = False
         self.view3d = None
+        self.haul_window = None
 
         self._create_widgets()
 
@@ -601,6 +603,7 @@ class CalculationFrame(ttk.Frame):
         corner.place(relx=0, rely=1, x=6, y=-6, anchor=tk.SW)
         ttk.Button(corner, text="重置视图", command=self._reset_plot_view).pack(side=tk.LEFT)
         ttk.Button(corner, text="三维视图…", command=self._open_3d_view).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(corner, text="土方调配…", command=self._open_haul).pack(side=tk.LEFT, padx=(6, 0))
         self.plotter.on_triangle_click = self._on_triangle_selected
         
         # 选项卡2：汇总表
@@ -1167,6 +1170,20 @@ class CalculationFrame(ttk.Frame):
         self.view3d = View3DWindow(self, self.result, natural, design, self.calculator.origin,
                                    self._project_name())
 
+    def _open_haul(self):
+        """土方调配窗口：在当前计算结果上分区调配。"""
+        if self.result is None:
+            messagebox.showinfo("土方调配", "请先完成计算")
+            return
+        try:
+            compact = self.soil_factors_value().compact
+        except ValueError as error:
+            messagebox.showerror("输入错误", str(error))
+            return
+        if self.haul_window is not None and self.haul_window.winfo_exists():
+            self.haul_window.destroy()
+        self.haul_window = HaulWindow(self, self.calculator, compact, self._project_name())
+
     def _reset_plot_view(self):
         self.plotter.reset_view()
 
@@ -1279,12 +1296,14 @@ class CalculationFrame(ttk.Frame):
                     pass
                 setattr(self, attr_name, None)
 
-        if self.view3d is not None:
-            try:
-                self.view3d.destroy()
-            except tk.TclError:
-                pass
-            self.view3d = None
+        for name in ("view3d", "haul_window"):
+            window = getattr(self, name)
+            if window is not None:
+                try:
+                    window.destroy()
+                except tk.TclError:
+                    pass
+                setattr(self, name, None)
         if hasattr(self, "plotter"):
             self.plotter.close()
         for name in ("canvas", "section_canvas"):
