@@ -72,6 +72,7 @@ class EarthworkPlotter:
         self._artist_contour_lines: list = []
         self._artist_scatter: Optional[object] = None
         self._artist_boundary: Optional[object] = None
+        self._artist_levels: Optional[object] = None
         self._highlight_artists: list = []
         self._pick_xy: Optional[np.ndarray] = None
         self._pick_tris: List[Triangle] = []
@@ -261,6 +262,7 @@ class EarthworkPlotter:
         self._artist_contour_lines = []
         self._artist_scatter = None
         self._artist_boundary = None
+        self._artist_levels = None
         self._highlight_artists = []
         self._pick_xy = None
         self._pick_tris = []
@@ -272,7 +274,8 @@ class EarthworkPlotter:
                     show_contour: bool = True,
                     show_points: bool = True,
                     show_boundary: bool = True,
-                    show_legend: bool = True):
+                    show_legend: bool = True,
+                    show_levels: bool = True):
         """绘制完整计算结果。
 
         result 未变时只切换 artist 可见性（毫秒级），跳过全量重建。
@@ -300,6 +303,8 @@ class EarthworkPlotter:
                     self._colorbar.ax.set_visible(show_points)
             if self._artist_boundary is not None:
                 self._artist_boundary.set_visible(show_boundary)
+            if self._artist_levels is not None:
+                self._artist_levels.set_visible(show_levels)
             # 图例同步
             legend = self.ax.get_legend()
             if legend:
@@ -323,6 +328,9 @@ class EarthworkPlotter:
         self._artist_contour_lines = [artists["zero"]] if artists["zero"] is not None else []
         self._artist_scatter = artists["scatter"]
         self._artist_boundary = artists["boundary"]
+        self._artist_levels = artists["levels"]
+        if self._artist_levels is not None:
+            self._artist_levels.set_visible(show_levels)
         self._pick_tris = artists["pick_tris"]
         self._pick_xy = artists["pick_xy"]
 
@@ -534,7 +542,7 @@ RASTERIZE_TRIANGLES = 5000
 
 def natural_label(result: CalculationResult) -> str:
     """测点散点的含义：与设计面比较时是实测高程，两期对比时是前期高程。"""
-    return "前期高程" if result.is_compare else "实测高程"
+    return "前期高程" if result.is_compare and not result.is_design_tin else "实测高程"
 
 
 def _result_geometry(result: CalculationResult):
@@ -567,7 +575,7 @@ def draw_result(ax, result: CalculationResult, points: List[SurveyPoint],
     # 导出 PDF/SVG 时，大量三角形按栅格嵌入，文字、边界和零线仍为矢量
     rasterize = fine and len(mesh_xy) > RASTERIZE_TRIANGLES
     artists = {"cut": None, "fill": None, "tin": None, "zero": None, "scatter": None,
-               "boundary": None, "legend": [], "pick_tris": tris, "pick_xy": mesh_xy}
+               "boundary": None, "levels": None, "legend": [], "pick_tris": tris, "pick_xy": mesh_xy}
 
     clip_patch = None
     if boundary:
@@ -601,6 +609,23 @@ def draw_result(ax, result: CalculationResult, points: List[SurveyPoint],
         artists["legend"].append(Patch(facecolor=COLORS["sheet"], edgecolor=colors['boundary'], hatch='//',
                                        label='挖空区（不计）'))
 
+    if result.contours is not None and result.contours.natural:
+        lines = [contour.polyline for contour in result.contours.natural]
+        widths = [(1.0 if fine else 1.2) if contour.major else (0.4 if fine else 0.6)
+                  for contour in result.contours.natural]
+        artists["levels"] = LineCollection(lines, colors=colors['contour'], linewidths=widths, zorder=4.5)
+        ax.add_collection(artists["levels"])
+        artists["legend"].append(Line2D([], [], color=colors['contour'], linewidth=1,
+                                        label=f'等高线（{result.contours.interval:g} m）'))
+
+    if result.sections is not None and result.sections.sections:
+        section_lines = LineCollection([(s.start, s.end) for s in result.sections.sections],
+                                       colors=colors['boundary'], linewidths=0.6, linestyles=':', zorder=4.6)
+        if clip_patch is not None:
+            section_lines.set_clip_path(clip_patch)
+        ax.add_collection(section_lines)
+        artists["sections"] = section_lines
+
     if zero:
         artists["zero"] = LineCollection(zero, colors=colors['zero'], linewidths=1.5 if fine else 2, zorder=6)
         ax.add_collection(artists["zero"])
@@ -627,6 +652,54 @@ def draw_result(ax, result: CalculationResult, points: List[SurveyPoint],
     ax.set_ylabel('Y 坐标 (m)', fontsize=12 if fine else 10)
     ax.grid(True, linestyle=':', alpha=0.3)
     return artists
+
+
+def draw_section(ax, section, result: CalculationResult, colors: Optional[dict] = None, fine: bool = False):
+    """画一个横断面：地面线、设计线（两期对比时为前期、后期地面），挖填部分着色。"""
+    colors = colors or dict(PLOT_COLORS)
+    labels = ("前期地面", "后期地面") if result.is_compare and not result.is_design_tin else ("地面线", "设计线")
+    first = True
+    for piece in section.pieces:
+        s = [piece.s0, piece.s1]
+        natural = [piece.natural0, piece.natural1]
+        design = [piece.design0, piece.design1]
+        ax.plot(s, natural, color=colors['contour'], linewidth=1.2 if fine else 1.5,
+                label=labels[0] if first else None)
+        ax.plot(s, design, color=colors['boundary'], linewidth=1.0 if fine else 1.2, linestyle='--',
+                label=labels[1] if first else None)
+        ax.fill_between(s, natural, design, where=[n >= d for n, d in zip(natural, design)],
+                        interpolate=True, color=colors['cut'], alpha=0.35, linewidth=0)
+        ax.fill_between(s, natural, design, where=[n <= d for n, d in zip(natural, design)],
+                        interpolate=True, color=colors['fill'], alpha=0.35, linewidth=0)
+        first = False
+    ax.set_title(f"断面 {section.index}  里程 {section.station:.3f} m  "
+                 f"挖 {section.cut_area:.2f} m²  填 {section.fill_area:.2f} m²", fontsize=9 if fine else 10)
+    ax.set_xlabel("偏距 (m)", fontsize=8 if fine else 9)
+    ax.set_ylabel("高程 (m)", fontsize=8 if fine else 9)
+    ax.tick_params(labelsize=7 if fine else 8)
+    ax.grid(True, linestyle=':', alpha=0.4)
+    if section.pieces:
+        ax.legend(fontsize=7 if fine else 8, loc='best')
+    else:
+        ax.text(0.5, 0.5, "断面不在计算范围内", ha='center', va='center', transform=ax.transAxes)
+
+
+def create_section_pages(result: CalculationResult, project_name: str, per_page: int = 6) -> List[Figure]:
+    """断面图页（A4 竖排，每页若干个断面），供 PDF 计算书使用。"""
+    setup_chinese_font()
+    sections = [s for s in result.sections.sections if s.pieces]
+    pages = []
+    for start in range(0, len(sections), per_page):
+        fig = Figure(figsize=(8.27, 11.69), dpi=100)
+        FigureCanvasAgg(fig)
+        chunk = sections[start:start + per_page]
+        for offset, section in enumerate(chunk):
+            ax = fig.add_subplot(per_page, 1, offset + 1)
+            draw_section(ax, section, result, fine=True)
+        fig.suptitle(f"{project_name} 断面图（第 {start // per_page + 1} 页）", fontsize=11)
+        fig.tight_layout(rect=(0, 0, 1, 0.97))
+        pages.append(fig)
+    return pages
 
 
 def create_standalone_figure(result: CalculationResult,

@@ -26,7 +26,8 @@ PROJECT_SUFFIXES = (".tinproj.json", ".json")
 DESIGN_SETTING_KEYS = (
     "design_elevation", "use_partition", "partition", "design_mode", "design_plane",
     "compare_points", "compare_source", "grid_enabled", "grid_spacing",
-    "max_edge_length", "soil_factors",
+    "max_edge_length", "soil_factors", "contours_enabled", "contour_interval",
+    "sections_enabled", "section_spacing", "section_angle", "design_points", "design_source",
 )
 DEFAULT_WINDOW_SIZE = (1400, 900)
 MIN_WINDOW_SIZE = (1200, 800)

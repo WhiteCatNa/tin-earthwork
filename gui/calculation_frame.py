@@ -7,10 +7,15 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from typing import Any, List, Callable, Optional, Dict, Tuple
 from core.balance import SoilFactors, balance_elevation, balance_plane, best_fit_plane, soil_balance
-from core.calculator import SurveyPoint, CalculationResult, TINEarthworkCalculator, format_id_list
+from core.calculator import COMPARE_DESIGN, SurveyPoint, CalculationResult, TINEarthworkCalculator, format_id_list
+from core.contours import trace_contours
+from core.sections import run_sections
 from core.grid_check import run_grid_check, suggest_spacing
 from core.surface import PlaneDesign
-from utils.plotter import EarthworkPlotter, create_standalone_figure
+from utils.view3d import surface_faces
+from gui.view3d_window import View3DWindow, cancel_idle_draw
+from utils.plotter import EarthworkPlotter, create_standalone_figure, draw_section
+from matplotlib.figure import Figure
 from utils.data_handler import ISSUE_NAMES, DataExporter, DataImporter, DataValidator, report_labels
 from gui.theme import COLORS, style_text_widget
 from gui.widgets import ScrollableFrame, WrappingButtonRow
@@ -19,8 +24,8 @@ import threading
 import queue
 
 DEFAULT_PROJECT_NAME = "TIN土方计算项目"
-# 比较面：统一高程 / 斜面 / 两期对比
-MODE_LABELS = (("flat", "统一高程"), ("plane", "斜面"), ("compare", "两期对比"))
+# 比较面：统一高程 / 斜面 / 两期对比 / 设计三角网（导入设计点、设计等高线）
+MODE_LABELS = (("flat", "统一高程"), ("plane", "斜面"), ("compare", "两期对比"), ("design_tin", "设计三角网"))
 PLANE_FIELDS = (("x0", "基准点 X0"), ("y0", "Y0"), ("h0", "基准高程 H0"), ("slope_x", "X向坡度%"), ("slope_y", "Y向坡度%"))
 
 
@@ -51,10 +56,17 @@ class CalculationFrame(ttk.Frame):
         self.plane_vars = {key: tk.StringVar(value="0") for key, _ in PLANE_FIELDS}
         self.compare_points: List[SurveyPoint] = []
         self.compare_source = ""
+        self.design_tin_points: List[SurveyPoint] = []
+        self.design_tin_source = ""
         self.grid_enabled_var = tk.BooleanVar(value=False)
         self.grid_spacing_var = tk.StringVar(value=f"{self._suggested_spacing():g}")
         self.trim_enabled_var = tk.BooleanVar(value=False)
         self.max_edge_var = tk.StringVar(value=f"{self._suggested_max_edge():g}")
+        self.contours_enabled_var = tk.BooleanVar(value=True)
+        self.contour_interval_var = tk.StringVar(value="")   # 空为自动
+        self.sections_enabled_var = tk.BooleanVar(value=False)
+        self.section_spacing_var = tk.StringVar(value=f"{self._suggested_spacing():g}")
+        self.section_angle_var = tk.StringVar(value="0")
         self.loose_var = tk.StringVar(value="1.0")
         self.compact_var = tk.StringVar(value="1.0")
         self._balance_thread = None
@@ -72,6 +84,7 @@ class CalculationFrame(ttk.Frame):
         self._export_poll_after_id = None
         self._export_buttons: List[ttk.Button] = []
         self._closing = False
+        self.view3d = None
 
         self._create_widgets()
 
@@ -101,9 +114,13 @@ class CalculationFrame(ttk.Frame):
     def apply_design_settings(self, design_elevation: float, use_partition: bool, partition: Dict[str, float],
                               design_mode: str = "flat", design_plane: Optional[Dict[str, float]] = None,
                               compare_points: Optional[List[SurveyPoint]] = None, compare_source: str = "",
+                              design_points: Optional[List[SurveyPoint]] = None, design_source: str = "",
                               grid_enabled: bool = False, grid_spacing: Optional[float] = None,
                               max_edge_length: Optional[float] = None,
-                              soil_factors: Optional[Dict[str, float]] = None):
+                              soil_factors: Optional[Dict[str, float]] = None,
+                              contours_enabled: bool = True, contour_interval: Optional[float] = None,
+                              sections_enabled: bool = False, section_spacing: Optional[float] = None,
+                              section_angle: float = 0.0):
         """恢复工程文件中的比较面、分区、后期测点、方格网、三角网清理和可松性系数设置。"""
         self.design_elevation_var.set(design_elevation)
         self.use_partition_var.set(bool(use_partition))
@@ -114,12 +131,19 @@ class CalculationFrame(ttk.Frame):
             for key, _ in PLANE_FIELDS:
                 self.plane_vars[key].set(f"{getattr(plane, key):g}")
         self.set_compare_points(list(compare_points or []), compare_source)
+        self.set_design_tin_points(list(design_points or []), design_source)
         self.grid_enabled_var.set(bool(grid_enabled))
         if grid_spacing:
             self.grid_spacing_var.set(f"{grid_spacing:g}")
         self.trim_enabled_var.set(bool(max_edge_length))
         if max_edge_length:
             self.max_edge_var.set(f"{max_edge_length:g}")
+        self.contours_enabled_var.set(bool(contours_enabled))
+        self.contour_interval_var.set(f"{contour_interval:g}" if contour_interval else "")
+        self.sections_enabled_var.set(bool(sections_enabled))
+        if section_spacing:
+            self.section_spacing_var.set(f"{section_spacing:g}")
+        self.section_angle_var.set(f"{section_angle or 0:g}")
         factors = SoilFactors.from_dict(soil_factors)
         self.loose_var.set(f"{factors.loose:g}")
         self.compact_var.set(f"{factors.compact:g}")
@@ -164,10 +188,15 @@ class CalculationFrame(ttk.Frame):
             "partition": dict(self.partition_data),
             "compare_points": list(self.compare_points),
             "compare_source": self.compare_source,
+            "design_points": list(self.design_tin_points),
+            "design_source": self.design_tin_source,
             "grid_enabled": bool(self.grid_enabled_var.get()),
             "grid_spacing": spacing,
             "max_edge_length": max_edge,
             "soil_factors": None if factors.is_default else factors.to_dict(),
+            "contours_enabled": bool(self.contours_enabled_var.get()),
+            "contour_interval": self.contour_interval_value(),
+            **self._section_settings(),
         }
 
     def plane_value(self) -> PlaneDesign:
@@ -198,6 +227,42 @@ class CalculationFrame(ttk.Frame):
         if not math.isfinite(length) or length <= 0:
             raise ValueError("最大边长必须大于 0")
         return length
+
+    def section_values(self) -> Tuple[float, float]:
+        """(断面间距, 推进方向角)。"""
+        try:
+            spacing = float(self.section_spacing_var.get())
+            angle = float(self.section_angle_var.get() or 0)
+        except ValueError:
+            raise ValueError("断面间距和方向角必须是数字") from None
+        if not math.isfinite(spacing) or spacing <= 0:
+            raise ValueError("断面间距必须大于 0")
+        if not math.isfinite(angle):
+            raise ValueError("断面方向角必须是数字")
+        return spacing, angle
+
+    def _section_settings(self) -> Dict[str, Any]:
+        enabled = bool(self.sections_enabled_var.get())
+        try:
+            spacing, angle = self.section_values()
+        except ValueError:
+            if enabled:
+                raise
+            spacing, angle = None, 0.0
+        return {"sections_enabled": enabled, "section_spacing": spacing, "section_angle": angle}
+
+    def contour_interval_value(self) -> Optional[float]:
+        """等高距；空为自动。"""
+        text = self.contour_interval_var.get().strip()
+        if not text:
+            return None
+        try:
+            interval = float(text)
+        except ValueError:
+            raise ValueError("等高距必须是数字，留空为自动") from None
+        if not math.isfinite(interval) or interval <= 0:
+            raise ValueError("等高距必须大于 0")
+        return interval
 
     def soil_factors_value(self) -> SoilFactors:
         values = []
@@ -258,6 +323,50 @@ class CalculationFrame(ttk.Frame):
                                           foreground=COLORS["ink"])
             else:
                 self.compare_label.config(text="未导入后期测量数据", foreground=COLORS["dim"])
+
+    def set_design_tin_points(self, points: List[SurveyPoint], source: str = ""):
+        """设置设计三角网的设计点（导入文件或恢复工程时调用）。"""
+        self.design_tin_points = list(points)
+        self.design_tin_source = source
+        self.result = None
+        if hasattr(self, "design_tin_label"):
+            if self.design_tin_points:
+                name = os.path.basename(source) if source else "工程文件"
+                self.design_tin_label.config(text=f"已导入 {len(self.design_tin_points)} 个设计点（{name}）",
+                                             foreground=COLORS["ink"])
+            else:
+                self.design_tin_label.config(text="未导入设计点", foreground=COLORS["dim"])
+
+    def _import_design_tin(self):
+        filepath = filedialog.askopenfilename(
+            title="导入设计面数据",
+            filetypes=[("设计面数据", "*.dxf *.xlsx *.xls *.csv *.txt *.dat"), ("所有文件", "*.*")],
+        )
+        if filepath:
+            self.load_design_tin_file(filepath)
+
+    def load_design_tin_file(self, filepath: str) -> bool:
+        """导入设计点：DXF 取高程点、3DFACE、设计等高线等；表格/文本按测点格式读取。"""
+        try:
+            if filepath.lower().endswith(".dxf"):
+                from utils.design_import import import_design_points_from_dxf
+                points = import_design_points_from_dxf(filepath)
+            else:
+                points, _, _ = DataImporter.import_file(filepath)
+        except Exception as error:
+            messagebox.showerror("导入失败", str(error))
+            return False
+        if len(points) < 3:
+            messagebox.showerror("导入失败", "设计面至少需要 3 个设计点")
+            return False
+        zs = [p.z for p in points]
+        if not messagebox.askokcancel(
+            "确认设计面数据",
+            f"识别到 {len(points)} 个设计点，设计高程 {min(zs):.3f} ~ {max(zs):.3f} m。\n\n使用这批点构建设计三角网？",
+        ):
+            return False
+        self.set_design_tin_points(points, filepath)
+        return True
 
     def _create_widgets(self):
         # 左侧：设置面板。“开始计算”和进度固定在底部；设置项放在可滚动区域，窗口偏矮时滚动查看
@@ -328,6 +437,13 @@ class CalculationFrame(ttk.Frame):
         ttk.Label(self.compare_frame, text="前期 = 数据导入页的测点；高差 = 前期 − 后期",
                   style="Muted.TLabel").pack(anchor=tk.W)
 
+        self.design_tin_frame = ttk.Frame(self.mode_container)
+        ttk.Button(self.design_tin_frame, text="导入设计点 / 设计等高线…", command=self._import_design_tin).pack(anchor=tk.W)
+        self.design_tin_label = ttk.Label(self.design_tin_frame, style="Muted.TLabel", text="未导入设计点")
+        self.design_tin_label.pack(anchor=tk.W, pady=(4, 0))
+        ttk.Label(self.design_tin_frame, text="DXF 读高程点、3DFACE、带标高的等高线\n高差 = 实测 − 设计",
+                  style="Muted.TLabel").pack(anchor=tk.W)
+
         # 分区设计高程（统一高程、斜面时可用）
         self.partition_check = ttk.Checkbutton(body, text="分区设计高程（个别点单独指定）",
                                                variable=self.use_partition_var, command=self._toggle_partition)
@@ -345,7 +461,8 @@ class CalculationFrame(ttk.Frame):
                 foreground=COLORS["ink"],
             )
         self.update_idletasks()
-        widest = max(frame.winfo_reqwidth() for frame in (self.flat_frame, self.plane_frame, self.compare_frame))
+        widest = max(frame.winfo_reqwidth() for frame in (self.flat_frame, self.plane_frame, self.compare_frame,
+                                                          self.design_tin_frame))
         ttk.Frame(self.mode_container, width=widest, height=1).pack(side=tk.BOTTOM)
         self._on_mode_change()
 
@@ -360,6 +477,28 @@ class CalculationFrame(ttk.Frame):
         ttk.Entry(factor_row, textvariable=self.compact_var, width=6).pack(side=tk.LEFT, padx=4)
         ttk.Label(body, text="Ks = 松方/自然方，Ks' = 压实方/自然方\n都填 1 表示不换算",
                   style="Muted.TLabel").pack(anchor=tk.W)
+
+        # 等高线
+        ttk.Separator(body, orient='horizontal').pack(fill=tk.X, pady=8)
+        contour_row = ttk.Frame(body)
+        contour_row.pack(fill=tk.X)
+        ttk.Checkbutton(contour_row, text="等高线", variable=self.contours_enabled_var).pack(side=tk.LEFT)
+        ttk.Label(contour_row, text="等高距 (m)").pack(side=tk.LEFT, padx=(10, 4))
+        ttk.Entry(contour_row, textvariable=self.contour_interval_var, width=6).pack(side=tk.LEFT)
+        ttk.Label(contour_row, text="空为自动", style="Muted.TLabel").pack(side=tk.LEFT, padx=4)
+
+        # 断面法
+        ttk.Separator(body, orient='horizontal').pack(fill=tk.X, pady=8)
+        section_row = ttk.Frame(body)
+        section_row.pack(fill=tk.X)
+        ttk.Checkbutton(section_row, text="断面法校核", variable=self.sections_enabled_var).pack(side=tk.LEFT)
+        ttk.Label(section_row, text="间距 (m)").pack(side=tk.LEFT, padx=(10, 4))
+        ttk.Entry(section_row, textvariable=self.section_spacing_var, width=6).pack(side=tk.LEFT)
+        angle_row = ttk.Frame(body)
+        angle_row.pack(fill=tk.X, pady=(2, 0))
+        ttk.Label(angle_row, text="推进方向 (°)").pack(side=tk.LEFT)
+        ttk.Entry(angle_row, textvariable=self.section_angle_var, width=6).pack(side=tk.LEFT, padx=4)
+        ttk.Label(angle_row, text="0 沿 X，90 沿 Y", style="Muted.TLabel").pack(side=tk.LEFT)
 
         # 三角网清理
         ttk.Separator(body, orient='horizontal').pack(fill=tk.X, pady=8)
@@ -381,6 +520,7 @@ class CalculationFrame(ttk.Frame):
         self.show_contour_var = tk.BooleanVar(value=True)
         self.show_points_var = tk.BooleanVar(value=True)
         self.show_boundary_var = tk.BooleanVar(value=True)
+        self.show_levels_var = tk.BooleanVar(value=True)
 
         # 右侧：结果显示
         right_frame = ttk.Frame(self)
@@ -409,9 +549,9 @@ class CalculationFrame(ttk.Frame):
         self.notebook.add(self.plot_frame, text="计算结果图")
         toggles = ttk.Frame(self.plot_frame)
         toggles.pack(fill=tk.X, padx=4, pady=(4, 0))
-        ttk.Label(toggles, text="显示：", style="Muted.TLabel").pack(side=tk.LEFT)
         for text, variable in (("TIN网格", self.show_tin_var), ("零填挖线", self.show_contour_var),
-                               ("测量点", self.show_points_var), ("计算边界", self.show_boundary_var)):
+                               ("等高线", self.show_levels_var), ("测点", self.show_points_var),
+                               ("边界", self.show_boundary_var)):
             ttk.Checkbutton(toggles, text=text, variable=variable, command=self._refresh_plot).pack(
                 side=tk.LEFT, padx=(0, 10))
 
@@ -420,8 +560,10 @@ class CalculationFrame(ttk.Frame):
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
         self.plotter.bind_canvas(self.canvas, enable_navigation=True)
         # 图上滚轮缩放、拖动平移、双击复位；显示开关一栏在小屏已排满，复位按钮浮在图的左下角
-        ttk.Button(self.canvas.get_tk_widget(), text="重置视图", command=self._reset_plot_view).place(
-            relx=0, rely=1, x=6, y=-6, anchor=tk.SW)
+        corner = ttk.Frame(self.canvas.get_tk_widget())
+        corner.place(relx=0, rely=1, x=6, y=-6, anchor=tk.SW)
+        ttk.Button(corner, text="重置视图", command=self._reset_plot_view).pack(side=tk.LEFT)
+        ttk.Button(corner, text="三维视图…", command=self._open_3d_view).pack(side=tk.LEFT, padx=(6, 0))
         self.plotter.on_triangle_click = self._on_triangle_selected
         
         # 选项卡2：汇总表
@@ -434,6 +576,11 @@ class CalculationFrame(ttk.Frame):
         self.notebook.add(self.detail_frame, text="计算明细")
         self._create_detail_table()
         
+        # 选项卡：断面图（启用断面法后可选断面查看）
+        self.section_frame = ttk.Frame(self.notebook)
+        self.notebook.add(self.section_frame, text="断面图")
+        self._create_section_view()
+
         # 选项卡4：三角形信息 (点击三角形后显示)
         self.info_frame = ttk.Frame(self.notebook)
         self.notebook.add(self.info_frame, text="三角形详情")
@@ -468,6 +615,54 @@ class CalculationFrame(ttk.Frame):
         self.detail_frame.grid_rowconfigure(0, weight=1)
         self.detail_frame.grid_columnconfigure(0, weight=1)
         
+    def _create_section_view(self):
+        top = ttk.Frame(self.section_frame)
+        top.pack(fill=tk.X, padx=8, pady=(6, 0))
+        ttk.Label(top, text="断面：").pack(side=tk.LEFT)
+        self.section_choice_var = tk.StringVar()
+        self.section_combo = ttk.Combobox(top, textvariable=self.section_choice_var, state="readonly", width=36)
+        self.section_combo.pack(side=tk.LEFT)
+        self.section_combo.bind("<<ComboboxSelected>>", lambda _event: self._draw_selected_section())
+        for text, step in (("上一个", -1), ("下一个", 1)):
+            ttk.Button(top, text=text, command=lambda step=step: self._step_section(step)).pack(side=tk.LEFT, padx=(6, 0))
+        self.section_figure = Figure(figsize=(8, 4), dpi=100, constrained_layout=True)
+        self.section_axes = self.section_figure.add_subplot(111)
+        self.section_canvas = FigureCanvasTkAgg(self.section_figure, master=self.section_frame)
+        self.section_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+        self._update_section_view()
+
+    def _update_section_view(self):
+        sections = self.result.sections.sections if self.result is not None and self.result.sections else []
+        self.section_combo["values"] = [
+            f"断面 {s.index}  里程 {s.station:.3f} m  挖 {s.cut_area:.2f} m²  填 {s.fill_area:.2f} m²" for s in sections
+        ]
+        if sections:
+            middle = len(sections) // 2
+            self.section_combo.current(middle)
+        else:
+            self.section_choice_var.set("")
+        self._draw_selected_section()
+
+    def _step_section(self, step: int):
+        count = len(self.section_combo["values"])
+        if not count:
+            return
+        index = min(max(self.section_combo.current() + step, 0), count - 1)
+        self.section_combo.current(index)
+        self._draw_selected_section()
+
+    def _draw_selected_section(self):
+        self.section_axes.clear()
+        index = self.section_combo.current()
+        if self.result is None or self.result.sections is None or index < 0:
+            self.section_axes.text(0.5, 0.5, "勾选“断面法校核”并计算后，在这里查看断面图",
+                                   ha="center", va="center", transform=self.section_axes.transAxes)
+            self.section_axes.set_axis_off()
+        else:
+            self.section_axes.set_axis_on()
+            draw_section(self.section_axes, self.result.sections.sections[index], self.result)
+        self.section_canvas.draw_idle()
+
     def _create_triangle_info(self):
         """创建三角形详情面板"""
         self.info_text = tk.Text(self.info_frame, wrap=tk.WORD)
@@ -487,7 +682,8 @@ class CalculationFrame(ttk.Frame):
     def _on_mode_change(self):
         """切换比较面：只显示对应的输入；两期对比时分区高程不适用。"""
         mode = self.design_mode_var.get()
-        for frame, value in ((self.flat_frame, "flat"), (self.plane_frame, "plane"), (self.compare_frame, "compare")):
+        for frame, value in ((self.flat_frame, "flat"), (self.plane_frame, "plane"), (self.compare_frame, "compare"),
+                             (self.design_tin_frame, "design_tin")):
             if value == mode:
                 frame.pack(fill=tk.X)
             else:
@@ -495,7 +691,7 @@ class CalculationFrame(ttk.Frame):
         if mode == "plane" and all(var.get() in ("", "0") for key, var in self.plane_vars.items()
                                    if key in ("x0", "y0", "h0")):
             self._fill_plane_defaults()
-        compare = mode == "compare"
+        compare = mode in ("compare", "design_tin")
         self.partition_check.config(state=tk.DISABLED if compare else tk.NORMAL)
         if compare:
             self.partition_frame.pack_forget()
@@ -720,17 +916,24 @@ class CalculationFrame(ttk.Frame):
 
         # Tkinter 控件只能由主线程访问；在线程启动前读取所需配置。
         mode = self.design_mode_var.get()
-        use_partition = self.use_partition_var.get() and mode != "compare"
+        use_partition = self.use_partition_var.get() and mode not in ("compare", "design_tin")
         partition_data = self.partition_data.copy() if use_partition else {}
         compare_points = list(self.compare_points)
+        design_tin_points = list(self.design_tin_points)
         try:
             design_elevation = self.design_elevation_value()
             plane = self.plane_value() if mode == "plane" else None
             grid_spacing = self.grid_spacing_value() if self.grid_enabled_var.get() else None
             max_edge = self.max_edge_value() if self.trim_enabled_var.get() else None
             factors = self.soil_factors_value()
+            contour_interval = self.contour_interval_value()
+            section = self.section_values() if self.sections_enabled_var.get() else None
         except ValueError as error:
             messagebox.showerror("输入错误", str(error))
+            return
+        contours_enabled = self.contours_enabled_var.get()
+        if mode == "design_tin" and not design_tin_points:
+            messagebox.showwarning("提示", "设计三角网需要先导入设计点")
             return
         if mode == "compare" and not compare_points:
             messagebox.showwarning("提示", "两期对比需要先导入后期测量数据")
@@ -744,7 +947,10 @@ class CalculationFrame(ttk.Frame):
         def calc_thread():
             try:
                 calculator = self.calculator
-                calculator.set_compare_points(compare_points if mode == "compare" else None)
+                if mode == "design_tin":
+                    calculator.set_compare_points(design_tin_points, kind=COMPARE_DESIGN)
+                else:
+                    calculator.set_compare_points(compare_points if mode == "compare" else None)
                 calculator.set_max_edge_length(max_edge)
                 if plane is not None:
                     calculator.set_design_plane(plane, partition_data)
@@ -765,6 +971,18 @@ class CalculationFrame(ttk.Frame):
                         result.warnings.insert(0, (
                             f"有 {len(unlisted)} 个测点不在分区高程表中，按{base} 计算：{format_id_list(unlisted)}"
                         ))
+                if contours_enabled:
+                    self._worker_events.put(("progress", 60, "追踪等高线..."))
+                    try:
+                        result.contours = trace_contours(calculator, contour_interval)
+                    except ValueError as error:
+                        result.warnings.append(f"等高线未生成：{error}")
+                if section is not None:
+                    self._worker_events.put(("progress", 70, "断面法..."))
+                    try:
+                        result.sections = run_sections(calculator, result, *section)
+                    except ValueError as error:
+                        result.warnings.append(f"断面法未完成：{error}")
                 if grid_spacing is not None:
                     self._worker_events.put(("progress", 75, "方格网校核..."))
                     try:
@@ -826,6 +1044,7 @@ class CalculationFrame(ttk.Frame):
         self.calculate_button.config(state=tk.NORMAL)
         self._refresh_plot()
         self._update_summary_table()
+        self._update_section_view()
         self._start_detail_table_load()
         summary = (
             f"总挖方量: {self.result.total_cut:.2f} m³\n"
@@ -842,6 +1061,13 @@ class CalculationFrame(ttk.Frame):
             else:
                 summary += f"\n缺土 {balance.borrow_natural:.2f} m³（自然方），需外借"
         warnings = list(self.result.warnings)
+        sections = self.result.sections
+        if sections is not None:
+            summary += f"\n\n断面法（间距 {sections.spacing:g} m，{len(sections.sections)} 个断面）:"
+            for label, _, value, diff, relative in sections.comparison(self.result)[:2]:
+                percent = "" if relative is None else f"，{relative:+.2f}%"
+                summary += f"\n  {label} {value:.2f} m³（与 TIN 法相差 {diff:+.2f}{percent}）"
+            warnings += sections.warnings
         grid = self.result.grid_check
         if grid is not None:
             summary += f"\n\n方格网校核（边长 {grid.spacing:g} m）:"
@@ -871,10 +1097,26 @@ class CalculationFrame(ttk.Frame):
                 show_tin=self.show_tin_var.get(),
                 show_contour=self.show_contour_var.get(),
                 show_points=self.show_points_var.get(),
-                show_boundary=self.show_boundary_var.get()
+                show_boundary=self.show_boundary_var.get(),
+                show_levels=self.show_levels_var.get(),
             )
         else:
             self.plotter.plot_points_only(self.points)
+
+    def _open_3d_view(self):
+        """三维视图窗口：地面与设计面（后期面），可旋转、调高程夸张。"""
+        if self.result is None:
+            messagebox.showinfo("三维视图", "请先完成计算")
+            return
+        try:
+            natural, design = surface_faces(self.calculator)
+        except Exception as error:
+            messagebox.showerror("三维视图", f"无法生成三维面：{error}")
+            return
+        if self.view3d is not None and self.view3d.winfo_exists():
+            self.view3d.destroy()
+        self.view3d = View3DWindow(self, self.result, natural, design, self.calculator.origin,
+                                   self._project_name())
 
     def _reset_plot_view(self):
         self.plotter.reset_view()
@@ -988,13 +1230,17 @@ class CalculationFrame(ttk.Frame):
                     pass
                 setattr(self, attr_name, None)
 
-        if hasattr(self, "plotter"):
-            self.plotter.close()
-        if hasattr(self, "canvas"):
+        if self.view3d is not None:
             try:
-                self.canvas.get_tk_widget().destroy()
+                self.view3d.destroy()
             except tk.TclError:
                 pass
+            self.view3d = None
+        if hasattr(self, "plotter"):
+            self.plotter.close()
+        for name in ("canvas", "section_canvas"):
+            if hasattr(self, name):
+                cancel_idle_draw(getattr(self, name))
 
     # ------------------------------------------------------------------
     # 导出（后台线程执行，避免大数据量时界面无响应）

@@ -45,6 +45,10 @@ MODE_DESIGN = "design"
 MODE_COMPARE = "compare"
 # 两期对比时，后期测点在明细中的点号前缀；叠加产生的交点命名前缀
 COMPARE_ID_PREFIX = "后期-"
+# 比较面是设计三角网（设计点、设计等高线等）时，设计点在明细中的点号前缀
+DESIGN_TIN_ID_PREFIX = "设计-"
+COMPARE_PERIOD = "period"   # 两期对比：前期 − 后期
+COMPARE_DESIGN = "design"   # 设计三角网：实测 − 设计
 CROSSING_ID_PREFIX = "交点"
 
 
@@ -111,6 +115,13 @@ class CalculationResult:
     max_edge_length: Optional[float] = None                         # 三角网清理：剔除的最大边长
     trimmed_triangles: List[List[XY]] = field(default_factory=list)  # 因边长过大被剔除的三角形
     soil_balance: Optional[Any] = None    # 土方平衡（core.balance.SoilBalance）
+    contours: Optional[Any] = None        # 等高线（core.contours.ContourSet）
+    sections: Optional[Any] = None        # 断面法（core.sections.SectionResult）
+    compare_kind: str = COMPARE_PERIOD    # 三角网叠加时比较面的含义：后期测量或设计三角网
+
+    @property
+    def is_design_tin(self) -> bool:
+        return self.is_compare and self.compare_kind == COMPARE_DESIGN
 
     @property
     def is_compare(self) -> bool:
@@ -173,6 +184,7 @@ class TINEarthworkCalculator:
         self.design_overrides: Dict[str, float] = {}      # 分区：单独指定设计高程的点
         self.points: List[SurveyPoint] = []
         self.compare_points: List[SurveyPoint] = []       # 两期对比的后期测点；空表示与设计面比较
+        self.compare_kind = COMPARE_PERIOD                 # compare_points 是后期测量，还是设计三角网的点
         self.boundary_polygon: List[XY] = []
         self.triangles: List[Triangle] = []
         self.delaunay = None
@@ -233,9 +245,17 @@ class TINEarthworkCalculator:
         self.design_overrides = {str(key): float(value) for key, value in (overrides or {}).items()}
         self._apply_design()
 
-    def set_compare_points(self, points: Optional[Sequence[SurveyPoint]]):
-        """设置两期对比的后期测点；传空则回到与设计面比较。"""
+    def set_compare_points(self, points: Optional[Sequence[SurveyPoint]], kind: str = COMPARE_PERIOD):
+        """设置两期对比的后期测点；传空则回到与设计面比较。
+
+        kind=COMPARE_DESIGN 时这些点是设计面（设计点、设计等高线上的点）构成的设计三角网，
+        计算方法与两期对比相同，只是报告用语为“实测 − 设计”。
+        """
         self.compare_points = list(points or [])
+        self.compare_kind = kind if kind in (COMPARE_PERIOD, COMPARE_DESIGN) else COMPARE_PERIOD
+
+    def _period_labels(self) -> Tuple[str, str]:
+        return ("实测", "设计") if self.compare_kind == COMPARE_DESIGN else ("前期", "后期")
 
     def add_points(self, points: List[SurveyPoint]):
         """添加测量点。
@@ -441,13 +461,14 @@ class TINEarthworkCalculator:
     def _triangulate_compare(self):
         """前期、后期各自构网后叠加；叠加后的顶点 z 为前期高程，design_z 为后期高程。"""
         before, after = self.points, self.compare_points
+        first, second = self._period_labels()
         if len(after) < 3:
-            raise ValueError("后期测量至少需要 3 个测点")
-        self._check_finite(after, "后期")
+            raise ValueError(f"{second}三角网至少需要 3 个点")
+        self._check_finite(after, second)
         coords_a = np.array([[p.x, p.y] for p in before], dtype=float)
         coords_b = np.array([[p.x, p.y] for p in after], dtype=float)
-        unique_a = self._unique_point_indices(before, coords_a, "前期")
-        unique_b = self._unique_point_indices(after, coords_b, "后期")
+        unique_a = self._unique_point_indices(before, coords_a, first)
+        unique_b = self._unique_point_indices(after, coords_b, second)
         origin = np.minimum(coords_a[unique_a].min(axis=0), coords_b[unique_b].min(axis=0))
         self._origin = (float(origin[0]), float(origin[1]))
         local_a = coords_a - origin
@@ -470,7 +491,7 @@ class TINEarthworkCalculator:
             cells = [cell for cell in cells if not long_a[cell[1]] and not long_b[cell[2]]]
         if not cells:
             raise ValueError(
-                "前期和后期测量的范围没有重叠，无法对比。请检查两期坐标是否同一坐标系、X/Y 方向是否一致。"
+                f"{first}和{second}的范围没有重叠，无法对比。请检查坐标是否同一坐标系、X/Y 方向是否一致。"
             )
         planes_a = _triangle_planes(tri_a, np.array([before[i].z for i in unique_a])[tin_a.simplices])
         planes_b = _triangle_planes(tri_b, np.array([after[i].z for i in unique_b])[tin_b.simplices])
@@ -509,7 +530,7 @@ class TINEarthworkCalculator:
         # 与原测点重合的顶点沿用原点号，便于在明细中核对；其余为两期三角网边线的交点
         names: Dict[Tuple[int, int], str] = {}
         for index, row in zip(unique_b, np.round(local_b[unique_b] / key_tol).astype(np.int64).tolist()):
-            names[tuple(row)] = f"{COMPARE_ID_PREFIX}{after[index].id}"
+            names[tuple(row)] = f"{self._compare_prefix()}{after[index].id}"
         for index, row in zip(unique_a, np.round(local_a[unique_a] / key_tol).astype(np.int64).tolist()):
             names[tuple(row)] = str(before[index].id)
         ox, oy = self._origin
@@ -527,6 +548,9 @@ class TINEarthworkCalculator:
         hull_a = float(np.abs(_signed_areas(tri_a)).sum())
         self._overlap_ratio = float(areas[areas > area_tol].sum()) / hull_a if hull_a > 0 else None
         return vertex_points, vertex_xy, simplices_array
+
+    def _compare_prefix(self) -> str:
+        return DESIGN_TIN_ID_PREFIX if self.compare_kind == COMPARE_DESIGN else COMPARE_ID_PREFIX
 
     def _classify(self, vertex_points: List[SurveyPoint], local: np.ndarray, simplices: np.ndarray) -> List[Triangle]:
         self._regions = {}
@@ -661,13 +685,42 @@ class TINEarthworkCalculator:
 
         zero = zero_crossing_points(vertices, dz)
         if len(zero) == 2:
-            if region is not None:
-                segments = clip_segment_to_ring(zero[0], zero[1], self._ring)
-            else:
-                segments = [(zero[0], zero[1])]
-            for hole in self._hole_rings if tri.id in self._hole_regions else []:
-                segments = [part for a, b in segments for part in clip_segment_to_ring(a, b, hole, inside=False)]
-            tri.zero_segments = [tuple(self._to_global(segment)) for segment in segments]
+            tri.zero_segments = self.clip_to_region(tri, zero[0], zero[1])
+
+    def clip_to_region(self, tri: Triangle, start: XY, end: XY) -> List[Tuple[XY, XY]]:
+        """三角形内的线段（局部坐标）裁剪到计算范围（边界以内、挖空区以外），返回全局坐标。"""
+        segments = [(start, end)]
+        if tri.id in self._regions:
+            segments = clip_segment_to_ring(start, end, self._ring)
+        for hole in self._hole_rings if tri.id in self._hole_regions else []:
+            segments = [part for a, b in segments for part in clip_segment_to_ring(a, b, hole, inside=False)]
+        return [tuple(self._to_global(segment)) for segment in segments]
+
+    def level_segments(self, key: str, level: float) -> List[Tuple[XY, XY]]:
+        """计算范围内 key（"z" 实测/前期，"design_z" 设计/后期）等于 level 的线段，全局坐标。
+
+        须在 calculate_volumes() 之后调用；沿三角形边的线段只出现一次。
+        """
+        ox, oy = self._origin
+        segments: List[Tuple[XY, XY]] = []
+        seen = set()
+        for tri in self.triangles:
+            if tri.is_boundary:
+                continue
+            values = [getattr(p, key) - level for p in tri.vertex_points]
+            if min(values) > 0 or max(values) < 0:
+                continue
+            vertices = [(p.x - ox, p.y - oy) for p in tri.vertex_points]
+            crossing = zero_crossing_points(vertices, values)
+            if len(crossing) != 2:
+                continue
+            for a, b in self.clip_to_region(tri, crossing[0], crossing[1]):
+                edge = tuple(sorted(((round(a[0], 6), round(a[1], 6)), (round(b[0], 6), round(b[1], 6)))))
+                if edge[0] == edge[1] or edge in seen:
+                    continue
+                seen.add(edge)
+                segments.append((a, b))
+        return segments
 
     def _subtract_holes(self, tri: Triangle):
         """从三角形的方量中扣除落在挖空区内的部分（挖空区在计算边界之内，可直接相减）。"""
@@ -731,6 +784,7 @@ class TINEarthworkCalculator:
             designs = [pt.design_z for pt in self.points]
             result.design_min, result.design_max = min(designs), max(designs)
         result.mode = self.mode
+        result.compare_kind = self.compare_kind
         result.design_description = self._design_description()
         if self.compare_points:
             result.compare_point_count = len(self.compare_points)
@@ -743,6 +797,8 @@ class TINEarthworkCalculator:
         return result
 
     def _design_description(self) -> str:
+        if self.compare_points and self.compare_kind == COMPARE_DESIGN:
+            return f"设计三角网：由 {len(self.compare_points)} 个设计点构网作为设计面，高差 = 实测 − 设计"
         if self.compare_points:
             return f"两期对比：以后期测量（{len(self.compare_points)} 个点）为比较面，高差 = 前期 − 后期"
         if self.design_plane is not None:
@@ -756,9 +812,19 @@ class TINEarthworkCalculator:
     def _coverage_warnings(self, result: CalculationResult) -> List[str]:
         ratio = result.coverage_ratio
         compare = self.mode == MODE_COMPARE
-        covered = "两期测量共同覆盖的范围" if compare else "测点覆盖范围"
+        if not compare:
+            covered = "测点覆盖范围"
+        elif self.compare_kind == COMPARE_DESIGN:
+            covered = "实测与设计三角网共同覆盖的范围"
+        else:
+            covered = "两期测量共同覆盖的范围"
         if ratio is None:
             if compare and self._overlap_ratio is not None and self._overlap_ratio < COVERAGE_WARN_RATIO:
+                if self.compare_kind == COMPARE_DESIGN:
+                    return [
+                        f"设计三角网只覆盖了实测范围的 {self._overlap_ratio * 100:.1f}%，"
+                        "只计算两者都有点的部分。需要计算整个场地时，请补充设计点或设置计算边界。"
+                    ]
                 return [
                     f"后期测量只覆盖了前期测量范围的 {self._overlap_ratio * 100:.1f}%，"
                     "只计算两期都有测点的部分。需要对比整个场地时，请补测或设置计算边界。"

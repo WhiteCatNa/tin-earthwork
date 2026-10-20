@@ -21,7 +21,17 @@ from utils.fileio import atomic_write_text
 from version import __version__
 
 def report_labels(result: CalculationResult) -> Dict[str, str]:
-    """报告用语：与设计面比较，或两期对比。"""
+    """报告用语：与设计面比较、与设计三角网比较，或两期对比。"""
+    if result.is_design_tin:
+        return {
+            "natural": "实测高程",
+            "design": "设计高程",
+            "design_item": "设计面",
+            "cut": "实测高于设计面部分",
+            "fill": "实测低于设计面部分",
+            "method": "设计三角网叠加（实测、设计两个三角网精确求交，边界精确裁剪）",
+            "covered": "实测与设计三角网共同覆盖",
+        }
     if result.is_compare:
         return {
             "natural": "前期高程",
@@ -506,17 +516,22 @@ class DataExporter:
             rows.append(['测点覆盖率', round(result.coverage_ratio * 100, 2), '%', '低于 99.5% 时请核对边界'])
         if result.holes:
             rows.append(['挖空区', len(result.holes), '个', f'面积 {result.hole_area:.3f} m²，不计方量'])
+        if result.contours is not None:
+            rows.append(['等高线', f'等高距 {result.contours.interval:g} m', '',
+                         f'地面 {len(result.contours.natural)} 条、'
+                         f'{"后期" if result.is_compare and not result.is_design_tin else "设计面"} '
+                         f'{len(result.contours.design)} 条，见 DXF'])
         if result.trimmed_triangles:
             rows.append(['剔除长边三角形', len(result.trimmed_triangles), '个',
                          f'边长超过 {result.max_edge_length:g} m，不计方量'])
         if result.design_description:
             # 斜面、两期对比的说明较长：数值列写类型，完整说明放在说明列
-            short = "两期对比" if result.is_compare else result.design_description.split("：", 1)[0]
+            short = result.design_description.split("：", 1)[0]
             rows.append([labels["design_item"], short, '', result.design_description])
         else:
             rows.append([labels["design_item"], result.design_text, '', ''])
         if result.is_compare:
-            rows.append(['后期测点数', result.compare_point_count, '个', ''])
+            rows.append(['设计点数' if result.is_design_tin else '后期测点数', result.compare_point_count, '个', ''])
         rows += [
             ['三角形数', result.triangle_count, '个',
              '两期三角网叠加后的计算单元' if result.is_compare else '参与计算的三角形'],
@@ -525,6 +540,15 @@ class DataExporter:
         ]
         if result.soil_balance is not None:
             rows += result.soil_balance.rows()
+        sections = result.sections
+        if sections is not None:
+            comparison = {label: (diff, relative) for label, _, _, diff, relative in sections.comparison(result)}
+            rows += [
+                ['断面法', f'间距 {sections.spacing:g} m', '',
+                 f'{len(sections.sections)} 个断面，推进方向 {sections.angle:g}°，平均断面法'],
+                ['断面法挖方', round(sections.total_cut, 3), 'm³', f'与 TIN 法相差 {_percent(comparison["挖方"][1])}'],
+                ['断面法填方', round(sections.total_fill, 3), 'm³', f'与 TIN 法相差 {_percent(comparison["填方"][1])}'],
+            ]
         grid = result.grid_check
         if grid is not None:
             comparison = {label: (diff, relative) for label, _, _, diff, relative in grid.comparison(result)}
@@ -638,6 +662,28 @@ class DataExporter:
             for row in self.grid_cell_rows(result):
                 ws6.append(row)
 
+        sections = result.sections
+        if sections is not None:
+            ws7 = wb.create_sheet("断面法")
+            for column, width in zip("ABCDEFGH", (10, 14, 16, 16, 14, 16, 16, 30)):
+                ws7.column_dimensions[column].width = width
+            ws7.append([bold(ws7, f"断面法（间距 {sections.spacing:g} m，推进方向 {sections.angle:g}°，平均断面法）", 12)])
+            ws7.append([])
+            header(ws7, ["项目", "TIN 法", "断面法", "差值", "相对差"])
+            for label, tin_value, value, diff, relative in sections.comparison(result):
+                ws7.append([label, round(tin_value, 3), round(value, 3), round(diff, 3), _percent(relative)])
+            ws7.append([])
+            header(ws7, ["断面", "里程(m)", "挖方面积(m²)", "填方面积(m²)", "至下一断面(m)",
+                         "区间挖方(m³)", "区间填方(m³)", "断面起点 X, Y"])
+            for k, section in enumerate(sections.sections):
+                interval = sections.volumes[k] if k < len(sections.volumes) else ("", "", "")
+                ws7.append([section.index, round(section.station, 3), round(section.cut_area, 3),
+                            round(section.fill_area, 3),
+                            *[round(value, 3) if value != "" else "" for value in interval],
+                            f"{section.start[0]:.3f}, {section.start[1]:.3f}"])
+            for warning in sections.warnings:
+                ws7.append(["提示", warning])
+
         # 先完整写入内存再落盘：目标文件被占用时不会留下半成品和临时文件
         buffer = io.BytesIO()
         wb.save(buffer)
@@ -666,16 +712,24 @@ class DataExporter:
                 parts.append(self._dxf_polyline("ZERO_CONTOUR", polyline, closed=False))
         if result.grid_check is not None:
             parts.extend(self._dxf_grid(result.grid_check))
+        if result.contours is not None:
+            parts.extend(self._dxf_contours(result))
+        if result.sections is not None:
+            size = max(result.sections.spacing * 0.15, 0.3)
+            for section in result.sections.sections:
+                parts.append(self._dxf_polyline("SECTION", [section.start, section.end], closed=False))
+                parts.append(self._dxf_text("SECTION", section.start[0], section.start[1], size, f"{section.index}"))
         parts.append("0\nENDSEC\n0\nEOF\n")
         with open(filepath, "w", encoding="utf-8") as handle:
             handle.write("".join(parts))
         return True
 
     @staticmethod
-    def _dxf_polyline(layer: str, points, closed: bool) -> str:
-        lines = [f"0\nPOLYLINE\n8\n{layer}\n66\n1\n10\n0.0\n20\n0.0\n30\n0.0\n70\n{1 if closed else 0}\n"]
+    def _dxf_polyline(layer: str, points, closed: bool, elevation: float = 0.0) -> str:
+        z = repr(float(elevation))
+        lines = [f"0\nPOLYLINE\n8\n{layer}\n66\n1\n10\n0.0\n20\n0.0\n30\n{z}\n70\n{1 if closed else 0}\n"]
         for x, y in points:
-            lines.append(f"0\nVERTEX\n8\n{layer}\n10\n{float(x)!r}\n20\n{float(y)!r}\n30\n0.0\n")
+            lines.append(f"0\nVERTEX\n8\n{layer}\n10\n{float(x)!r}\n20\n{float(y)!r}\n30\n{z}\n")
         lines.append(f"0\nSEQEND\n8\n{layer}\n")
         return "".join(lines)
 
@@ -717,6 +771,25 @@ class DataExporter:
             parts.append(cls._dxf_text("GRID_VOLUME", cx - a * 0.3, cy, size, text))
         return parts
 
+    @classmethod
+    def _dxf_contours(cls, result: CalculationResult) -> List[str]:
+        """等高线：多段线标高即等高线高程，可直接在 CAD/CASS 中当作等高线使用。
+
+        地面等高线在 CONTOUR（首曲线）/ CONTOUR_MAJOR（计曲线），设计面（两期对比时为后期地面）
+        在 DESIGN_CONTOUR / DESIGN_CONTOUR_MAJOR；计曲线中部标注高程（CONTOUR_LABEL）。
+        """
+        contours = result.contours
+        size = max(contours.interval * 0.5, 0.2)
+        parts: List[str] = []
+        for prefix, items in (("", contours.natural), ("DESIGN_", contours.design)):
+            for contour in items:
+                layer = f"{prefix}CONTOUR_MAJOR" if contour.major else f"{prefix}CONTOUR"
+                parts.append(cls._dxf_polyline(layer, contour.polyline, closed=False, elevation=contour.level))
+                if contour.major:
+                    x, y = contour.polyline[len(contour.polyline) // 2]
+                    parts.append(cls._dxf_text(f"{prefix}CONTOUR_LABEL", x, y, size, f"{contour.level:g}"))
+        return parts
+
     def generate_report_text(self, result: CalculationResult, point_count: int) -> str:
         """生成文本报告"""
         labels = report_labels(result)
@@ -741,7 +814,16 @@ class DataExporter:
             )
         warnings = "\n".join(f"- {item}" for item in result.warnings) or "无"
         point_lines = f"测量点数: {point_count}"
-        if result.is_compare:
+        if result.is_design_tin:
+            point_lines = f"实测点数: {point_count}\n设计点数: {result.compare_point_count}"
+            notes = (
+                "1. 实测点、设计点分别构建TIN三角网，两网精确叠加后，每个计算单元内实测地面和设计面均为平面。\n"
+                "2. 高差 = 实测高程 − 设计高程；正为挖方，负为填方。\n"
+                "3. 跨越计算边界的单元按边界精确裁剪；只计算实测与设计三角网都覆盖的部分。\n"
+                "4. 混合挖填单元已按零填挖线分割计算，避免正负高差抵消。\n"
+                "5. 计算结果仅供工程参考，正式计量请以复核成果为准。"
+            )
+        elif result.is_compare:
             point_lines = f"前期测点数: {point_count}\n后期测点数: {result.compare_point_count}"
             notes = (
                 "1. 前期、后期测点分别构建TIN三角网，两网精确叠加后，每个计算单元内两期地面均为平面。\n"
@@ -758,6 +840,15 @@ class DataExporter:
                 "4. 所有三角形均保留面积、顶点高程、高差及分项体积，可逐项复核。\n"
                 "5. 计算结果仅供工程参考，正式计量请以复核成果为准。"
             )
+        section_text = ""
+        if result.sections is not None:
+            lines = [f"断面间距 {result.sections.spacing:g} m，推进方向 {result.sections.angle:g}°，"
+                     f"共 {len(result.sections.sections)} 个断面，平均断面法"]
+            for label, tin_value, value, diff, relative in result.sections.comparison(result):
+                lines.append(f"{label}: 断面法 {value:.3f} m³，TIN 法 {tin_value:.3f} m³，"
+                             f"相差 {diff:+.3f} m³（{_percent(relative)}）")
+            lines += [f"- {item}" for item in result.sections.warnings]
+            section_text = "\n【断面法校核】\n" + "\n".join(lines) + "\n"
         balance_section = ""
         if result.soil_balance is not None:
             balance_section = "\n【土方平衡】\n" + "\n".join(
@@ -800,7 +891,7 @@ class DataExporter:
 总填方量: {result.total_fill:.3f} m³
 挖填差值: {result.net_volume:.3f} m³
 {balance}
-{balance_section}{grid_section}
+{balance_section}{section_text}{grid_section}
 【计算提示】
 {warnings}
 
@@ -842,11 +933,15 @@ class DataExporter:
 
             figure = create_standalone_figure(result, points, boundary, self.project_name)
             pdf.savefig(figure)
+            if result.sections is not None:
+                from utils.plotter import create_section_pages
+                for page in create_section_pages(result, self.project_name):
+                    pdf.savefig(page)
         return True
 
 
 PROJECT_FORMAT_VERSION = 2
-DESIGN_MODES = ("flat", "plane", "compare")
+DESIGN_MODES = ("flat", "plane", "compare", "design_tin")
 
 
 def _point_rows(points: List[SurveyPoint]) -> List[Dict[str, Any]]:
@@ -895,9 +990,16 @@ def save_project(
     design_plane: Optional[Dict[str, float]] = None,
     compare_points: Optional[List[SurveyPoint]] = None,
     compare_source: str = "",
+    design_points: Optional[List[SurveyPoint]] = None,
+    design_source: str = "",
     holes: Optional[List[List[Tuple[float, float]]]] = None,
     max_edge_length: Optional[float] = None,
     soil_factors: Optional[Dict[str, float]] = None,
+    contours_enabled: bool = True,
+    contour_interval: Optional[float] = None,
+    sections_enabled: bool = False,
+    section_spacing: Optional[float] = None,
+    section_angle: float = 0.0,
     grid_enabled: bool = False,
     grid_spacing: Optional[float] = None,
 ) -> None:
@@ -920,6 +1022,13 @@ def save_project(
         "holes": [[[float(x), float(y)] for x, y in hole] for hole in (holes or [])],
         "max_edge_length": None if not max_edge_length else float(max_edge_length),
         "soil_factors": {key: float(value) for key, value in (soil_factors or {}).items()} or None,
+        "contours": {"enabled": bool(contours_enabled),
+                     "interval": None if not contour_interval else float(contour_interval)},
+        "design_points": _point_rows(design_points or []),
+        "design_source": design_source,
+        "sections": {"enabled": bool(sections_enabled),
+                     "spacing": None if not section_spacing else float(section_spacing),
+                     "angle": float(section_angle or 0.0)},
         "points": _point_rows(points),
         "compare_points": _point_rows(compare_points or []),
     }
@@ -955,6 +1064,13 @@ def load_project(filepath: str) -> Dict[str, Any]:
         "holes": [[(float(x), float(y)) for x, y in hole] for hole in (payload.get("holes") or [])],
         "max_edge_length": None if not payload.get("max_edge_length") else float(payload["max_edge_length"]),
         "soil_factors": payload.get("soil_factors") or None,
+        "contours_enabled": bool((payload.get("contours") or {"enabled": True}).get("enabled", True)),
+        "contour_interval": (payload.get("contours") or {}).get("interval") or None,
+        "design_points": _points_from_rows(payload.get("design_points")),
+        "design_source": payload.get("design_source") or "",
+        "sections_enabled": bool((payload.get("sections") or {}).get("enabled")),
+        "section_spacing": (payload.get("sections") or {}).get("spacing") or None,
+        "section_angle": float((payload.get("sections") or {}).get("angle") or 0.0),
         "points": _points_from_rows(payload.get("points")),
         "compare_points": compare_points,
     }
