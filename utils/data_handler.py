@@ -57,6 +57,10 @@ def _percent(value: Optional[float]) -> str:
     return "—" if value is None else f"{value:+.2f}%"
 
 
+def _half_percent(value: Optional[float]) -> str:
+    return "—" if value is None else f"± {value:.2f}%"
+
+
 ISSUE_NAMES = {
     'missing_values': '缺失值',
     'duplicate_coords': '重复坐标',
@@ -567,6 +571,15 @@ class DataExporter:
             rows.append(['分层土方', layers.title, '', f'{len(layers.rows)} 层'])
             for row in layers.rows:
                 rows.append([f'  {row.label(layers.mode)}', f'挖 {row.cut:.3f} / 填 {row.fill:.3f}', 'm³', ''])
+        uncertainty = result.uncertainty
+        if uncertainty is not None:
+            rows.append(['不确定度评定', f'测量中误差 {uncertainty.sigma_measure:g} m', '',
+                         f'抽稀外推 {uncertainty.repeats} 次；修正后估计 ± 95% 区间半宽'])
+            for label, _, estimate, half, pct in uncertainty.rows():
+                rows.append([f'  {label}', f'{estimate:.3f} ± {half:.3f}', 'm³', _half_percent(pct)])
+            if uncertainty.recommendations:
+                rows.append(['  推荐补测点', len(uncertainty.recommendations), '个',
+                             f'内插误差指标可降至 {uncertainty.recommendations[-1].remaining:.0%}'])
         grid = result.grid_check
         if grid is not None:
             comparison = {label: (diff, relative) for label, _, _, diff, relative in grid.comparison(result)}
@@ -713,6 +726,30 @@ class DataExporter:
             for row in layers.rows:
                 ws8.append([row.label(layers.mode), round(row.cut, 3), round(row.fill, 3)])
             ws8.append(["合计", round(layers.total_cut, 3), round(layers.total_fill, 3)])
+
+        uncertainty = result.uncertainty
+        if uncertainty is not None:
+            ws9 = wb.create_sheet("不确定度评定")
+            for column, width in zip("ABCDEF", (16, 16, 16, 18, 14, 40)):
+                ws9.column_dimensions[column].width = width
+            ws9.append([bold(ws9, "土方量不确定度评定", 12)])
+            ws9.append([f"测量中误差 {uncertainty.sigma_measure:g} m，系统误差 {uncertainty.sigma_bias:g} m，"
+                        f"抽稀外推 {uncertainty.repeats} 次"])
+            ws9.append([])
+            header(ws9, ["项目", "TIN 法(m³)", "修正后估计(m³)", "95% 区间半宽(m³)", "半宽占比", "其中内插 / 测量 1σ(m³)"])
+            for (label, tin, estimate, half, pct), interp, measure in zip(
+                    uncertainty.rows(), uncertainty.interp_sigma, uncertainty.measure_sigma):
+                ws9.append([label, round(tin, 3), round(estimate, 3), round(half, 3), _half_percent(pct),
+                            f"{interp:.3f} / {measure:.3f}"])
+            if uncertainty.recommendations:
+                ws9.append([])
+                ws9.append([bold(ws9, "推荐补测点（按收益从大到小）", 11)])
+                header(ws9, ["序号", "X", "Y", "误差指标减少(m³)", "补到此点后剩余"])
+                for k, item in enumerate(uncertainty.recommendations, 1):
+                    ws9.append([f"R{k}", round(item.x, 3), round(item.y, 3), round(item.reduction, 3),
+                                f"{item.remaining:.0%}"])
+            for warning in uncertainty.warnings:
+                ws9.append(["提示", warning])
 
         # 先完整写入内存再落盘：目标文件被占用时不会留下半成品和临时文件
         buffer = io.BytesIO()
@@ -883,6 +920,15 @@ class DataExporter:
             section_text += "\n【分层土方】\n" + result.layers.title + "\n" + "\n".join(
                 f"{row.label(result.layers.mode)}: 挖方 {row.cut:.3f} m³，填方 {row.fill:.3f} m³"
                 for row in result.layers.rows) + "\n"
+        if result.uncertainty is not None:
+            uncertainty = result.uncertainty
+            lines = [f"测量中误差 {uncertainty.sigma_measure:g} m，抽稀外推 {uncertainty.repeats} 次（修正后估计 ± 95% 区间半宽）"]
+            lines += [f"{label}: TIN 法 {tin:.3f} m³，修正后 {estimate:.3f} ± {half:.3f} m³（{_half_percent(pct)}）"
+                      for label, tin, estimate, half, pct in uncertainty.rows()]
+            lines += [f"推荐补测点 R{k}: X={item.x:.3f}, Y={item.y:.3f}"
+                      for k, item in enumerate(uncertainty.recommendations, 1)]
+            lines += [f"- {item}" for item in uncertainty.warnings]
+            section_text += "\n【不确定度评定】\n" + "\n".join(lines) + "\n"
         balance_section = ""
         if result.soil_balance is not None:
             balance_section = "\n【土方平衡】\n" + "\n".join(
@@ -1039,6 +1085,7 @@ def save_project(
     section_angle: float = 0.0,
     layers: Optional[Dict[str, Any]] = None,
     slope_design: Optional[Dict[str, Any]] = None,
+    uncertainty: Optional[Dict[str, Any]] = None,
     grid_enabled: bool = False,
     grid_spacing: Optional[float] = None,
 ) -> None:
@@ -1070,6 +1117,7 @@ def save_project(
                      "angle": float(section_angle or 0.0)},
         "layers": layers or None,
         "slope_design": slope_design or None,
+        "uncertainty": uncertainty or None,
         "points": _point_rows(points),
         "compare_points": _point_rows(compare_points or []),
     }
@@ -1114,6 +1162,7 @@ def load_project(filepath: str) -> Dict[str, Any]:
         "section_angle": float((payload.get("sections") or {}).get("angle") or 0.0),
         "layers": payload.get("layers") or None,
         "slope_design": payload.get("slope_design") or None,
+        "uncertainty": payload.get("uncertainty") or None,
         "points": _points_from_rows(payload.get("points")),
         "compare_points": compare_points,
     }

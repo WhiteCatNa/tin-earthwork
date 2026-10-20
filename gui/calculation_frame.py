@@ -16,6 +16,8 @@ from core.surface import PlaneDesign
 from utils.view3d import surface_faces
 from gui.view3d_window import View3DWindow, cancel_idle_draw
 from gui.haul_window import HaulWindow
+from gui.uncertainty_window import UncertaintyWindow
+from core.uncertainty import evaluate_uncertainty
 from gui.slope_window import SlopeWindow
 from core.slope import Platform
 from utils.plotter import EarthworkPlotter, create_standalone_figure, draw_section
@@ -74,6 +76,9 @@ class CalculationFrame(ttk.Frame):
         self.layers_enabled_var = tk.BooleanVar(value=False)
         self.layer_mode_var = tk.StringVar(value=LAYER_ELEVATION)
         self.layer_values_var = tk.StringVar(value="")
+        self.uncertainty_enabled_var = tk.BooleanVar(value=False)
+        self.sigma_measure_var = tk.StringVar(value="0.02")
+        self.recommend_var = tk.StringVar(value="20")
         self.loose_var = tk.StringVar(value="1.0")
         self.compact_var = tk.StringVar(value="1.0")
         self._balance_thread = None
@@ -94,6 +99,7 @@ class CalculationFrame(ttk.Frame):
         self.view3d = None
         self.haul_window = None
         self.slope_window = None
+        self.uncertainty_window = None
         self.slope_platforms: List[Platform] = []
         self.slope_spacing: Optional[float] = None
 
@@ -132,7 +138,8 @@ class CalculationFrame(ttk.Frame):
                               contours_enabled: bool = True, contour_interval: Optional[float] = None,
                               sections_enabled: bool = False, section_spacing: Optional[float] = None,
                               section_angle: float = 0.0, layers: Optional[Dict[str, Any]] = None,
-                              slope_design: Optional[Dict[str, Any]] = None):
+                              slope_design: Optional[Dict[str, Any]] = None,
+                              uncertainty: Optional[Dict[str, Any]] = None):
         """恢复工程文件中的比较面、分区、后期测点、方格网、三角网清理和可松性系数设置。"""
         self.design_elevation_var.set(design_elevation)
         self.use_partition_var.set(bool(use_partition))
@@ -163,6 +170,10 @@ class CalculationFrame(ttk.Frame):
         self.layers_enabled_var.set(bool(layers.get("enabled")))
         self.layer_mode_var.set(layers.get("mode") if layers.get("mode") in LAYER_MODES else LAYER_ELEVATION)
         self.layer_values_var.set(str(layers.get("values") or ""))
+        uncertainty = uncertainty or {}
+        self.uncertainty_enabled_var.set(bool(uncertainty.get("enabled")))
+        self.sigma_measure_var.set(f"{uncertainty.get('sigma_measure', 0.02):g}")
+        self.recommend_var.set(str(int(uncertainty.get("recommend", 20))))
         factors = SoilFactors.from_dict(soil_factors)
         self.loose_var.set(f"{factors.loose:g}")
         self.compact_var.set(f"{factors.compact:g}")
@@ -217,6 +228,7 @@ class CalculationFrame(ttk.Frame):
             "contour_interval": self.contour_interval_value(),
             **self._section_settings(),
             **self._layer_settings(),
+            **self._uncertainty_settings(),
             "slope_design": ({"platforms": [p.to_dict() for p in self.slope_platforms], "spacing": self.slope_spacing}
                              if self.slope_platforms else None),
         }
@@ -286,6 +298,29 @@ class CalculationFrame(ttk.Frame):
         if not enabled and not text:
             return {"layers": None}
         return {"layers": {"enabled": enabled, "mode": self.layer_mode_var.get(), "values": text}}
+
+    def uncertainty_values(self) -> Tuple[float, int]:
+        """(测量中误差 m, 推荐补测点数)。"""
+        try:
+            sigma = float(self.sigma_measure_var.get())
+        except ValueError:
+            raise ValueError("测量中误差必须是数字") from None
+        if not math.isfinite(sigma) or sigma < 0 or sigma > 1:
+            raise ValueError("测量中误差应在 0~1 m 之间")
+        try:
+            count = int(self.recommend_var.get().strip() or 0)
+        except ValueError:
+            raise ValueError("推荐补测点数必须是整数") from None
+        if count < 0 or count > 1000:
+            raise ValueError("推荐补测点数应在 0~1000 之间")
+        return sigma, count
+
+    def _uncertainty_settings(self) -> Dict[str, Any]:
+        enabled = bool(self.uncertainty_enabled_var.get())
+        if not enabled:
+            return {"uncertainty": None}
+        sigma, count = self.uncertainty_values()
+        return {"uncertainty": {"enabled": True, "sigma_measure": sigma, "recommend": count}}
 
     def contour_interval_value(self) -> Optional[float]:
         """等高距；空为自动。"""
@@ -550,6 +585,16 @@ class CalculationFrame(ttk.Frame):
         ttk.Entry(layer_values, textvariable=self.layer_values_var, width=16).pack(side=tk.LEFT, padx=4)
         ttk.Label(layer_values, text="高程或深度 (m)，逗号分隔", style="Muted.TLabel").pack(side=tk.LEFT)
 
+        # 不确定度评定
+        ttk.Separator(body, orient='horizontal').pack(fill=tk.X, pady=8)
+        ttk.Checkbutton(body, text="不确定度评定与补测点推荐", variable=self.uncertainty_enabled_var).pack(anchor=tk.W)
+        uncertainty_row = ttk.Frame(body)
+        uncertainty_row.pack(fill=tk.X, pady=(2, 0))
+        ttk.Label(uncertainty_row, text="测量中误差 (m)").pack(side=tk.LEFT)
+        ttk.Entry(uncertainty_row, textvariable=self.sigma_measure_var, width=6).pack(side=tk.LEFT, padx=4)
+        ttk.Label(uncertainty_row, text="补测点数").pack(side=tk.LEFT, padx=(6, 4))
+        ttk.Entry(uncertainty_row, textvariable=self.recommend_var, width=5).pack(side=tk.LEFT)
+
         # 三角网清理
         ttk.Separator(body, orient='horizontal').pack(fill=tk.X, pady=8)
         trim_row = ttk.Frame(body)
@@ -616,6 +661,7 @@ class CalculationFrame(ttk.Frame):
         ttk.Button(corner, text="三维视图…", command=self._open_3d_view).pack(side=tk.LEFT, padx=(6, 0))
         ttk.Button(corner, text="土方调配…", command=self._open_haul).pack(side=tk.LEFT, padx=(6, 0))
         ttk.Button(corner, text="场地放坡…", command=self._open_slope).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(corner, text="不确定度…", command=self._open_uncertainty).pack(side=tk.LEFT, padx=(6, 0))
         self.plotter.on_triangle_click = self._on_triangle_selected
         
         # 选项卡2：汇总表
@@ -981,6 +1027,7 @@ class CalculationFrame(ttk.Frame):
             contour_interval = self.contour_interval_value()
             section = self.section_values() if self.sections_enabled_var.get() else None
             layer_spec = self.layer_values() if self.layers_enabled_var.get() else None
+            uncertainty_spec = self.uncertainty_values() if self.uncertainty_enabled_var.get() else None
         except ValueError as error:
             messagebox.showerror("输入错误", str(error))
             return
@@ -1042,6 +1089,13 @@ class CalculationFrame(ttk.Frame):
                         result.layers = run_layers(calculator, *layer_spec)
                     except ValueError as error:
                         result.warnings.append(f"分层土方未完成：{error}")
+                if uncertainty_spec is not None:
+                    self._worker_events.put(("progress", 74, "不确定度评定（抽稀重算）..."))
+                    try:
+                        result.uncertainty = evaluate_uncertainty(calculator, result, uncertainty_spec[0],
+                                                                  recommend=uncertainty_spec[1])
+                    except ValueError as error:
+                        result.warnings.append(f"不确定度评定未完成：{error}")
                 if grid_spacing is not None:
                     self._worker_events.put(("progress", 75, "方格网校核..."))
                     try:
@@ -1132,6 +1186,14 @@ class CalculationFrame(ttk.Frame):
             summary += f"\n\n分层土方（{'按高程' if layers.mode == LAYER_ELEVATION else '按深度'}）:"
             for row in layers.rows:
                 summary += f"\n  {row.label(layers.mode)}: 挖 {row.cut:.2f}，填 {row.fill:.2f} m³"
+        uncertainty = self.result.uncertainty
+        if uncertainty is not None:
+            summary += "\n\n不确定度评定（修正后估计 ± 95% 区间半宽）:"
+            for label, _, estimate, half, _ in uncertainty.rows():
+                summary += f"\n  {label} {estimate:.2f} ± {half:.2f} m³"
+            if uncertainty.recommendations:
+                summary += f"\n  推荐补测 {len(uncertainty.recommendations)} 点，见“不确定度…”"
+            warnings += uncertainty.warnings
         grid = self.result.grid_check
         if grid is not None:
             summary += f"\n\n方格网校核（边长 {grid.spacing:g} m）:"
@@ -1195,6 +1257,26 @@ class CalculationFrame(ttk.Frame):
         if self.haul_window is not None and self.haul_window.winfo_exists():
             self.haul_window.destroy()
         self.haul_window = HaulWindow(self, self.calculator, compact, self._project_name())
+
+    def _open_uncertainty(self):
+        """不确定度窗口：内插误差分布与推荐补测点。没评定过时用当前设置补算一次。"""
+        if self.result is None:
+            messagebox.showinfo("不确定度", "请先完成计算")
+            return
+        if self.result.uncertainty is None:
+            try:
+                sigma, count = self.uncertainty_values()
+                self.config(cursor="watch")
+                self.update_idletasks()
+                self.result.uncertainty = evaluate_uncertainty(self.calculator, self.result, sigma, recommend=count)
+            except ValueError as error:
+                messagebox.showerror("不确定度", str(error))
+                return
+            finally:
+                self.config(cursor="")
+        if self.uncertainty_window is not None and self.uncertainty_window.winfo_exists():
+            self.uncertainty_window.destroy()
+        self.uncertainty_window = UncertaintyWindow(self, self.result, self._project_name())
 
     def _open_slope(self):
         """场地放坡窗口：平台 + 自动放坡，不依赖当前计算结果。"""
@@ -1325,7 +1407,7 @@ class CalculationFrame(ttk.Frame):
                     pass
                 setattr(self, attr_name, None)
 
-        for name in ("view3d", "haul_window", "slope_window"):
+        for name in ("view3d", "haul_window", "slope_window", "uncertainty_window"):
             window = getattr(self, name)
             if window is not None:
                 try:

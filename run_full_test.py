@@ -23,6 +23,7 @@ from core.haul import run_haul
 from core.layers import run_layers
 from core.slope import Platform, run_slope
 from core.surface import PlaneDesign
+from core.uncertainty import evaluate_uncertainty
 from utils.data_handler import DataImporter, DataExporter
 
 
@@ -68,7 +69,7 @@ def run_full_pipeline(output_dir="."):
 
     points = generate_test_data()
     excel_path = save_test_excel(points, output_dir / "test_data_1000.xlsx")
-    print(f"\n[1/12] 生成测试数据: {excel_path} ({len(points)} 点)")
+    print(f"\n[1/13] 生成测试数据: {excel_path} ({len(points)} 点)")
 
     imported_points, issues, _ = DataImporter.import_file(excel_path)
     _require(len(imported_points) == len(points), "导入点数与生成点数不一致")
@@ -79,10 +80,10 @@ def run_full_pipeline(output_dir="."):
     _require(not blocking_issues, f"导入数据存在阻断问题: {blocking_issues}")
     if issues["coord_outliers"] or issues["elevation_outliers"]:
         print("    导入质量检查提示：检测到统计离群值，继续使用确定性测试数据。")
-    print(f"[2/12] 导入并验证通过: {len(imported_points)} 点")
+    print(f"[2/13] 导入并验证通过: {len(imported_points)} 点")
 
     boundary = [(0, 0), (200, 0), (200, 150), (0, 150)]
-    print(f"[3/12] 设置矩形边界: {len(boundary)} 点")
+    print(f"[3/13] 设置矩形边界: {len(boundary)} 点")
 
     design_elevation = 50.0
     calc = TINEarthworkCalculator(design_elevation)
@@ -91,7 +92,7 @@ def run_full_pipeline(output_dir="."):
     result = calc.run_full_calculation()
     _require(result.triangle_count > 0, "边界内没有可计算三角形")
     _require(abs(result.computed_area - 200 * 150) < 1e-6 or result.warnings, "计算面积与边界面积不符且没有提示")
-    print(f"[4/12] 计算通过: {result.triangle_count} 个三角形，计算面积 {result.computed_area:.1f} m²")
+    print(f"[4/13] 计算通过: {result.triangle_count} 个三角形，计算面积 {result.computed_area:.1f} m²")
     for warning in result.warnings:
         print(f"    提示: {warning}")
 
@@ -107,7 +108,7 @@ def run_full_pipeline(output_dir="."):
     _require(txt_path.is_file() and txt_path.stat().st_size > 0, "文本报告为空")
     _require(load_workbook(report_path).sheetnames == ["土方量汇总表", "三角形计算明细", "异常数据检查"], "Excel 工作表不完整")
     _require(not pd.read_csv(csv_path, encoding="utf-8-sig").empty, "CSV 明细没有数据")
-    print(f"[5/12] Excel/CSV/文本报告导出通过")
+    print(f"[5/13] Excel/CSV/文本报告导出通过")
 
     # 斜面设计面：地形起伏很小时，设计面抬高 0.1 m 的斜面净方量应接近 −面积×(平均高差)
     plane = PlaneDesign(x0=100.0, y0=75.0, h0=50.0, slope_x=0.5, slope_y=-0.3)
@@ -115,7 +116,7 @@ def run_full_pipeline(output_dir="."):
     plane_result = calc.run_full_calculation()
     _require(plane_result.total_cut > 0 and plane_result.total_fill > 0, "斜面设计面计算结果异常")
     _require("斜面" in plane_result.design_text, "斜面设计面说明缺失")
-    print(f"[6/12] 斜面设计面计算通过: 挖方 {plane_result.total_cut:.1f} m³，填方 {plane_result.total_fill:.1f} m³")
+    print(f"[6/13] 斜面设计面计算通过: 挖方 {plane_result.total_cut:.1f} m³，填方 {plane_result.total_fill:.1f} m³")
 
     # 挖空区 + 挖填平衡：考虑可松性系数时，平衡标高下挖方自然方恰好够回填
     calc.set_holes([[(40, 40), (80, 40), (80, 70), (40, 70)]])
@@ -129,7 +130,7 @@ def run_full_pipeline(output_dir="."):
     _require(abs(result.computed_area - balanced.computed_area - 1200) < 1e-6, "挖空区面积未扣除")
     _require(abs(best.cut - best.fill / factors.compact) < 1.0, "最优斜面未挖填平衡")
     calc.set_holes([])
-    print(f"[7/12] 挖空区与挖填平衡通过: 平衡标高 {flat.elevation:.4f} m，"
+    print(f"[7/13] 挖空区与挖填平衡通过: 平衡标高 {flat.elevation:.4f} m，"
           f"最优斜面坡度 {best.plane.slope_x:+.3f}% / {best.plane.slope_y:+.3f}%")
 
     # 两期对比：后期在前期基础上整体下挖约 0.5 m，测点位置不同
@@ -141,7 +142,7 @@ def run_full_pipeline(output_dir="."):
     _require(compare.total_cut > compare.total_fill * 10, "两期对比：整体下挖时挖方应远大于填方")
     mean_cut = compare.net_volume / compare.computed_area
     _require(0.3 < mean_cut < 0.7, f"两期对比平均下挖深度 {mean_cut:.3f} m 不在预期范围")
-    print(f"[8/12] 两期对比通过: 后期 {len(after)} 点，挖方 {compare.total_cut:.1f} m³，平均下挖 {mean_cut:.3f} m")
+    print(f"[8/13] 两期对比通过: 后期 {len(after)} 点，挖方 {compare.total_cut:.1f} m³，平均下挖 {mean_cut:.3f} m")
 
     # 等高线、断面法；同一批后期测点作为“设计三角网”时方量应与两期对比完全一致
     compare.contours = trace_contours(calc, 0.5)
@@ -155,7 +156,7 @@ def run_full_pipeline(output_dir="."):
              "设计三角网与两期对比方量不一致")
     calc.set_compare_points(after)
     calc.run_full_calculation()
-    print(f"[9/12] 等高线（{len(compare.contours.natural)} 条）、断面法（{len(compare.sections.sections)} 个断面，"
+    print(f"[9/13] 等高线（{len(compare.contours.natural)} 条）、断面法（{len(compare.sections.sections)} 个断面，"
           f"净方量相差 {section_relative:.2%}）、设计三角网通过")
 
     # 方格网校核并导出全部格式
@@ -175,7 +176,7 @@ def run_full_pipeline(output_dir="."):
     dxf_text = compare_dxf.read_text(encoding="utf-8")
     _require("GRID_HEIGHT" in dxf_text and "CONTOUR" in dxf_text and "SECTION" in dxf_text, "DXF 缺少方格网、等高线或断面线")
     _require(compare_pdf.read_bytes().startswith(b"%PDF"), "PDF 计算书无效")
-    print(f"[10/12] 方格网校核（边长 10 m，{len(grid.cells)} 格，净方量相差 {relative:.2%}）与导出通过")
+    print(f"[10/13] 方格网校核（边长 10 m，{len(grid.cells)} 格，净方量相差 {relative:.2%}）与导出通过")
     # 分层土方、土方调配、场地放坡
     calc.set_compare_points(None)
     calc.set_design_elevation(design_elevation)
@@ -188,9 +189,13 @@ def run_full_pipeline(output_dir="."):
     platform = Platform("平台", [(60, 45), (140, 45), (140, 105), (60, 105)], design_elevation, 1.0, 1.5)
     slope = run_slope(imported_points, [platform])
     _require(slope.total_cut >= slope.platform_cut and slope.total_fill >= slope.platform_fill, "放坡方量小于平台方量")
-    print(f"[11/12] 分层土方（{len(layers.rows)} 层）、土方调配（{len(haul.zones)} 区，平均运距 {haul.average_distance:.1f} m）、"
+    print(f"[11/13] 分层土方（{len(layers.rows)} 层）、土方调配（{len(haul.zones)} 区，平均运距 {haul.average_distance:.1f} m）、"
           f"场地放坡（挖 {slope.total_cut:.1f} / 填 {slope.total_fill:.1f} m³）通过")
-    print(f"[12/12] 全流程通过，输出目录: {output_dir}")
+    uncertainty = evaluate_uncertainty(calc, flat_result, sigma_measure=0.02, recommend=10)
+    estimate, half = uncertainty.estimate[2], uncertainty.rows()[2][3]
+    _require(half > 0 and len(uncertainty.recommendations) == 10, "不确定度评定或补测点推荐未完成")
+    print(f"[12/13] 不确定度评定：挖填差值 {estimate:.1f} ± {half:.1f} m³（95%），推荐补测 {len(uncertainty.recommendations)} 点")
+    print(f"[13/13] 全流程通过，输出目录: {output_dir}")
     return result
 
 

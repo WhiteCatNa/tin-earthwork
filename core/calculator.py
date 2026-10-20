@@ -118,6 +118,7 @@ class CalculationResult:
     contours: Optional[Any] = None        # 等高线（core.contours.ContourSet）
     sections: Optional[Any] = None        # 断面法（core.sections.SectionResult）
     layers: Optional[Any] = None          # 分层土方（core.layers.LayerResult）
+    uncertainty: Optional[Any] = None     # 不确定度评定（core.uncertainty.UncertaintyResult）
     compare_kind: str = COMPARE_PERIOD    # 三角网叠加时比较面的含义：后期测量或设计三角网
 
     @property

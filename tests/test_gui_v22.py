@@ -201,3 +201,29 @@ def test_slope_window_and_project(app, tmp_path, monkeypatch):
     platform = app.calc_frame.slope_platforms[0]
     assert (platform.elevation, platform.fill_ratio) == (11.0, 2.0)
     assert app.calc_frame.slope_spacing == 1.0
+
+
+def test_uncertainty_in_gui_and_project(app, tmp_path, monkeypatch):
+    cf = _load(app, draw_hole=False)
+    cf.design_elevation_var.set(10.5)
+    cf.uncertainty_enabled_var.set(True)
+    cf.sigma_measure_var.set("0.01")
+    cf.recommend_var.set("3")
+    result = _calculate(app, cf)
+    assert result.uncertainty is not None and result.uncertainty.sigma_measure == 0.01
+    rows = [cf.tree_summary.item(i)["values"][0] for i in cf.tree_summary.get_children()]
+    assert "不确定度评定" in rows
+    cf._open_uncertainty()
+    window = cf.uncertainty_window
+    assert window is not None and window.winfo_exists()
+    assert len(window.result_tree.get_children()) == 3
+    window.destroy()
+
+    path = tmp_path / "u.tinproj.json"
+    app.save_project_to(str(path))
+    app.load_project_from(str(path))
+    cf = app.calc_frame
+    assert cf.uncertainty_enabled_var.get() and cf.recommend_var.get() == "3"
+    cf.sigma_measure_var.set("-1")
+    with pytest.raises(ValueError):
+        cf.uncertainty_values()
