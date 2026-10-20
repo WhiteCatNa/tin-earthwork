@@ -258,6 +258,19 @@ class DataImporter:
                         continue
                 else:
                     raise ValueError("无法识别CSV编码")
+            elif suffix in ['.dxf', '.las']:
+                # 地形图（高程点、注记、等高线）或点云：按默认选项取点，界面上可先选图层、抽稀方式
+                from utils import terrain_import
+                if suffix == '.dxf':
+                    sources = terrain_import.scan_dxf_terrain(filepath)
+                    if not sources:
+                        raise ValueError("DXF 中没有找到高程点、高程注记或带标高的等高线")
+                    points = terrain_import.build_terrain_points(
+                        sources, terrain_import.default_selection(sources)).points
+                else:
+                    cloud = terrain_import.read_las(filepath)
+                    points = terrain_import.cloud_points(cloud, terrain_import.suggest_cell(cloud.xyz))
+                return points, DataValidator.validate_points(points), terrain_import.points_frame(points)
             elif suffix in ['.txt', '.dat']:
                 points, format_errors, df = DataImporter.import_survey_text(
                     filepath, cass=(suffix == '.dat')

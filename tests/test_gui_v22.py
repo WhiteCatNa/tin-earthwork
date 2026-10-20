@@ -96,3 +96,55 @@ def test_layers_in_gui_and_project(app, tmp_path):
     finally:
         mb.showerror = original
     assert errors and "大于 0" in errors[0]
+
+
+def test_import_contour_dxf_and_las(app, tmp_path, monkeypatch):
+    from tests.test_terrain_import import _dxf, _lw, _write_las
+    infos = []
+    monkeypatch.setattr("tkinter.messagebox.showinfo", lambda title, msg, **k: infos.append(msg))
+    monkeypatch.setattr("tkinter.messagebox.showwarning", lambda title, msg, **k: infos.append(msg))
+    frame = app.import_frame
+    path = tmp_path / "dgx.dxf"
+    path.write_text(_dxf("".join(_lw("DGX", 10 + k, [(10 * k, 0), (10 * k, 20)]) for k in range(3))),
+                    encoding="utf-8")
+    seen = {}
+    frame.ask_dxf_options = lambda parent, sources: seen.setdefault("dxf", ([True] * len(sources), 2.0))
+    frame.file_var.set(str(path))
+    frame._import_file()
+    assert len(frame.points) == 33 and "33 个" in infos[-1]          # 每条线 11 点
+    assert frame.column_mapping.get("z") == "Z"
+
+    las = tmp_path / "c.las"
+    _write_las(las, [(1000 + i, 2000 + j, 5.0) for i in range(10) for j in range(10)], [2] * 100)
+    frame.ask_las_options = lambda parent, cloud: (2.0, "lowest", True)
+    frame.file_var.set(str(las))
+    frame._import_file()
+    assert len(frame.points) == 25
+
+    frame.ask_las_options = lambda parent, cloud: None              # 取消
+    frame._import_file()
+    assert len(frame.points) == 25
+
+
+def test_terrain_dialogs(app, tmp_path):
+    import numpy as np
+    from gui.terrain_dialog import DxfTerrainDialog, LasDialog
+    from utils.terrain_import import KIND_CONTOUR, KIND_POINT, LasCloud, TerrainSource
+    sources = [TerrainSource("GCD", KIND_POINT, points=[(0, 0, 1)]),
+               TerrainSource("DGX", KIND_CONTOUR, lines=[[(0, 0, 2), (1, 0, 2)]])]
+    dialog = DxfTerrainDialog(app, sources)
+    dialog.spacing_var.set("abc")
+    dialog.ok()
+    assert dialog.result is None
+    dialog.vars[0].set(False)
+    dialog.spacing_var.set("2.5")
+    dialog.ok()
+    assert dialog.result == ([False, True], 2.5)
+
+    cloud = LasCloud(np.array([(0, 0, 1), (100, 100, 2)], dtype=float), np.array([1, 1]), "1.2", 1)
+    dialog = LasDialog(app, cloud)
+    assert not dialog.ground_var.get()
+    dialog.cell_var.set("5")
+    dialog.method_var.set("center")
+    dialog.ok()
+    assert dialog.result == (5.0, "center", False)
