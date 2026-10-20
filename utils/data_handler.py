@@ -895,13 +895,13 @@ def save_project(
     design_plane: Optional[Dict[str, float]] = None,
     compare_points: Optional[List[SurveyPoint]] = None,
     compare_source: str = "",
-    grid_enabled: bool = False,
-    grid_spacing: Optional[float] = None,
     holes: Optional[List[List[Tuple[float, float]]]] = None,
     max_edge_length: Optional[float] = None,
     soil_factors: Optional[Dict[str, float]] = None,
+    grid_enabled: bool = False,
+    grid_spacing: Optional[float] = None,
 ) -> None:
-    """保存可再次打开的工程文件（测点、边界、挖空区、设计面、后期测点、方格网、三角网清理、可松性系数）。"""
+    """保存可再次打开的工程文件（测点、边界、设计面、后期测点、方格网设置）。"""
     if design_mode not in DESIGN_MODES:
         raise ValueError(f"未知的设计面类型: {design_mode}")
     payload = {
