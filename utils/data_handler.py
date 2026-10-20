@@ -549,6 +549,11 @@ class DataExporter:
                 ['断面法挖方', round(sections.total_cut, 3), 'm³', f'与 TIN 法相差 {_percent(comparison["挖方"][1])}'],
                 ['断面法填方', round(sections.total_fill, 3), 'm³', f'与 TIN 法相差 {_percent(comparison["填方"][1])}'],
             ]
+        layers = result.layers
+        if layers is not None:
+            rows.append(['分层土方', layers.title, '', f'{len(layers.rows)} 层'])
+            for row in layers.rows:
+                rows.append([f'  {row.label(layers.mode)}', f'挖 {row.cut:.3f} / 填 {row.fill:.3f}', 'm³', ''])
         grid = result.grid_check
         if grid is not None:
             comparison = {label: (diff, relative) for label, _, _, diff, relative in grid.comparison(result)}
@@ -683,6 +688,18 @@ class DataExporter:
                             f"{section.start[0]:.3f}, {section.start[1]:.3f}"])
             for warning in sections.warnings:
                 ws7.append(["提示", warning])
+
+        layers = result.layers
+        if layers is not None:
+            ws8 = wb.create_sheet("分层土方")
+            for column, width in zip("ABC", (28, 16, 16)):
+                ws8.column_dimensions[column].width = width
+            ws8.append([bold(ws8, f"分层土方（{layers.title}）", 12)])
+            ws8.append([])
+            header(ws8, ["分层", "挖方(m³)", "填方(m³)"])
+            for row in layers.rows:
+                ws8.append([row.label(layers.mode), round(row.cut, 3), round(row.fill, 3)])
+            ws8.append(["合计", round(layers.total_cut, 3), round(layers.total_fill, 3)])
 
         # 先完整写入内存再落盘：目标文件被占用时不会留下半成品和临时文件
         buffer = io.BytesIO()
@@ -849,6 +866,10 @@ class DataExporter:
                              f"相差 {diff:+.3f} m³（{_percent(relative)}）")
             lines += [f"- {item}" for item in result.sections.warnings]
             section_text = "\n【断面法校核】\n" + "\n".join(lines) + "\n"
+        if result.layers is not None:
+            section_text += "\n【分层土方】\n" + result.layers.title + "\n" + "\n".join(
+                f"{row.label(result.layers.mode)}: 挖方 {row.cut:.3f} m³，填方 {row.fill:.3f} m³"
+                for row in result.layers.rows) + "\n"
         balance_section = ""
         if result.soil_balance is not None:
             balance_section = "\n【土方平衡】\n" + "\n".join(
@@ -1003,6 +1024,8 @@ def save_project(
     sections_enabled: bool = False,
     section_spacing: Optional[float] = None,
     section_angle: float = 0.0,
+    layers: Optional[Dict[str, Any]] = None,
+    slope_design: Optional[Dict[str, Any]] = None,
     grid_enabled: bool = False,
     grid_spacing: Optional[float] = None,
 ) -> None:
@@ -1032,6 +1055,8 @@ def save_project(
         "sections": {"enabled": bool(sections_enabled),
                      "spacing": None if not section_spacing else float(section_spacing),
                      "angle": float(section_angle or 0.0)},
+        "layers": layers or None,
+        "slope_design": slope_design or None,
         "points": _point_rows(points),
         "compare_points": _point_rows(compare_points or []),
     }
@@ -1074,6 +1099,8 @@ def load_project(filepath: str) -> Dict[str, Any]:
         "sections_enabled": bool((payload.get("sections") or {}).get("enabled")),
         "section_spacing": (payload.get("sections") or {}).get("spacing") or None,
         "section_angle": float((payload.get("sections") or {}).get("angle") or 0.0),
+        "layers": payload.get("layers") or None,
+        "slope_design": payload.get("slope_design") or None,
         "points": _points_from_rows(payload.get("points")),
         "compare_points": compare_points,
     }

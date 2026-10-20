@@ -10,6 +10,7 @@ from core.balance import SoilFactors, balance_elevation, balance_plane, best_fit
 from core.calculator import COMPARE_DESIGN, SurveyPoint, CalculationResult, TINEarthworkCalculator, format_id_list
 from core.contours import trace_contours
 from core.sections import run_sections
+from core.layers import LAYER_DEPTH, LAYER_ELEVATION, LAYER_MODES, parse_layer_values, run_layers
 from core.grid_check import run_grid_check, suggest_spacing
 from core.surface import PlaneDesign
 from utils.view3d import surface_faces
@@ -67,6 +68,9 @@ class CalculationFrame(ttk.Frame):
         self.sections_enabled_var = tk.BooleanVar(value=False)
         self.section_spacing_var = tk.StringVar(value=f"{self._suggested_spacing():g}")
         self.section_angle_var = tk.StringVar(value="0")
+        self.layers_enabled_var = tk.BooleanVar(value=False)
+        self.layer_mode_var = tk.StringVar(value=LAYER_ELEVATION)
+        self.layer_values_var = tk.StringVar(value="")
         self.loose_var = tk.StringVar(value="1.0")
         self.compact_var = tk.StringVar(value="1.0")
         self._balance_thread = None
@@ -120,7 +124,7 @@ class CalculationFrame(ttk.Frame):
                               soil_factors: Optional[Dict[str, float]] = None,
                               contours_enabled: bool = True, contour_interval: Optional[float] = None,
                               sections_enabled: bool = False, section_spacing: Optional[float] = None,
-                              section_angle: float = 0.0):
+                              section_angle: float = 0.0, layers: Optional[Dict[str, Any]] = None):
         """恢复工程文件中的比较面、分区、后期测点、方格网、三角网清理和可松性系数设置。"""
         self.design_elevation_var.set(design_elevation)
         self.use_partition_var.set(bool(use_partition))
@@ -144,6 +148,10 @@ class CalculationFrame(ttk.Frame):
         if section_spacing:
             self.section_spacing_var.set(f"{section_spacing:g}")
         self.section_angle_var.set(f"{section_angle or 0:g}")
+        layers = layers or {}
+        self.layers_enabled_var.set(bool(layers.get("enabled")))
+        self.layer_mode_var.set(layers.get("mode") if layers.get("mode") in LAYER_MODES else LAYER_ELEVATION)
+        self.layer_values_var.set(str(layers.get("values") or ""))
         factors = SoilFactors.from_dict(soil_factors)
         self.loose_var.set(f"{factors.loose:g}")
         self.compact_var.set(f"{factors.compact:g}")
@@ -197,6 +205,7 @@ class CalculationFrame(ttk.Frame):
             "contours_enabled": bool(self.contours_enabled_var.get()),
             "contour_interval": self.contour_interval_value(),
             **self._section_settings(),
+            **self._layer_settings(),
         }
 
     def plane_value(self) -> PlaneDesign:
@@ -250,6 +259,20 @@ class CalculationFrame(ttk.Frame):
                 raise
             spacing, angle = None, 0.0
         return {"sections_enabled": enabled, "section_spacing": spacing, "section_angle": angle}
+
+    def layer_values(self) -> Tuple[str, List[float]]:
+        """(分层方式, 分界值)。"""
+        mode = self.layer_mode_var.get()
+        return mode, parse_layer_values(self.layer_values_var.get(), mode)
+
+    def _layer_settings(self) -> Dict[str, Any]:
+        enabled = bool(self.layers_enabled_var.get())
+        text = self.layer_values_var.get().strip()
+        if enabled:
+            self.layer_values()
+        if not enabled and not text:
+            return {"layers": None}
+        return {"layers": {"enabled": enabled, "mode": self.layer_mode_var.get(), "values": text}}
 
     def contour_interval_value(self) -> Optional[float]:
         """等高距；空为自动。"""
@@ -499,6 +522,20 @@ class CalculationFrame(ttk.Frame):
         ttk.Label(angle_row, text="推进方向 (°)").pack(side=tk.LEFT)
         ttk.Entry(angle_row, textvariable=self.section_angle_var, width=6).pack(side=tk.LEFT, padx=4)
         ttk.Label(angle_row, text="0 沿 X，90 沿 Y", style="Muted.TLabel").pack(side=tk.LEFT)
+
+        # 分层土方
+        ttk.Separator(body, orient='horizontal').pack(fill=tk.X, pady=8)
+        layer_row = ttk.Frame(body)
+        layer_row.pack(fill=tk.X)
+        ttk.Checkbutton(layer_row, text="分层土方", variable=self.layers_enabled_var).pack(side=tk.LEFT)
+        for value, text in ((LAYER_ELEVATION, "按高程"), (LAYER_DEPTH, "按深度")):
+            ttk.Radiobutton(layer_row, text=text, value=value, variable=self.layer_mode_var).pack(
+                side=tk.LEFT, padx=(8, 0))
+        layer_values = ttk.Frame(body)
+        layer_values.pack(fill=tk.X, pady=(2, 0))
+        ttk.Label(layer_values, text="分界").pack(side=tk.LEFT)
+        ttk.Entry(layer_values, textvariable=self.layer_values_var, width=16).pack(side=tk.LEFT, padx=4)
+        ttk.Label(layer_values, text="高程或深度 (m)，逗号分隔", style="Muted.TLabel").pack(side=tk.LEFT)
 
         # 三角网清理
         ttk.Separator(body, orient='horizontal').pack(fill=tk.X, pady=8)
@@ -928,6 +965,7 @@ class CalculationFrame(ttk.Frame):
             factors = self.soil_factors_value()
             contour_interval = self.contour_interval_value()
             section = self.section_values() if self.sections_enabled_var.get() else None
+            layer_spec = self.layer_values() if self.layers_enabled_var.get() else None
         except ValueError as error:
             messagebox.showerror("输入错误", str(error))
             return
@@ -983,6 +1021,12 @@ class CalculationFrame(ttk.Frame):
                         result.sections = run_sections(calculator, result, *section)
                     except ValueError as error:
                         result.warnings.append(f"断面法未完成：{error}")
+                if layer_spec is not None:
+                    self._worker_events.put(("progress", 72, "分层土方..."))
+                    try:
+                        result.layers = run_layers(calculator, *layer_spec)
+                    except ValueError as error:
+                        result.warnings.append(f"分层土方未完成：{error}")
                 if grid_spacing is not None:
                     self._worker_events.put(("progress", 75, "方格网校核..."))
                     try:
@@ -1068,6 +1112,11 @@ class CalculationFrame(ttk.Frame):
                 percent = "" if relative is None else f"，{relative:+.2f}%"
                 summary += f"\n  {label} {value:.2f} m³（与 TIN 法相差 {diff:+.2f}{percent}）"
             warnings += sections.warnings
+        layers = self.result.layers
+        if layers is not None:
+            summary += f"\n\n分层土方（{'按高程' if layers.mode == LAYER_ELEVATION else '按深度'}）:"
+            for row in layers.rows:
+                summary += f"\n  {row.label(layers.mode)}: 挖 {row.cut:.2f}，填 {row.fill:.2f} m³"
         grid = self.result.grid_check
         if grid is not None:
             summary += f"\n\n方格网校核（边长 {grid.spacing:g} m）:"

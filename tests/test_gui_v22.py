@@ -66,3 +66,33 @@ def test_three_d_view(app):
     window.redraw()
     assert "0.1~100" in window.status_var.get()
     window.destroy()
+
+
+def test_layers_in_gui_and_project(app, tmp_path):
+    cf = _load(app, draw_hole=False)
+    cf.design_elevation_var.set(11.0)
+    cf.layers_enabled_var.set(True)
+    cf.layer_mode_var.set("depth")
+    cf.layer_values_var.set("0.5")
+    result = _calculate(app, cf)
+    assert [row.cut for row in result.layers.rows] == pytest.approx([75, 25], abs=1e-9)
+    rows = [cf.tree_summary.item(i)["values"][0] for i in cf.tree_summary.get_children()]
+    assert "分层土方" in rows
+
+    path = tmp_path / "layers.tinproj.json"
+    app.save_project_to(str(path))
+    app.load_project_from(str(path))
+    cf = app.calc_frame
+    assert cf.layers_enabled_var.get() and cf.layer_mode_var.get() == "depth"
+    assert cf.layer_values_var.get() == "0.5"
+
+    cf.layer_values_var.set("-1")
+    errors = []
+    import tkinter.messagebox as mb
+    original = mb.showerror
+    mb.showerror = lambda title, msg, **k: errors.append(msg)
+    try:
+        cf._run_calculation()
+    finally:
+        mb.showerror = original
+    assert errors and "大于 0" in errors[0]
