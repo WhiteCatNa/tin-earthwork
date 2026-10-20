@@ -414,8 +414,10 @@ class EarthworkPlotter:
 
     def plot_boundary_edit(self, points: List[SurveyPoint], 
                            boundary: List[Tuple[float, float]],
-                           current_point: Optional[Tuple[float, float]] = None):
-        """边界编辑模式绘制"""
+                           current_point: Optional[Tuple[float, float]] = None,
+                           holes: Optional[List[List[Tuple[float, float]]]] = None,
+                           drawing_hole: Optional[List[Tuple[float, float]]] = None):
+        """边界编辑模式绘制。holes 为已完成的挖空区，drawing_hole 为正在绘制的挖空区。"""
         self._remove_colorbar()
         self.ax.clear()
         self._style_axes()
@@ -450,6 +452,20 @@ class EarthworkPlotter:
                     alpha=0.5,
                 )
                            
+        if holes:
+            self.ax.add_collection(PolyCollection(
+                holes, facecolor='none', edgecolor=self.colors['boundary'], hatch='//', linewidth=1.5,
+            ))
+            self.ax.plot([], [], color=self.colors['boundary'], linewidth=1.5, label=f'挖空区 {len(holes)} 个')
+        if drawing_hole:
+            hx = [p[0] for p in drawing_hole]
+            hy = [p[1] for p in drawing_hole]
+            self.ax.plot(hx, hy, color=self.colors['cut'], marker='s', linewidth=2, markersize=5,
+                         label='正在绘制的挖空区')
+            if len(drawing_hole) >= 2:
+                self.ax.plot([hx[-1], hx[0]], [hy[-1], hy[0]], color=self.colors['cut'],
+                             linestyle='--', linewidth=1, alpha=0.5)
+
         # 当前正在添加的点由可复用 artist 绘制，避免鼠标移动时不断创建新对象。
                            
         self.ax.set_aspect('equal')
@@ -576,6 +592,14 @@ def draw_result(ax, result: CalculationResult, points: List[SurveyPoint],
         if clip_patch is not None:
             tin.set_clip_path(clip_patch)
         artists["tin"] = tin
+
+    if result.holes:
+        # 挖空区盖在挖填色块和三角网上，表示这里不计方量
+        holes = PolyCollection(result.holes, facecolor=COLORS["sheet"], edgecolor=colors['boundary'],
+                               hatch='//', linewidth=1.2 if fine else 1.5, zorder=4)
+        ax.add_collection(holes)
+        artists["legend"].append(Patch(facecolor=COLORS["sheet"], edgecolor=colors['boundary'], hatch='//',
+                                       label='挖空区（不计）'))
 
     if zero:
         artists["zero"] = LineCollection(zero, colors=colors['zero'], linewidths=1.5 if fine else 2, zorder=6)

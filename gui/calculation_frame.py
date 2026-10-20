@@ -6,6 +6,7 @@ import os
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from typing import Any, List, Callable, Optional, Dict, Tuple
+from core.balance import SoilFactors, balance_elevation, balance_plane, best_fit_plane, soil_balance
 from core.calculator import SurveyPoint, CalculationResult, TINEarthworkCalculator, format_id_list
 from core.grid_check import run_grid_check, suggest_spacing
 from core.surface import PlaneDesign
@@ -27,14 +28,17 @@ class CalculationFrame(ttk.Frame):
     """计算设置与结果页面"""
     
     def __init__(self, parent, points: List[SurveyPoint], boundary: List[Tuple[float, float]],
-                 project_name_getter: Optional[Callable[[], str]] = None):
+                 project_name_getter: Optional[Callable[[], str]] = None,
+                 holes: Optional[List[List[Tuple[float, float]]]] = None):
         super().__init__(parent)
         self.project_name_getter = project_name_getter
         self.points = points
         self.boundary = boundary
+        self.holes = list(holes or [])
         self.calculator = TINEarthworkCalculator()
         self.calculator.add_points(points)
         self.calculator.set_boundary(boundary)
+        self.calculator.set_holes(self.holes)
         self.result: Optional[CalculationResult] = None
         self.design_elevation_var = tk.DoubleVar(value=self.calculator.design_elevation)
         imported_design = [point for point in points if point.has_design_z]
@@ -49,6 +53,13 @@ class CalculationFrame(ttk.Frame):
         self.compare_source = ""
         self.grid_enabled_var = tk.BooleanVar(value=False)
         self.grid_spacing_var = tk.StringVar(value=f"{self._suggested_spacing():g}")
+        self.trim_enabled_var = tk.BooleanVar(value=False)
+        self.max_edge_var = tk.StringVar(value=f"{self._suggested_max_edge():g}")
+        self.loose_var = tk.StringVar(value="1.0")
+        self.compact_var = tk.StringVar(value="1.0")
+        self._balance_thread = None
+        self._balance_events = queue.Queue()
+        self._balance_poll_after_id = None
         self._detail_rows = []
         self._detail_load_after_id = None
         self._detail_batch_size = 200
@@ -75,20 +86,25 @@ class CalculationFrame(ttk.Frame):
         except (tk.TclError, ValueError):
             raise ValueError("统一设计高程必须是数字") from None
 
-    def update_inputs(self, points: List[SurveyPoint], boundary: List[Tuple[float, float]]):
-        """测点或边界变化后调用：同步计算器并作废旧结果。"""
+    def update_inputs(self, points: List[SurveyPoint], boundary: List[Tuple[float, float]],
+                      holes: Optional[List[List[Tuple[float, float]]]] = None):
+        """测点、边界或挖空区变化后调用：同步计算器并作废旧结果。"""
         self.points = points
         self.boundary = boundary
+        self.holes = list(holes or [])
         self.calculator.add_points(points)
         self.calculator.set_boundary(boundary)
+        self.calculator.set_holes(self.holes)
         self.result = None
         self._refresh_plot()
 
     def apply_design_settings(self, design_elevation: float, use_partition: bool, partition: Dict[str, float],
                               design_mode: str = "flat", design_plane: Optional[Dict[str, float]] = None,
                               compare_points: Optional[List[SurveyPoint]] = None, compare_source: str = "",
-                              grid_enabled: bool = False, grid_spacing: Optional[float] = None):
-        """恢复工程文件中的比较面、分区、后期测点和方格网设置。"""
+                              grid_enabled: bool = False, grid_spacing: Optional[float] = None,
+                              max_edge_length: Optional[float] = None,
+                              soil_factors: Optional[Dict[str, float]] = None):
+        """恢复工程文件中的比较面、分区、后期测点、方格网、三角网清理和可松性系数设置。"""
         self.design_elevation_var.set(design_elevation)
         self.use_partition_var.set(bool(use_partition))
         self.partition_data = dict(partition or {})
@@ -101,6 +117,12 @@ class CalculationFrame(ttk.Frame):
         self.grid_enabled_var.set(bool(grid_enabled))
         if grid_spacing:
             self.grid_spacing_var.set(f"{grid_spacing:g}")
+        self.trim_enabled_var.set(bool(max_edge_length))
+        if max_edge_length:
+            self.max_edge_var.set(f"{max_edge_length:g}")
+        factors = SoilFactors.from_dict(soil_factors)
+        self.loose_var.set(f"{factors.loose:g}")
+        self.compact_var.set(f"{factors.compact:g}")
         self.design_mode_var.set(design_mode if design_mode in dict(MODE_LABELS) else "flat")
         self._on_mode_change()
         overrides = self.partition_data if self.use_partition_var.get() else {}
@@ -132,6 +154,8 @@ class CalculationFrame(ttk.Frame):
         except ValueError:
             if self.grid_enabled_var.get():
                 raise
+        max_edge = self.max_edge_value() if self.trim_enabled_var.get() else None
+        factors = self.soil_factors_value()
         return {
             "design_mode": mode,
             "design_elevation": self.design_elevation_value(),
@@ -142,6 +166,8 @@ class CalculationFrame(ttk.Frame):
             "compare_source": self.compare_source,
             "grid_enabled": bool(self.grid_enabled_var.get()),
             "grid_spacing": spacing,
+            "max_edge_length": max_edge,
+            "soil_factors": None if factors.is_default else factors.to_dict(),
         }
 
     def plane_value(self) -> PlaneDesign:
@@ -163,6 +189,33 @@ class CalculationFrame(ttk.Frame):
         if not math.isfinite(spacing) or spacing <= 0:
             raise ValueError("方格边长必须大于 0")
         return spacing
+
+    def max_edge_value(self) -> float:
+        try:
+            length = float(self.max_edge_var.get())
+        except ValueError:
+            raise ValueError("最大边长必须是数字") from None
+        if not math.isfinite(length) or length <= 0:
+            raise ValueError("最大边长必须大于 0")
+        return length
+
+    def soil_factors_value(self) -> SoilFactors:
+        values = []
+        for var, name in ((self.loose_var, "最初可松性系数 Ks"), (self.compact_var, "最终可松性系数 Ks'")):
+            try:
+                values.append(float(var.get()))
+            except ValueError:
+                raise ValueError(f"{name}必须是数字") from None
+        return SoilFactors(*values).validate()
+
+    def _suggested_max_edge(self) -> float:
+        """建议的最大边长：测点平均间距的 5 倍，取整到 5 m。"""
+        extent = self._site_extent()
+        if extent is None or len(self.points) < 3:
+            return 50.0
+        xmin, ymin, xmax, ymax = extent
+        spacing = math.sqrt(max((xmax - xmin) * (ymax - ymin), 1e-9) / len(self.points))
+        return max(5.0, round(spacing * 5 / 5) * 5)
 
     def _site_extent(self) -> Optional[Tuple[float, float, float, float]]:
         coords = list(self.boundary) or [(p.x, p.y) for p in self.points]
@@ -246,6 +299,7 @@ class CalculationFrame(ttk.Frame):
         ttk.Label(self.flat_frame, text="设计高程 (m)").pack(side=tk.LEFT)
         ttk.Entry(self.flat_frame, textvariable=self.design_elevation_var, width=10).pack(side=tk.LEFT, padx=6)
         ttk.Button(self.flat_frame, text="从数据估算", command=self._estimate_elevation).pack(side=tk.LEFT)
+        ttk.Button(self.flat_frame, text="挖填平衡", command=self._balance_flat).pack(side=tk.LEFT, padx=(6, 0))
 
         self.plane_frame = ttk.Frame(self.mode_container)
         positions = {"x0": (0, 0), "y0": (0, 1), "h0": (1, 0), "slope_x": (2, 0), "slope_y": (2, 1)}
@@ -259,6 +313,10 @@ class CalculationFrame(ttk.Frame):
             row=1, column=2, columnspan=2, sticky="ew", pady=2)
         ttk.Label(self.plane_frame, text="坡度沿 +X / +Y 方向升高为正", style="Muted.TLabel").grid(
             row=3, column=0, columnspan=4, sticky="w")
+        ttk.Button(self.plane_frame, text="按坡度求平衡 H0", command=self._balance_plane).grid(
+            row=4, column=0, columnspan=2, sticky="ew", pady=(4, 0), padx=(0, 4))
+        ttk.Button(self.plane_frame, text="最小二乘最优斜面", command=self._best_fit_plane).grid(
+            row=4, column=2, columnspan=2, sticky="ew", pady=(4, 0))
 
         self.compare_frame = ttk.Frame(self.mode_container)
         compare_buttons = ttk.Frame(self.compare_frame)
@@ -290,6 +348,26 @@ class CalculationFrame(ttk.Frame):
         widest = max(frame.winfo_reqwidth() for frame in (self.flat_frame, self.plane_frame, self.compare_frame))
         ttk.Frame(self.mode_container, width=widest, height=1).pack(side=tk.BOTTOM)
         self._on_mode_change()
+
+        # 土方平衡：可松性系数
+        ttk.Separator(body, orient='horizontal').pack(fill=tk.X, pady=8)
+        ttk.Label(body, text="土方平衡", style="Title.TLabel").pack(anchor=tk.W, pady=(0, 4))
+        factor_row = ttk.Frame(body)
+        factor_row.pack(fill=tk.X)
+        ttk.Label(factor_row, text="Ks").pack(side=tk.LEFT)
+        ttk.Entry(factor_row, textvariable=self.loose_var, width=6).pack(side=tk.LEFT, padx=(4, 12))
+        ttk.Label(factor_row, text="Ks'").pack(side=tk.LEFT)
+        ttk.Entry(factor_row, textvariable=self.compact_var, width=6).pack(side=tk.LEFT, padx=4)
+        ttk.Label(body, text="Ks = 松方/自然方，Ks' = 压实方/自然方\n都填 1 表示不换算",
+                  style="Muted.TLabel").pack(anchor=tk.W)
+
+        # 三角网清理
+        ttk.Separator(body, orient='horizontal').pack(fill=tk.X, pady=8)
+        trim_row = ttk.Frame(body)
+        trim_row.pack(fill=tk.X)
+        ttk.Checkbutton(trim_row, text="剔除长边三角形", variable=self.trim_enabled_var).pack(side=tk.LEFT)
+        ttk.Label(trim_row, text="边长 > (m)").pack(side=tk.LEFT, padx=(10, 4))
+        ttk.Entry(trim_row, textvariable=self.max_edge_var, width=6).pack(side=tk.LEFT)
 
         # 方格网校核
         ttk.Separator(body, orient='horizontal').pack(fill=tk.X, pady=8)
@@ -462,6 +540,125 @@ class CalculationFrame(ttk.Frame):
         self.set_compare_points(swapped, self.compare_source)
         self.compare_label.config(text=self.compare_label.cget("text") + "，已互换 X/Y")
 
+    # ------------------------------------------------------------------
+    # 挖填平衡的设计标高、最优斜面（后台计算，完成后填入输入框）
+    # ------------------------------------------------------------------
+
+    def _balance_inputs(self):
+        """读取平衡计算需要的设置并同步到计算器；输入有误时提示并返回 None。"""
+        if not self.points:
+            messagebox.showwarning("提示", "没有可计算的测量点")
+            return None
+        if self._balance_thread is not None:
+            messagebox.showinfo("提示", "上一次平衡计算还在进行，请稍候")
+            return None
+        try:
+            factors = self.soil_factors_value()
+            max_edge = self.max_edge_value() if self.trim_enabled_var.get() else None
+        except ValueError as error:
+            messagebox.showerror("输入错误", str(error))
+            return None
+        self.calculator.set_compare_points(None)
+        self.calculator.set_max_edge_length(max_edge)
+        return factors
+
+    def _run_balance(self, label: str, work: Callable[[], Any], on_done: Callable[[Any], None]):
+        self.status_var.set(f"正在{label}...")
+        events = queue.Queue()
+        self._balance_events = events
+
+        def worker():
+            try:
+                events.put(("done", work()))
+            except Exception as error:
+                events.put(("error", error))
+
+        self._balance_thread = threading.Thread(target=worker, daemon=True)
+        self._balance_thread.start()
+
+        def poll():
+            self._balance_poll_after_id = None
+            if self._closing:
+                return
+            try:
+                kind, value = events.get_nowait()
+            except queue.Empty:
+                self._balance_poll_after_id = self.after(30, poll)
+                return
+            self._balance_thread = None
+            if kind == "error":
+                self.status_var.set(f"{label}失败")
+                messagebox.showerror(f"{label}失败", str(value))
+                return
+            self.status_var.set(f"{label}完成，可点“开始计算”")
+            on_done(value)
+
+        self._balance_poll_after_id = self.after(30, poll)
+
+    @staticmethod
+    def _balance_message(design) -> str:
+        balance = design.balance
+        text = f"挖方 {design.cut:.2f} m³，填方 {design.fill:.2f} m³"
+        if not balance.factors.is_default:
+            text += f"\n按 {balance.factors.describe()}，填方需自然方 {balance.fill_natural:.2f} m³，挖填平衡"
+        return text
+
+    def _balance_flat(self):
+        factors = self._balance_inputs()
+        if factors is None:
+            return
+        calculator = self.calculator
+
+        def done(design):
+            self.design_elevation_var.set(round(design.elevation, 4))
+            self.result = None
+            messagebox.showinfo("挖填平衡", f"挖填平衡的设计高程：{design.elevation:.4f} m\n"
+                                            f"{self._balance_message(design)}\n\n已填入设计高程。")
+
+        self._run_balance("求平衡标高", lambda: balance_elevation(calculator, factors), done)
+
+    def _set_plane(self, plane: PlaneDesign):
+        for key, _ in PLANE_FIELDS:
+            value = getattr(plane, key)
+            self.plane_vars[key].set(f"{value:.4f}" if key in ("h0", "slope_x", "slope_y") else f"{value:.3f}")
+        self.result = None
+
+    def _balance_plane(self):
+        try:
+            plane = self.plane_value()
+        except ValueError as error:
+            messagebox.showerror("输入错误", str(error))
+            return
+        factors = self._balance_inputs()
+        if factors is None:
+            return
+        calculator = self.calculator
+
+        def done(design):
+            self._set_plane(design.plane)
+            messagebox.showinfo("挖填平衡", f"保持坡度不变，挖填平衡的基准高程 H0 = {design.plane.h0:.4f} m\n"
+                                            f"{self._balance_message(design)}")
+
+        self._run_balance("求平衡 H0", lambda: balance_plane(calculator, plane, factors), done)
+
+    def _best_fit_plane(self):
+        factors = self._balance_inputs()
+        if factors is None:
+            return
+        calculator = self.calculator
+
+        def done(design):
+            self._set_plane(design.plane)
+            messagebox.showinfo(
+                "最小二乘最优斜面",
+                f"与地面最贴合（挖填总量最小）且挖填平衡的斜面：\n"
+                f"X 向坡度 {design.plane.slope_x:+.4f}%，Y 向坡度 {design.plane.slope_y:+.4f}%\n"
+                f"基准点取计算范围形心 ({design.plane.x0:.3f}, {design.plane.y0:.3f})，H0 = {design.plane.h0:.4f} m\n"
+                f"{self._balance_message(design)}\n\n排水需要特定坡度时，可改坡度后点“按坡度求平衡 H0”。",
+            )
+
+        self._run_balance("求最优斜面", lambda: best_fit_plane(calculator, factors), done)
+
     def _toggle_partition(self):
         """切换分区高程编辑状态"""
         if self.use_partition_var.get():
@@ -530,6 +727,8 @@ class CalculationFrame(ttk.Frame):
             design_elevation = self.design_elevation_value()
             plane = self.plane_value() if mode == "plane" else None
             grid_spacing = self.grid_spacing_value() if self.grid_enabled_var.get() else None
+            max_edge = self.max_edge_value() if self.trim_enabled_var.get() else None
+            factors = self.soil_factors_value()
         except ValueError as error:
             messagebox.showerror("输入错误", str(error))
             return
@@ -546,6 +745,7 @@ class CalculationFrame(ttk.Frame):
             try:
                 calculator = self.calculator
                 calculator.set_compare_points(compare_points if mode == "compare" else None)
+                calculator.set_max_edge_length(max_edge)
                 if plane is not None:
                     calculator.set_design_plane(plane, partition_data)
                 elif partition_data:
@@ -557,6 +757,7 @@ class CalculationFrame(ttk.Frame):
                 stage = "叠加前期、后期三角网..." if mode == "compare" else "构建 TIN 三角网..."
                 self._worker_events.put(("progress", 30, stage))
                 result = calculator.run_full_calculation()
+                result.soil_balance = soil_balance(result.total_cut, result.total_fill, factors)
                 if partition_data:
                     unlisted = [str(p.id) for p in calculator.points if p.id not in partition_data]
                     if unlisted:
@@ -634,6 +835,12 @@ class CalculationFrame(ttk.Frame):
             f"三角形数: {self.result.triangle_count}\n"
             f"混合三角形: {self.result.mixed_triangle_count}"
         )
+        balance = self.result.soil_balance
+        if balance is not None:
+            if balance.surplus >= 0:
+                summary += f"\n余土 {balance.surplus:.2f} m³（自然方），外运松方 {balance.export_loose:.2f} m³"
+            else:
+                summary += f"\n缺土 {balance.borrow_natural:.2f} m³（自然方），需外借"
         warnings = list(self.result.warnings)
         grid = self.result.grid_check
         if grid is not None:
@@ -771,7 +978,8 @@ class CalculationFrame(ttk.Frame):
         self._closing = True
         self._detail_load_token += 1
 
-        for attr_name in ("_worker_poll_after_id", "_detail_load_after_id", "_export_poll_after_id"):
+        for attr_name in ("_worker_poll_after_id", "_detail_load_after_id", "_export_poll_after_id",
+                          "_balance_poll_after_id"):
             after_id = getattr(self, attr_name, None)
             if after_id is not None:
                 try:

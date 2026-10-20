@@ -6,7 +6,7 @@ from tkinter import ttk, filedialog, messagebox
 from typing import List, Tuple, Callable, Optional
 from utils.plotter import EarthworkPlotter
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-from core.calculator import SurveyPoint
+from core.calculator import SurveyPoint, check_holes
 from core.geometry import ring_self_intersects
 import numpy as np
 
@@ -14,11 +14,14 @@ import numpy as np
 class BoundaryFrame(ttk.Frame):
     """计算边界设置页面"""
     
-    def __init__(self, parent, points: List[SurveyPoint], on_boundary_set: Callable[[List[Tuple[float, float]]], None]):
+    def __init__(self, parent, points: List[SurveyPoint],
+                 on_boundary_set: Callable[[List[Tuple[float, float]], List[List[Tuple[float, float]]]], None]):
         super().__init__(parent)
         self.points = points
         self.on_boundary_set = on_boundary_set
         self.boundary: List[Tuple[float, float]] = []
+        self.holes: List[List[Tuple[float, float]]] = []       # 已完成的挖空区
+        self.drawing_hole: List[Tuple[float, float]] = []      # 正在绘制的挖空区
         self.edit_mode = True
         self.current_point: Optional[Tuple[float, float]] = None
         self._point_xy = np.empty((0, 2), dtype=float)
@@ -55,9 +58,31 @@ class BoundaryFrame(ttk.Frame):
         self.edit_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(mode_frame, text="编辑模式（左键添加）", variable=self.edit_var,
                        command=self._toggle_edit_mode).pack(anchor=tk.W)
+        # 绘制对象：计算边界，或挖空区（建筑物、水池等不计方量的区域）
+        target_row = ttk.Frame(mode_frame)
+        target_row.pack(fill=tk.X, pady=(4, 0))
+        ttk.Label(target_row, text="绘制：").pack(side=tk.LEFT)
+        self.target_var = tk.StringVar(value="boundary")
+        for value, label in (("boundary", "计算边界"), ("hole", "挖空区")):
+            ttk.Radiobutton(target_row, text=label, value=value, variable=self.target_var,
+                            command=self._on_target_change).pack(side=tk.LEFT, padx=(0, 8))
+        hole_row = ttk.Frame(mode_frame)
+        hole_row.pack(fill=tk.X, pady=(4, 0))
+        self.hole_status_var = tk.StringVar(value="挖空区：无")
+        ttk.Label(hole_row, textvariable=self.hole_status_var, style="Muted.TLabel").pack(side=tk.LEFT)
+        hole_buttons = ttk.Frame(mode_frame)
+        hole_buttons.pack(fill=tk.X, pady=(2, 0))
+        hole_buttons.grid_columnconfigure((0, 1, 2), weight=1, uniform="hole_buttons")
+        for column, (text, command) in enumerate((("完成挖空区", self._finish_hole),
+                                                   ("导入挖空区", self._import_holes),
+                                                   ("清空挖空区", self._clear_holes))):
+            ttk.Button(hole_buttons, text=text, command=command).grid(
+                row=0, column=column, sticky="ew", padx=(0 if column == 0 else 2, 0 if column == 2 else 2))
 
         # 边界点列表
-        ttk.Label(ctrl_frame, text="边界点坐标:", style="Title.TLabel").grid(row=1, column=0, sticky="w", pady=(10, 0))
+        self.list_title_var = tk.StringVar(value="边界点坐标:")
+        ttk.Label(ctrl_frame, textvariable=self.list_title_var, style="Title.TLabel").grid(
+            row=1, column=0, sticky="w", pady=(10, 0))
 
         list_frame = ttk.Frame(ctrl_frame)
         list_frame.grid(row=2, column=0, sticky="nsew", pady=8)
@@ -111,7 +136,9 @@ class BoundaryFrame(ttk.Frame):
                     "2. 手工边界按顺时针或逆时针逐点左键点击\n"
                     "3. 点会自动吸附到附近测量点；右键或“撤销”可回退\n"
                     "4. 至少 3 个点，系统会自动闭合；确认前检查状态提示\n"
-                    "5. 也可导入 DXF 多段线或 CSV/TXT（前两列为 X、Y）")
+                    "5. 也可导入 DXF 多段线或 CSV/TXT（前两列为 X、Y）\n"
+                    "6. 建筑物、水池等不计方量的区域：选“挖空区”逐个画，\n"
+                    "   每画完一个点“完成挖空区”")
         self.info_label = ttk.Label(ctrl_frame, text=info_text, justify=tk.LEFT, style="Hint.TLabel")
         self.info_label.grid(row=6, column=0, sticky="w", pady=(10, 0))
         self.ctrl_frame, self.list_frame = ctrl_frame, list_frame
@@ -140,15 +167,16 @@ class BoundaryFrame(ttk.Frame):
         if not self.edit_mode or event.inaxes != self.plotter.ax:
             return
             
+        target = self._target()
         if event.button == 1:  # 左键添加点
             if event.xdata is not None and event.ydata is not None:
                 x, y = self._snap_to_point(event.xdata, event.ydata)
-                self.boundary.append((x, y))
+                target.append((x, y))
                 self.current_point = None
                 self._refresh_plot()
                 self._update_boundary_list()
-        elif event.button == 3 and self.boundary:  # 右键删除最后一点
-            self.boundary.pop()
+        elif event.button == 3 and target:  # 右键删除最后一点
+            target.pop()
             self.current_point = None
             self._refresh_plot()
             self._update_boundary_list()
@@ -156,9 +184,9 @@ class BoundaryFrame(ttk.Frame):
     def _on_canvas_motion(self, event):
         if event.inaxes == self.plotter.ax and event.xdata is not None and event.ydata is not None:
             self.coord_var.set(f"X: {event.xdata:.3f}  Y: {event.ydata:.3f}")
-            if self.edit_mode and self.boundary:
+            if self.edit_mode and self._target():
                 self.current_point = (event.xdata, event.ydata)
-                self.plotter.update_boundary_preview(self.boundary, self.current_point)
+                self.plotter.update_boundary_preview(self._target(), self.current_point)
 
     def _snap_to_point(self, x: float, y: float, threshold: float = 5.0) -> Tuple[float, float]:
         """吸附到最近的测量点。"""
@@ -172,9 +200,86 @@ class BoundaryFrame(ttk.Frame):
             return tuple(self._point_xy[point_index])
         return x, y
         
+    def _target(self) -> List[Tuple[float, float]]:
+        """鼠标点击、撤销、删除点所作用的多边形：计算边界或正在绘制的挖空区。"""
+        return self.drawing_hole if self.target_var.get() == "hole" else self.boundary
+
+    def _on_target_change(self):
+        self.current_point = None
+        self.list_title_var.set("挖空区顶点坐标:" if self.target_var.get() == "hole" else "边界点坐标:")
+        self._refresh_plot()
+        self._update_boundary_list()
+
     def _refresh_plot(self):
-        self.plotter.plot_boundary_edit(self.points, self.boundary, self.current_point)
+        self.plotter.plot_boundary_edit(self.points, self.boundary, self.current_point,
+                                        holes=self.holes, drawing_hole=self.drawing_hole)
         self._update_boundary_status()
+        self._update_hole_status()
+
+    def _update_hole_status(self):
+        if not hasattr(self, "hole_status_var"):
+            return
+        text = f"挖空区：{len(self.holes)} 个" if self.holes else "挖空区：无"
+        if self.drawing_hole:
+            text += f"；正在绘制的有 {len(self.drawing_hole)} 个点"
+        self.hole_status_var.set(text)
+
+    def _finish_hole(self) -> bool:
+        """把正在绘制的挖空区加入列表；无效时提示并保留，便于修改。"""
+        if len(self.drawing_hole) < 3:
+            messagebox.showwarning("提示", "挖空区至少需要 3 个点。先在“绘制”中选“挖空区”，再在图上逐点点击。")
+            return False
+        try:
+            check_holes(self.boundary, self.holes + [list(self.drawing_hole)])
+        except ValueError as error:
+            messagebox.showwarning("挖空区无效", str(error).replace(f"第 {len(self.holes) + 1} 个挖空区", "这个挖空区"))
+            return False
+        self.holes.append(list(self.drawing_hole))
+        self.drawing_hole = []
+        self.current_point = None
+        self._refresh_plot()
+        self._update_boundary_list()
+        return True
+
+    def _import_holes(self):
+        filepath = filedialog.askopenfilename(
+            title="导入挖空区",
+            filetypes=[("DXF图形", "*.dxf"), ("CSV文件", "*.csv"), ("文本文件", "*.txt"), ("所有文件", "*.*")],
+        )
+        if filepath:
+            self.load_holes_file(filepath)
+
+    def load_holes_file(self, filepath: str) -> bool:
+        """DXF 取边界以内的全部闭合多段线；CSV/TXT 为一个挖空区（前两列为 X、Y）。"""
+        try:
+            if filepath.lower().endswith(".dxf"):
+                from utils.dxf_io import import_holes_from_dxf
+                holes = import_holes_from_dxf(filepath, self.boundary or None)
+            else:
+                holes = [read_xy_file(filepath)]
+            check_holes(self.boundary, self.holes + holes)
+        except Exception as error:
+            messagebox.showerror("导入失败", str(error))
+            return False
+        self.holes += holes
+        self._refresh_plot()
+        messagebox.showinfo("成功", f"导入挖空区 {len(holes)} 个")
+        return True
+
+    def _clear_holes(self):
+        if (self.holes or self.drawing_hole) and not messagebox.askyesno("清空挖空区", "删除全部挖空区？"):
+            return
+        self.holes = []
+        self.drawing_hole = []
+        self.current_point = None
+        self._refresh_plot()
+        self._update_boundary_list()
+
+    def set_holes(self, holes: List[List[Tuple[float, float]]]):
+        """外部设置挖空区（打开工程）。"""
+        self.holes = [list(hole) for hole in holes or []]
+        self.drawing_hole = []
+        self._refresh_plot()
 
     def _update_boundary_status(self):
         if not hasattr(self, 'boundary_status_var'):
@@ -214,8 +319,10 @@ class BoundaryFrame(ttk.Frame):
             pass
 
     def transform_boundary(self, func: Callable[[float, float], Tuple[float, float]]):
-        """对边界每个顶点做同一变换（平移、X/Y 互换）。"""
+        """对边界和挖空区每个顶点做同一变换（平移、X/Y 互换）。"""
         self.boundary = [func(x, y) for x, y in self.boundary]
+        self.holes = [[func(x, y) for x, y in hole] for hole in self.holes]
+        self.drawing_hole = [func(x, y) for x, y in self.drawing_hole]
         self.current_point = None
         self._update_boundary_list()
         try:
@@ -246,15 +353,16 @@ class BoundaryFrame(ttk.Frame):
         self._update_boundary_list()
 
     def _undo_last_point(self):
-        if self.boundary:
-            self.boundary.pop()
+        target = self._target()
+        if target:
+            target.pop()
             self.current_point = None
             self._refresh_plot()
             self._update_boundary_list()
         
     def _update_boundary_list(self):
         self.tree_boundary.delete(*self.tree_boundary.get_children())
-        for i, (x, y) in enumerate(self.boundary, 1):
+        for i, (x, y) in enumerate(self._target(), 1):
             self.tree_boundary.insert('', 'end', values=(i, f"{x:.3f}", f"{y:.3f}"))
             
     def _import_boundary(self):
@@ -275,18 +383,7 @@ class BoundaryFrame(ttk.Frame):
                 from utils.dxf_io import import_boundary_from_dxf
                 self.boundary = import_boundary_from_dxf(filepath)
             else:
-                import pandas as pd
-                df = pd.read_csv(filepath, sep=None, engine="python", header=None)
-                if df.shape[1] < 2:
-                    messagebox.showwarning("提示", "文件列数不足，需要至少X、Y两列")
-                    return
-                boundary = []
-                for _, row in df.iterrows():
-                    try:
-                        boundary.append((float(row[0]), float(row[1])))
-                    except (TypeError, ValueError):
-                        continue  # 表头或说明行
-                self.boundary = boundary
+                self.boundary = read_xy_file(filepath)
             if len(self.boundary) < 3:
                 messagebox.showwarning("提示", "边界至少需要 3 个点")
                 return
@@ -298,7 +395,7 @@ class BoundaryFrame(ttk.Frame):
             messagebox.showerror("错误", f"导入失败: {error}")
             
     def _clear_boundary(self):
-        self.boundary = []
+        self._target().clear()
         self.current_point = None
         self._refresh_plot()
         self._update_boundary_list()
@@ -307,8 +404,9 @@ class BoundaryFrame(ttk.Frame):
         selection = self.tree_boundary.selection()
         if selection:
             idx = int(self.tree_boundary.item(selection[0])['values'][0]) - 1
-            if 0 <= idx < len(self.boundary):
-                self.boundary.pop(idx)
+            target = self._target()
+            if 0 <= idx < len(target):
+                target.pop(idx)
                 self._refresh_plot()
                 self._update_boundary_list()
                 
@@ -323,12 +421,34 @@ class BoundaryFrame(ttk.Frame):
             "可在数据导入页点击“X/Y 互换”。\n\n仍要使用这个边界吗？",
         ):
             return
+        if self.drawing_hole and not self._finish_hole():
+            return
+        try:
+            check_holes(self.boundary, self.holes)
+        except ValueError as error:
+            messagebox.showwarning("挖空区无效", f"{error}\n\n可“清空挖空区”后重新绘制。")
+            return
         self._update_boundary_list()
-        self.on_boundary_set(list(self.boundary))
-        messagebox.showinfo("成功", f"边界已设置，共 {len(self.boundary)} 个点")
+        self.on_boundary_set(list(self.boundary), [list(hole) for hole in self.holes])
+        holes = f"，挖空区 {len(self.holes)} 个" if self.holes else ""
+        messagebox.showinfo("成功", f"边界已设置，共 {len(self.boundary)} 个点{holes}")
 
     def set_boundary(self, boundary: List[Tuple[float, float]]):
         """外部设置边界"""
         self.boundary = list(boundary)
         self._refresh_plot()
         self._update_boundary_list()
+
+def read_xy_file(filepath: str) -> List[Tuple[float, float]]:
+    """读取 CSV/TXT 中的多边形顶点（前两列为 X、Y，表头和说明行自动跳过）。"""
+    import pandas as pd
+    df = pd.read_csv(filepath, sep=None, engine="python", header=None)
+    if df.shape[1] < 2:
+        raise ValueError("文件列数不足，需要至少X、Y两列")
+    points = []
+    for _, row in df.iterrows():
+        try:
+            points.append((float(row[0]), float(row[1])))
+        except (TypeError, ValueError):
+            continue  # 表头或说明行
+    return points

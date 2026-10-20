@@ -14,6 +14,7 @@ from typing import List, Optional, Tuple
 import numpy as np
 
 from core.calculator import CalculationResult, SurveyPoint, TINEarthworkCalculator
+from core.geometry import normalize_ring
 from core.overlay import clip_convex
 
 XY = Tuple[float, float]
@@ -112,6 +113,18 @@ def grid_region(calculator: TINEarthworkCalculator) -> List[XY]:
     return clip_convex(boundary, coverage)
 
 
+def _excluded_areas(calculator: TINEarthworkCalculator, region: List[XY]) -> List[List[XY]]:
+    """TIN 法不计方量的区域（挖空区、剔除的长边三角形），裁剪到方格网计算范围以内。
+
+    挖空区在计算边界之内，与凸的测点覆盖范围求交即可；剔除的三角形是凸的，用它去裁剪计算范围。
+    """
+    coverage = calculator.coverage_polygon()
+    areas = [clip_convex([tuple(p) for p in hole], coverage) for hole in calculator.holes]
+    if not calculator.compare_points:
+        areas += [clip_convex(region, [tuple(p) for p in normalize_ring(tri)]) for tri in calculator.trimmed_triangles]
+    return [area for area in areas if len(area) >= 3]
+
+
 def run_grid_check(calculator: TINEarthworkCalculator, tin: CalculationResult, spacing: float) -> GridCheckResult:
     """在 TIN 法计算完成后运行方格网校核（calculator 须已构网）。"""
     spacing = float(spacing)
@@ -172,6 +185,7 @@ def run_grid_check(calculator: TINEarthworkCalculator, tin: CalculationResult, s
 
     mesh = TINEarthworkCalculator()
     mesh.set_boundary(region)
+    mesh.set_holes(_excluded_areas(calculator, region), validate=False)
     mesh.build_from_mesh(vertex_points, simplices)
     mesh_result = mesh.calculate_volumes()
 
@@ -198,6 +212,8 @@ def run_grid_check(calculator: TINEarthworkCalculator, tin: CalculationResult, s
         computed_area=mesh_result.computed_area,
         skipped_cells=int((~complete).sum()), mesh_result=mesh_result,
     )
+    if calculator.compare_points and calculator.trimmed_triangles:
+        result.warnings.append("两期对比时，方格网校核没有扣除剔除的长边三角形，与 TIN 法的面积会有差异。")
     if tin.computed_area > 0 and result.computed_area < tin.computed_area * GRID_COVERAGE_WARN_RATIO:
         missing = tin.computed_area - result.computed_area
         result.warnings.append(

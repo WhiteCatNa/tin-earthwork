@@ -22,7 +22,9 @@ from core.geometry import (
     normalize_ring,
     points_in_ring,
     polygon_integral,
+    ring_inside_ring,
     ring_self_intersects,
+    rings_overlap,
     signed_area,
     triangles_touching_ring,
     zero_crossing_points,
@@ -75,7 +77,7 @@ class Triangle:
     cut_area: float = 0.0
     fill_area: float = 0.0
     is_boundary: bool = False  # 完全位于计算边界外，不参与计算
-    is_clipped: bool = False   # 部分位于边界内，已按边界裁剪
+    is_clipped: bool = False   # 部分位于边界内（或部分落在挖空区内），已按边界裁剪
     is_mixed: bool = False     # 边界内部分同时有挖有填
     # 混合或被裁剪时，挖方/填方区域的平面多边形（用于绘图）
     cut_polygon: List[XY] = field(default_factory=list)
@@ -104,6 +106,11 @@ class CalculationResult:
     design_description: str = ""          # 斜面、两期对比时的比较面说明
     compare_point_count: int = 0          # 两期对比时后期测点数
     grid_check: Optional[Any] = None      # 方格网校核结果（core.grid_check.GridCheckResult）
+    holes: List[List[XY]] = field(default_factory=list)            # 挖空区（不计方量）
+    hole_area: float = 0.0                # 挖空区落在计算范围内的面积
+    max_edge_length: Optional[float] = None                         # 三角网清理：剔除的最大边长
+    trimmed_triangles: List[List[XY]] = field(default_factory=list)  # 因边长过大被剔除的三角形
+    soil_balance: Optional[Any] = None    # 土方平衡（core.balance.SoilBalance）
 
     @property
     def is_compare(self) -> bool:
@@ -179,6 +186,13 @@ class TINEarthworkCalculator:
         self._tin_a: Optional[Tuple[Delaunay, np.ndarray]] = None
         self._tin_b: Optional[Tuple[Delaunay, np.ndarray]] = None
         self._overlap_ratio: Optional[float] = None   # 两期对比：共同覆盖面积 / 前期范围面积
+        self.holes: List[List[XY]] = []               # 挖空区：建筑物、水池等不计方量的区域
+        self._validate_holes = True
+        self._hole_regions: Dict[int, List[np.ndarray]] = {}  # 三角形落在挖空区内的部分（局部坐标）
+        self._hole_rings: List[np.ndarray] = []
+        self._hole_area = 0.0
+        self.max_edge_length: Optional[float] = None  # 剔除边长大于该值的三角形（凸包边缘的狭长三角形）
+        self.trimmed_triangles: List[List[XY]] = []   # 最近一次构网时被剔除的三角形（全局坐标）
 
     @property
     def mode(self) -> str:
@@ -241,6 +255,22 @@ class TINEarthworkCalculator:
     def set_boundary(self, boundary: List[XY]):
         """设置计算边界"""
         self.boundary_polygon = boundary
+
+    def set_holes(self, holes: Optional[Sequence[Sequence[XY]]], validate: bool = True):
+        """设置挖空区（多个多边形）。挖空区内不计方量，须位于计算边界之内且互不重叠。
+
+        validate=False 只供内部使用（方格网校核传入已裁剪好的区域）。
+        """
+        self.holes = [[(float(x), float(y)) for x, y in ring] for ring in (holes or []) if len(ring)]
+        self._validate_holes = validate
+
+    def set_max_edge_length(self, length: Optional[float]):
+        """三角网清理：剔除任一边长大于 length 的三角形；None 或 0 表示不剔除。"""
+        if length is not None:
+            length = float(length)
+            if not math.isfinite(length) or length < 0:
+                raise ValueError("最大边长必须是不小于 0 的数字")
+        self.max_edge_length = length or None
 
     # ------------------------------------------------------------------
     # 构网
@@ -319,6 +349,48 @@ class TINEarthworkCalculator:
             raise ValueError("计算边界无效：顶点共线，围不成面积")
         return ring - np.asarray(self._origin)
 
+    def _prepare_holes(self, outer: Optional[np.ndarray]) -> List[np.ndarray]:
+        """挖空区转为局部坐标的逆时针多边形，并检查是否有效。"""
+        rings = []
+        for index, hole in enumerate(self.holes, 1):
+            ring = normalize_ring(hole)
+            if not self._validate_holes:
+                if len(ring) >= 3 and abs(signed_area(ring)) > 0:
+                    rings.append(ring - np.asarray(self._origin))
+                continue
+            name = f"第 {index} 个挖空区"
+            if len(ring) < 3:
+                raise ValueError(f"{name}无效：至少需要 3 个不重复的顶点")
+            if not np.all(np.isfinite(ring)):
+                raise ValueError(f"{name}含有非数字坐标")
+            if ring_self_intersects(ring):
+                raise ValueError(f"{name}的边线相互交叉，请修正")
+            if abs(signed_area(ring)) <= 0:
+                raise ValueError(f"{name}无效：顶点共线，围不成面积")
+            local = ring - np.asarray(self._origin)
+            if outer is not None and not ring_inside_ring(local, outer):
+                raise ValueError(f"{name}超出了计算边界，挖空区必须完整位于计算边界之内")
+            for other_index, other in enumerate(rings, 1):
+                if rings_overlap(local, other):
+                    raise ValueError(f"第 {other_index} 个和{name}相互重叠，请合并成一个")
+            rings.append(local)
+        return rings
+
+    @staticmethod
+    def _long_edges(tri_xy: np.ndarray, limit: Optional[float]) -> np.ndarray:
+        """任一边长大于 limit 的三角形。"""
+        if not limit or not len(tri_xy):
+            return np.zeros(len(tri_xy), dtype=bool)
+        edges = tri_xy - np.roll(tri_xy, -1, axis=1)
+        return np.hypot(edges[..., 0], edges[..., 1]).max(axis=1) > limit
+
+    def _trim(self, local: np.ndarray, simplices: np.ndarray) -> np.ndarray:
+        """剔除长边三角形，并记下被剔除的部分。"""
+        long = self._long_edges(local[simplices], self.max_edge_length)
+        if long.any():
+            self.trimmed_triangles += [self._to_global(tri) for tri in local[simplices[long]]]
+        return simplices[~long]
+
     def build_tin(self) -> List[Triangle]:
         """构建三角网，并按计算边界把三角形分为 边界内 / 跨边界 / 边界外。
 
@@ -327,11 +399,20 @@ class TINEarthworkCalculator:
         if len(self.points) < 3:
             raise ValueError("至少需要 3 个测量点才能构建三角网")
         self.warnings = []
+        self.trimmed_triangles = []
         self._check_finite(self.points)
         if self.compare_points:
             vertex_points, local, simplices = self._triangulate_compare()
         else:
             vertex_points, local, simplices = self._triangulate_design()
+            simplices = self._trim(local, simplices)
+        if self.trimmed_triangles:
+            self.warnings.append(
+                f"三角网清理：剔除了 {len(self.trimmed_triangles)} 个边长超过 {self.max_edge_length:g} m 的三角形，"
+                "这些区域不计方量"
+            )
+        if not len(simplices):
+            raise ValueError("剔除长边三角形后没有剩余三角形，请加大最大边长")
         return self._classify(vertex_points, local, simplices)
 
     def build_from_mesh(self, vertex_points: List[SurveyPoint], simplices: np.ndarray) -> List[Triangle]:
@@ -382,6 +463,11 @@ class TINEarthworkCalculator:
         extent = float(max(np.ptp(local_a[unique_a], axis=0).max(), np.ptp(local_b[unique_b], axis=0).max())) or 1.0
         area_tol = (extent * 1e-9) * extent * 1e-3
         cells = overlay_triangulations(tri_a, tri_b, area_tol)
+        long_a = self._long_edges(tri_a, self.max_edge_length)
+        long_b = self._long_edges(tri_b, self.max_edge_length)
+        if long_a.any() or long_b.any():
+            self.trimmed_triangles += [self._to_global(tri) for tri in np.concatenate([tri_a[long_a], tri_b[long_b]])]
+            cells = [cell for cell in cells if not long_a[cell[1]] and not long_b[cell[2]]]
         if not cells:
             raise ValueError(
                 "前期和后期测量的范围没有重叠，无法对比。请检查两期坐标是否同一坐标系、X/Y 方向是否一致。"
@@ -452,12 +538,16 @@ class TINEarthworkCalculator:
 
         self._ring = self._prepare_boundary()
         self._boundary_area = abs(signed_area(self._ring)) if self._ring is not None else 0.0
+        self._hole_rings = self._prepare_holes(self._ring)
+        self._hole_area = sum(abs(signed_area(ring)) for ring in self._hole_rings)
+        if self._ring is not None:
+            self._boundary_area -= self._hole_area
         outside = np.zeros(len(simplices), dtype=bool)
+        area_tol = self._eps * extent * 1e-3
         if self._ring is not None:
             touching = triangles_touching_ring(tri_xy, self._ring, self._eps)
             clear = np.nonzero(~touching)[0]
             outside[clear] = ~points_in_ring(tri_xy[clear].mean(axis=1), self._ring)
-            area_tol = self._eps * extent * 1e-3
             for index in np.nonzero(touching)[0]:
                 region = clip_ring_to_triangle(self._ring, tri_xy[index])
                 region_area = abs(signed_area(region))
@@ -466,6 +556,7 @@ class TINEarthworkCalculator:
                     outside[index] = True
                 elif full_area - region_area > area_tol + full_area * 1e-9:
                     self._regions[int(index)] = region
+        self._classify_holes(tri_xy, outside, area_tol)
 
         self.triangles = []
         for i, (v0, v1, v2) in enumerate(simplices):
@@ -474,11 +565,33 @@ class TINEarthworkCalculator:
                 vertex_ids=(int(v0), int(v1), int(v2)),
                 vertex_points=(vertex_points[v0], vertex_points[v1], vertex_points[v2]),
                 is_boundary=bool(outside[i]),
-                is_clipped=i in self._regions,
+                is_clipped=i in self._regions or i in self._hole_regions,
             )
             tri.area = self._triangle_area(tri.vertex_points)
             self.triangles.append(tri)
         return self.triangles
+
+    def _classify_holes(self, tri_xy: np.ndarray, outside: np.ndarray, area_tol: float):
+        """记下每个三角形落在挖空区内的部分；整个落在挖空区内的三角形视为边界外。"""
+        self._hole_regions = {}
+        for ring in self._hole_rings:
+            touching = triangles_touching_ring(tri_xy, ring, self._eps)
+            clear = np.nonzero(~touching & ~outside)[0]
+            outside[clear[points_in_ring(tri_xy[clear].mean(axis=1), ring)]] = True
+            for index in np.nonzero(touching & ~outside)[0].tolist():
+                piece = clip_ring_to_triangle(ring, tri_xy[index])
+                piece_area = abs(signed_area(piece))
+                if piece_area <= area_tol:
+                    continue
+                region = self._regions.get(index)
+                region_area = abs(signed_area(region if region is not None else tri_xy[index]))
+                pieces = self._hole_regions.setdefault(index, [])
+                pieces.append(piece)
+                if region_area - sum(abs(signed_area(p)) for p in pieces) <= area_tol + region_area * 1e-9:
+                    outside[index] = True
+        for index in [i for i in self._hole_regions if outside[i]]:
+            del self._hole_regions[index]
+            self._regions.pop(index, None)
 
     def _triangle_area(self, points: Tuple[SurveyPoint, SurveyPoint, SurveyPoint]) -> float:
         """计算三角形的水平投影面积。"""
@@ -502,8 +615,8 @@ class TINEarthworkCalculator:
         vertices = [(p0.x - ox, p0.y - oy), (p1.x - ox, p1.y - oy), (p2.x - ox, p2.y - oy)]
         dz = [p0.delta_z, p1.delta_z, p2.delta_z]
 
-        if tri.is_clipped:
-            region = self._regions[tri.id]
+        region = self._regions.get(tri.id)
+        if region is not None:
             plane = linear_plane(*vertices, *dz, eps=self._eps * self._eps)
             polygon = [(float(x), float(y)) for x, y in region]
             if plane is None:
@@ -518,7 +631,7 @@ class TINEarthworkCalculator:
         has_fill = any(v < 0 for v in values)
 
         if not (has_cut and has_fill):
-            if tri.is_clipped:
+            if region is not None:
                 tri.area, tri.volume = polygon_integral(polygon, values)
             else:
                 tri.area = self._triangle_area(tri.vertex_points)
@@ -527,7 +640,7 @@ class TINEarthworkCalculator:
                 tri.cut_volume, tri.cut_area = tri.volume, tri.area
             elif tri.volume < 0:
                 tri.fill_volume, tri.fill_area = -tri.volume, tri.area
-            if tri.is_clipped:
+            if region is not None:
                 target = tri.cut_polygon if tri.volume > 0 else tri.fill_polygon
                 target.extend(self._to_global(polygon))
             tri.avg_delta_z = tri.volume / tri.area if tri.area else 0.0
@@ -548,11 +661,43 @@ class TINEarthworkCalculator:
 
         zero = zero_crossing_points(vertices, dz)
         if len(zero) == 2:
-            if tri.is_clipped:
+            if region is not None:
                 segments = clip_segment_to_ring(zero[0], zero[1], self._ring)
             else:
                 segments = [(zero[0], zero[1])]
+            for hole in self._hole_rings if tri.id in self._hole_regions else []:
+                segments = [part for a, b in segments for part in clip_segment_to_ring(a, b, hole, inside=False)]
             tri.zero_segments = [tuple(self._to_global(segment)) for segment in segments]
+
+    def _subtract_holes(self, tri: Triangle):
+        """从三角形的方量中扣除落在挖空区内的部分（挖空区在计算边界之内，可直接相减）。"""
+        p0, p1, p2 = tri.vertex_points
+        ox, oy = self._origin
+        vertices = [(p0.x - ox, p0.y - oy), (p1.x - ox, p1.y - oy), (p2.x - ox, p2.y - oy)]
+        dz = [p0.delta_z, p1.delta_z, p2.delta_z]
+        plane = linear_plane(*vertices, *dz, eps=self._eps * self._eps)
+        for piece in self._hole_regions[tri.id]:
+            polygon = [(float(x), float(y)) for x, y in piece]
+            if plane is None:
+                values = [sum(dz) / 3] * len(polygon)
+            else:
+                a, b, c = plane
+                values = [a * x + b * y + c for x, y in polygon]
+            area, _ = polygon_integral(polygon, values)
+            cut_area, cut = polygon_integral(*clip_by_sign(polygon, values, positive=True))
+            fill_area, fill = polygon_integral(*clip_by_sign(polygon, values, positive=False))
+            tri.area -= area
+            if cut > 0:
+                tri.cut_volume -= cut
+                tri.cut_area -= cut_area
+            if fill < 0:
+                tri.fill_volume += fill
+                tri.fill_area -= fill_area
+        tri.area = max(tri.area, 0.0)
+        tri.cut_volume, tri.fill_volume = max(tri.cut_volume, 0.0), max(tri.fill_volume, 0.0)
+        tri.cut_area, tri.fill_area = max(tri.cut_area, 0.0), max(tri.fill_area, 0.0)
+        tri.volume = tri.cut_volume - tri.fill_volume
+        tri.avg_delta_z = tri.volume / tri.area if tri.area else 0.0
 
     def calculate_volumes(self) -> CalculationResult:
         """计算挖填方量"""
@@ -571,6 +716,8 @@ class TINEarthworkCalculator:
             if tri.is_boundary:
                 continue
             self._calculate_triangle(tri)
+            if tri.id in self._hole_regions:
+                self._subtract_holes(tri)
             result.total_cut += tri.cut_volume
             result.total_fill += tri.fill_volume
             result.computed_area += tri.area
@@ -588,6 +735,11 @@ class TINEarthworkCalculator:
         if self.compare_points:
             result.compare_point_count = len(self.compare_points)
         result.warnings = list(self.warnings) + self._coverage_warnings(result)
+        if self._validate_holes:
+            result.holes = [list(ring) for ring in self.holes]
+        result.hole_area = self._hole_area
+        result.max_edge_length = self.max_edge_length
+        result.trimmed_triangles = list(self.trimmed_triangles)
         return result
 
     def _design_description(self) -> str:
@@ -625,6 +777,39 @@ class TINEarthworkCalculator:
             f"（{(1 - ratio) * 100:.1f}%）不在{covered}内，这部分没有计入方量。"
             "请补测边界附近的点，或把边界收进测点范围。"
         ]
+
+    def computed_pieces(self) -> List[Tuple[np.ndarray, np.ndarray, float]]:
+        """参与计算的区域拆成多边形：(局部坐标顶点, 顶点处的实测/前期高程, 符号)。
+
+        挖空区部分符号为 −1，与所在三角形相减即得实际计算范围。须在 build_tin() 之后调用。
+        """
+        ox, oy = self._origin
+        pieces: List[Tuple[np.ndarray, np.ndarray, float]] = []
+        for tri in self.triangles:
+            if tri.is_boundary:
+                continue
+            vertices = np.array([(p.x - ox, p.y - oy) for p in tri.vertex_points])
+            zs = [p.z for p in tri.vertex_points]
+            plane = linear_plane(*map(tuple, vertices), *zs, eps=self._eps * self._eps)
+
+            def heights(polygon: np.ndarray) -> np.ndarray:
+                if plane is None:
+                    return np.full(len(polygon), sum(zs) / 3)
+                a, b, c = plane
+                return polygon[:, 0] * a + polygon[:, 1] * b + c
+
+            region = self._regions.get(tri.id)
+            region = vertices if region is None else np.asarray(region, dtype=float)
+            pieces.append((region, heights(region), 1.0))
+            for hole in self._hole_regions.get(tri.id, []):
+                hole = np.asarray(hole, dtype=float)
+                pieces.append((hole, heights(hole), -1.0))
+        return pieces
+
+    @property
+    def origin(self) -> Tuple[float, float]:
+        """局部坐标原点（computed_pieces 等返回局部坐标）。"""
+        return self._origin
 
     def _surfaces(self) -> Tuple[TinSurface, str, TinSurface, str]:
         """(地面曲面, 取值键, 比较面曲面, 取值键)，局部坐标。须在 build_tin() 之后调用。"""
@@ -671,6 +856,14 @@ class TINEarthworkCalculator:
             self.set_design_elevation(design_elevation)
         self.build_tin()
         return self.calculate_volumes()
+
+
+def check_holes(boundary: Sequence[XY], holes: Sequence[Sequence[XY]]):
+    """检查挖空区是否有效（顶点、交叉、超出边界、互相重叠），无效时抛出 ValueError。"""
+    calculator = TINEarthworkCalculator()
+    calculator.set_boundary(list(boundary))
+    calculator.set_holes(holes)
+    calculator._prepare_holes(calculator._prepare_boundary())
 
 
 def extract_zero_contour_segments(result: CalculationResult) -> List[Tuple[XY, XY]]:

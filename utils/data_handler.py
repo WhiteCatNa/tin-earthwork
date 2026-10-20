@@ -501,8 +501,14 @@ class DataExporter:
             ['计算面积', round(result.computed_area, 3), 'm²', f'计算边界内且{labels["covered"]}的水平面积'],
         ]
         if result.boundary_area > 0:
-            rows.append(['计算边界面积', round(result.boundary_area, 3), 'm²', ''])
+            rows.append(['计算边界面积', round(result.boundary_area, 3), 'm²',
+                         '已扣除挖空区' if result.holes else ''])
             rows.append(['测点覆盖率', round(result.coverage_ratio * 100, 2), '%', '低于 99.5% 时请核对边界'])
+        if result.holes:
+            rows.append(['挖空区', len(result.holes), '个', f'面积 {result.hole_area:.3f} m²，不计方量'])
+        if result.trimmed_triangles:
+            rows.append(['剔除长边三角形', len(result.trimmed_triangles), '个',
+                         f'边长超过 {result.max_edge_length:g} m，不计方量'])
         if result.design_description:
             # 斜面、两期对比的说明较长：数值列写类型，完整说明放在说明列
             short = "两期对比" if result.is_compare else result.design_description.split("：", 1)[0]
@@ -517,6 +523,8 @@ class DataExporter:
             ['混合三角形', result.mixed_triangle_count, '个', '跨越零填挖线，已按零线分割'],
             ['边界裁剪三角形', result.clipped_triangle_count, '个', '跨越计算边界，只计边界内部分'],
         ]
+        if result.soil_balance is not None:
+            rows += result.soil_balance.rows()
         grid = result.grid_check
         if grid is not None:
             comparison = {label: (diff, relative) for label, _, _, diff, relative in grid.comparison(result)}
@@ -643,7 +651,7 @@ class DataExporter:
         return True
 
     def export_boundary_dxf(self, result: CalculationResult, filepath: str) -> bool:
-        """导出计算边界（闭合多段线）和零填挖线到 DXF。
+        """导出计算边界、挖空区（闭合多段线）和零填挖线到 DXF。
 
         采用 R12 格式的 POLYLINE，AutoCAD、CASS 等都能直接打开。
         """
@@ -651,6 +659,8 @@ class DataExporter:
                  "0\nSECTION\n2\nENTITIES\n"]
         if result.boundary_points:
             parts.append(self._dxf_polyline("BOUNDARY", result.boundary_points, closed=True))
+        for hole in result.holes:
+            parts.append(self._dxf_polyline("HOLE", hole, closed=True))
         for polyline in chain_segments(extract_zero_contour_segments(result)):
             if len(polyline) >= 2:
                 parts.append(self._dxf_polyline("ZERO_CONTOUR", polyline, closed=False))
@@ -720,7 +730,14 @@ class DataExporter:
         if result.boundary_area > 0:
             area_lines += (
                 f"\n计算边界面积: {result.boundary_area:.3f} m²"
-                f"（测点覆盖率 {result.coverage_ratio * 100:.2f}%）"
+                f"（{'已扣除挖空区，' if result.holes else ''}测点覆盖率 {result.coverage_ratio * 100:.2f}%）"
+            )
+        if result.holes:
+            area_lines += f"\n挖空区: {len(result.holes)} 个，面积 {result.hole_area:.3f} m²，不计方量"
+        if result.trimmed_triangles:
+            area_lines += (
+                f"\n三角网清理: 剔除边长超过 {result.max_edge_length:g} m 的三角形 "
+                f"{len(result.trimmed_triangles)} 个，不计方量"
             )
         warnings = "\n".join(f"- {item}" for item in result.warnings) or "无"
         point_lines = f"测量点数: {point_count}"
@@ -741,6 +758,12 @@ class DataExporter:
                 "4. 所有三角形均保留面积、顶点高程、高差及分项体积，可逐项复核。\n"
                 "5. 计算结果仅供工程参考，正式计量请以复核成果为准。"
             )
+        balance_section = ""
+        if result.soil_balance is not None:
+            balance_section = "\n【土方平衡】\n" + "\n".join(
+                f"{label}: {value}{' ' + unit if unit else ''}" + (f"（{note}）" if note else "")
+                for label, value, unit, note in result.soil_balance.rows()
+            ) + "\n"
         grid_section = ""
         grid = result.grid_check
         if grid is not None:
@@ -777,7 +800,7 @@ class DataExporter:
 总填方量: {result.total_fill:.3f} m³
 挖填差值: {result.net_volume:.3f} m³
 {balance}
-{grid_section}
+{balance_section}{grid_section}
 【计算提示】
 {warnings}
 
@@ -874,8 +897,11 @@ def save_project(
     compare_source: str = "",
     grid_enabled: bool = False,
     grid_spacing: Optional[float] = None,
+    holes: Optional[List[List[Tuple[float, float]]]] = None,
+    max_edge_length: Optional[float] = None,
+    soil_factors: Optional[Dict[str, float]] = None,
 ) -> None:
-    """保存可再次打开的工程文件（测点、边界、设计面、后期测点、方格网设置）。"""
+    """保存可再次打开的工程文件（测点、边界、挖空区、设计面、后期测点、方格网、三角网清理、可松性系数）。"""
     if design_mode not in DESIGN_MODES:
         raise ValueError(f"未知的设计面类型: {design_mode}")
     payload = {
@@ -891,6 +917,9 @@ def save_project(
         "grid_check": {"enabled": bool(grid_enabled), "spacing": None if grid_spacing is None else float(grid_spacing)},
         "compare_source": compare_source,
         "boundary": [[float(x), float(y)] for x, y in boundary],
+        "holes": [[[float(x), float(y)] for x, y in hole] for hole in (holes or [])],
+        "max_edge_length": None if not max_edge_length else float(max_edge_length),
+        "soil_factors": {key: float(value) for key, value in (soil_factors or {}).items()} or None,
         "points": _point_rows(points),
         "compare_points": _point_rows(compare_points or []),
     }
@@ -923,6 +952,9 @@ def load_project(filepath: str) -> Dict[str, Any]:
         "grid_spacing": None if grid.get("spacing") is None else float(grid["spacing"]),
         "compare_source": payload.get("compare_source") or "",
         "boundary": boundary,
+        "holes": [[(float(x), float(y)) for x, y in hole] for hole in (payload.get("holes") or [])],
+        "max_edge_length": None if not payload.get("max_edge_length") else float(payload["max_edge_length"]),
+        "soil_factors": payload.get("soil_factors") or None,
         "points": _points_from_rows(payload.get("points")),
         "compare_points": compare_points,
     }
