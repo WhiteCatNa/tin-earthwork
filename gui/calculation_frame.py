@@ -16,6 +16,8 @@ from core.surface import PlaneDesign
 from utils.view3d import surface_faces
 from gui.view3d_window import View3DWindow, cancel_idle_draw
 from gui.haul_window import HaulWindow
+from gui.slope_window import SlopeWindow
+from core.slope import Platform
 from utils.plotter import EarthworkPlotter, create_standalone_figure, draw_section
 from matplotlib.figure import Figure
 from utils.data_handler import ISSUE_NAMES, DataExporter, DataImporter, DataValidator, report_labels
@@ -91,6 +93,9 @@ class CalculationFrame(ttk.Frame):
         self._closing = False
         self.view3d = None
         self.haul_window = None
+        self.slope_window = None
+        self.slope_platforms: List[Platform] = []
+        self.slope_spacing: Optional[float] = None
 
         self._create_widgets()
 
@@ -126,7 +131,8 @@ class CalculationFrame(ttk.Frame):
                               soil_factors: Optional[Dict[str, float]] = None,
                               contours_enabled: bool = True, contour_interval: Optional[float] = None,
                               sections_enabled: bool = False, section_spacing: Optional[float] = None,
-                              section_angle: float = 0.0, layers: Optional[Dict[str, Any]] = None):
+                              section_angle: float = 0.0, layers: Optional[Dict[str, Any]] = None,
+                              slope_design: Optional[Dict[str, Any]] = None):
         """恢复工程文件中的比较面、分区、后期测点、方格网、三角网清理和可松性系数设置。"""
         self.design_elevation_var.set(design_elevation)
         self.use_partition_var.set(bool(use_partition))
@@ -150,6 +156,9 @@ class CalculationFrame(ttk.Frame):
         if section_spacing:
             self.section_spacing_var.set(f"{section_spacing:g}")
         self.section_angle_var.set(f"{section_angle or 0:g}")
+        slope_design = slope_design or {}
+        self.slope_platforms = [Platform.from_dict(item) for item in slope_design.get("platforms") or []]
+        self.slope_spacing = slope_design.get("spacing") or None
         layers = layers or {}
         self.layers_enabled_var.set(bool(layers.get("enabled")))
         self.layer_mode_var.set(layers.get("mode") if layers.get("mode") in LAYER_MODES else LAYER_ELEVATION)
@@ -208,6 +217,8 @@ class CalculationFrame(ttk.Frame):
             "contour_interval": self.contour_interval_value(),
             **self._section_settings(),
             **self._layer_settings(),
+            "slope_design": ({"platforms": [p.to_dict() for p in self.slope_platforms], "spacing": self.slope_spacing}
+                             if self.slope_platforms else None),
         }
 
     def plane_value(self) -> PlaneDesign:
@@ -604,6 +615,7 @@ class CalculationFrame(ttk.Frame):
         ttk.Button(corner, text="重置视图", command=self._reset_plot_view).pack(side=tk.LEFT)
         ttk.Button(corner, text="三维视图…", command=self._open_3d_view).pack(side=tk.LEFT, padx=(6, 0))
         ttk.Button(corner, text="土方调配…", command=self._open_haul).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(corner, text="场地放坡…", command=self._open_slope).pack(side=tk.LEFT, padx=(6, 0))
         self.plotter.on_triangle_click = self._on_triangle_selected
         
         # 选项卡2：汇总表
@@ -1184,6 +1196,23 @@ class CalculationFrame(ttk.Frame):
             self.haul_window.destroy()
         self.haul_window = HaulWindow(self, self.calculator, compact, self._project_name())
 
+    def _open_slope(self):
+        """场地放坡窗口：平台 + 自动放坡，不依赖当前计算结果。"""
+        try:
+            compact = self.soil_factors_value().compact
+        except ValueError as error:
+            messagebox.showerror("输入错误", str(error))
+            return
+        if self.slope_window is not None and self.slope_window.winfo_exists():
+            self.slope_window.destroy()
+
+        def remember(platforms, spacing):
+            self.slope_platforms = platforms
+            self.slope_spacing = spacing
+
+        self.slope_window = SlopeWindow(self, self.points, self.boundary, self.slope_platforms, self.slope_spacing,
+                                        compact, remember, self._project_name())
+
     def _reset_plot_view(self):
         self.plotter.reset_view()
 
@@ -1296,7 +1325,7 @@ class CalculationFrame(ttk.Frame):
                     pass
                 setattr(self, attr_name, None)
 
-        for name in ("view3d", "haul_window"):
+        for name in ("view3d", "haul_window", "slope_window"):
             window = getattr(self, name)
             if window is not None:
                 try:

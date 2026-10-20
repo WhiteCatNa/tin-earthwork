@@ -28,7 +28,7 @@ DESIGN_SETTING_KEYS = (
     "compare_points", "compare_source", "grid_enabled", "grid_spacing",
     "max_edge_length", "soil_factors", "contours_enabled", "contour_interval",
     "sections_enabled", "section_spacing", "section_angle", "design_points", "design_source",
-    "layers",
+    "layers", "slope_design",
 )
 DEFAULT_WINDOW_SIZE = (1400, 900)
 MIN_WINDOW_SIZE = (1200, 800)

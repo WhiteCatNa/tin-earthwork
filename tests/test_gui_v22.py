@@ -169,3 +169,35 @@ def test_haul_window(app, tmp_path, monkeypatch):
     window.compute()            # 错误输入：保留上次结果
     assert window.result is not None
     window.destroy()
+
+
+def test_slope_window_and_project(app, tmp_path, monkeypatch):
+    cf = _load(app, draw_hole=False)
+    cf._open_slope()
+    window = cf.slope_window
+    window.add_platform([(5.0, 5.0), (15.0, 5.0), (15.0, 15.0), (5.0, 15.0)])
+    window.vars["elevation"].set("11")
+    window.vars["fill_ratio"].set("2")
+    assert window._apply_edit()
+    window.spacing_var.set("1")
+    window.compute()
+    _wait(app, lambda: window.result is not None)
+    # 地面 10 + 0.1x，平台 11 m：平台内挖、填各 10×5×0.25 = 12.5（x=10 处正好 11）
+    assert window.result.platform_cut == pytest.approx(12.5) and window.result.platform_fill == pytest.approx(12.5)
+    assert window.result.total_cut > 12.5 and window.result.total_fill > 12.5
+    path = tmp_path / "slope.dxf"
+    monkeypatch.setattr("tkinter.filedialog.asksaveasfilename", lambda **k: str(path))
+    window._export()
+    assert "PLATFORM" in path.read_text(encoding="utf-8")
+
+    window.vars["cut_ratio"].set("0")
+    assert not window._apply_edit()
+    window.destroy()
+    assert cf.slope_platforms[0].fill_ratio == 2
+
+    project = tmp_path / "s.tinproj.json"
+    app.save_project_to(str(project))
+    app.load_project_from(str(project))
+    platform = app.calc_frame.slope_platforms[0]
+    assert (platform.elevation, platform.fill_ratio) == (11.0, 2.0)
+    assert app.calc_frame.slope_spacing == 1.0
