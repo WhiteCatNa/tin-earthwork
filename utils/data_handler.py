@@ -941,7 +941,7 @@ class DataExporter:
 
 
 PROJECT_FORMAT_VERSION = 2
-DESIGN_MODES = ("flat", "plane", "compare", "design_tin")
+DESIGN_MODES = ("flat", "plane", "compare")
 
 
 def _point_rows(points: List[SurveyPoint]) -> List[Dict[str, Any]]:
@@ -956,6 +956,9 @@ def _point_rows(points: List[SurveyPoint]) -> List[Dict[str, Any]]:
         }
         for point in points
     ]
+
+
+DESIGN_MODES += ("design_tin",)   # 设计三角网：设计点在 design_points 中
 
 
 def _points_from_rows(rows) -> List[SurveyPoint]:
