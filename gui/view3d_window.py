@@ -11,6 +11,7 @@ from core.calculator import CalculationResult
 from gui.theme import COLORS
 from utils.view3d import MAX_FACES, draw_3d, exaggeration_value, face_count
 import utils.plotter  # noqa: F401  导入时配置中文字体
+import mpl_toolkits.mplot3d  # noqa: F401  注册 3d 投影（打包时确保收入）
 
 
 def cancel_idle_draw(canvas: FigureCanvasTkAgg):
