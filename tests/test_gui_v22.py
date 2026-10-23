@@ -156,9 +156,12 @@ def test_haul_window(app, tmp_path, monkeypatch):
     _calculate(app, cf)
     cf._open_haul()
     window = cf.haul_window
+    _wait(app, lambda: not window.busy)
     assert window.result is not None
     window.size_var.set("10")
     window.compute()
+    assert window.busy
+    _wait(app, lambda: not window.busy)
     assert {z.name for z in window.result.zones} == {"A1", "A2", "B1", "B2"}
     assert len(window.move_tree.get_children()) == 2
     path = tmp_path / "h.xlsx"
@@ -167,6 +170,10 @@ def test_haul_window(app, tmp_path, monkeypatch):
     assert path.exists()
     window.size_var.set("x")
     window.compute()            # 错误输入：保留上次结果
+    assert window.result is not None and not window.busy
+    window.size_var.set("-5")
+    window.compute()            # 后台报错：同样保留上次结果
+    _wait(app, lambda: not window.busy)
     assert window.result is not None
     window.destroy()
 
@@ -227,3 +234,19 @@ def test_uncertainty_in_gui_and_project(app, tmp_path, monkeypatch):
     cf.sigma_measure_var.set("-1")
     with pytest.raises(ValueError):
         cf.uncertainty_values()
+
+
+def test_uncertainty_on_demand(app):
+    """计算时没勾选评定：点“不确定度…”在后台补算，期间“开始计算”不可用，完成后打开窗口、主图画出补测点。"""
+    cf = _load(app, draw_hole=False)
+    cf.design_elevation_var.set(10.5)
+    cf.uncertainty_enabled_var.set(False)
+    cf.recommend_var.set("2")
+    result = _calculate(app, cf)
+    assert result.uncertainty is None
+    cf._open_uncertainty()
+    assert str(cf.calculate_button["state"]) == "disabled"
+    _wait(app, lambda: cf.uncertainty_window is not None)
+    assert result.uncertainty is not None
+    assert str(cf.calculate_button["state"]) == "normal"
+    cf.uncertainty_window.destroy()

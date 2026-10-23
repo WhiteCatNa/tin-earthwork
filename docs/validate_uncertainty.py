@@ -1,7 +1,8 @@
 """不确定度评定与补测点推荐的仿真验证（docs/uncertainty_validation.md 的数据来源）。
 
-用法：python docs/validate_uncertainty.py 400 random 30 40
-      （测点数、布点方式 random/grid、地形组数、补测点数）
+用法：python docs/validate_uncertainty.py 400 random 30 40 [9000] [0.02]
+      （测点数、布点方式 random/grid、地形组数、补测点数、随机种子起点、测量中误差 m）
+      报告中的“标定组”用种子起点 5000，“检验组”用 9000（方法定型后才运行，未参与调参）。
 地形 = 48 + 0.02x + 12 个随机高斯山包/洼地，200 m × 200 m，设计高程 50 m，测量中误差 0.02 m；
 真值用 2000 × 2000 细网格数值积分。
 """
@@ -58,10 +59,10 @@ def volumes(xy, z):
     return calc, result, np.array([result.total_cut, result.total_fill, result.net_volume])
 
 
-def run(n, kind, groups, extra, sigma=0.02):
+def run(n, kind, groups, extra, sigma=0.02, base=5000):
     z_scores, before, after, added = [], [], [], []
     for seed in range(groups):
-        rng = np.random.default_rng(5000 + seed)
+        rng = np.random.default_rng(base + seed)
         f = terrain(rng)
         xy = np.vstack([CORNERS, layout(rng, n, kind)])
         z = f(xy[:, 0], xy[:, 1]) + rng.normal(0, sigma, len(xy))
@@ -80,7 +81,7 @@ def run(n, kind, groups, extra, sigma=0.02):
             added.append(errors)
     z_scores, before, after = np.array(z_scores), np.array(before), np.array(after)
     rms = lambda a: np.sqrt((a ** 2).mean(axis=0)).round(0)  # noqa: E731
-    print(f"{n} 点 {kind}，{groups} 组（挖方 / 填方 / 挖填差值）")
+    print(f"{n} 点 {kind}，{groups} 组，种子起点 {base}，σm = {sigma} m（挖方 / 填方 / 挖填差值）")
     print("  95% 区间覆盖率", (abs(z_scores) < 1.96).mean(axis=0).round(2), " z 均方根", rms(z_scores * 100) / 100)
     print("  均方根误差 TIN 法", rms(before), " 修正后", rms(after))
     if extra:
@@ -90,4 +91,7 @@ def run(n, kind, groups, extra, sigma=0.02):
 
 if __name__ == "__main__":
     n, kind, groups = int(sys.argv[1]), sys.argv[2], int(sys.argv[3])
-    run(n, kind, groups, int(sys.argv[4]) if len(sys.argv) > 4 else 0)
+    extra = int(sys.argv[4]) if len(sys.argv) > 4 else 0
+    base = int(sys.argv[5]) if len(sys.argv) > 5 else 5000
+    sigma = float(sys.argv[6]) if len(sys.argv) > 6 else 0.02
+    run(n, kind, groups, extra, sigma, base)

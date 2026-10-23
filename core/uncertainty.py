@@ -13,8 +13,10 @@ TIN 法方量的误差有两部分：
        B = mean(Vk − V) / (1/f − 1)        （f 为保留比例，取 0.5）
    修正后估计 V − B；内插部分的不确定度取
        σ² = sd²·(1 + 1/K) + (c·B)²
-   sd 为各次 (Vk − V)/(1/f − 1) 的标准差（随机抽稀造成的离散），c·B 计入“偏差估计本身不准”（c = 1）。
-   测点接近规则格网时，抽稀后的点不再规则，偏差会被高估或低估，评定中会提示。
+   sd 为各次 (Vk − V)/(1/f − 1) 的标准差（随机抽稀造成的离散），c·B 计入“偏差估计本身不准”。
+   挖填差值的这一项按 c²(B挖² + B填²) 计：挖方、填方偏差相减后大部分抵消，但各自的估计误差并不抵消。
+   测点接近规则格网（最近邻距离变异系数 < 0.3）时，随机抽稀打破了规则性，偏差估计不如不规则布点可靠，
+   c 取 1.0，否则取 0.5。
 
 补测点推荐：线性内插在三角形内的平均误差约为 κ·Σℓ²/12（ℓ 为边长，κ 为当地地面弯曲程度，1/m），
 三角形的方量误差尺度为 κ·g，g = A·Σℓ²/12。κ 由留一交叉验证（逐个去掉内部测点、用相邻点内插、看残差）
@@ -24,7 +26,7 @@ TIN 法方量的误差有两部分：
 import heapq
 import math
 from dataclasses import dataclass, field
-from typing import List, Optional, Sequence, Tuple
+from typing import Callable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -35,7 +37,8 @@ XY = Tuple[float, float]
 Z95 = 1.959964
 FRACTION = 0.5            # 抽稀时保留的内部测点比例
 REPEATS = 8               # 抽稀次数
-BIAS_INFLATION = 1.0      # c：偏差估计本身的不确定度按 c·B 计
+BIAS_INFLATION = 0.5      # c：偏差估计本身的不确定度按 c·B 计（不规则布点）
+BIAS_INFLATION_REGULAR = 1.0   # 接近规则格网时随机抽稀破坏了规则性，偏差估计更不准，c 取大一些
 MIN_INTERIOR = 20         # 内部测点少于此数时不做抽稀外推
 REGULAR_CV = 0.3          # 最近邻距离的变异系数低于此值视为接近规则格网
 MAX_LOO_POINTS = 5000
@@ -63,6 +66,7 @@ class UncertaintyResult:
     sigma_measure: float
     sigma_bias: float
     repeats: int = 0                                   # 实际完成的抽稀次数
+    regular: bool = False                              # 测点接近规则格网
     tin: Tuple[float, float, float] = (0.0, 0.0, 0.0)  # TIN 法 挖方、填方、挖填差值
     bias: Tuple[float, float, float] = (0.0, 0.0, 0.0)   # 估计的 TIN 法偏差（TIN − 真值）
     sigma: Tuple[float, float, float] = (0.0, 0.0, 0.0)  # 修正后估计的 1σ
@@ -262,6 +266,25 @@ def _triangle_g(vertices: np.ndarray) -> Tuple[float, float]:
     return area, edges
 
 
+def _g_arrays(vertices: np.ndarray) -> np.ndarray:
+    """批量计算 A·Σℓ²/12，vertices 形状 [N, 3, 2]。"""
+    a, b, c = vertices[:, 0], vertices[:, 1], vertices[:, 2]
+    area = np.abs((b[:, 0] - a[:, 0]) * (c[:, 1] - a[:, 1]) - (c[:, 0] - a[:, 0]) * (b[:, 1] - a[:, 1])) / 2
+    edges = ((a - b) ** 2).sum(axis=1) + ((b - c) ** 2).sum(axis=1) + ((c - a) ** 2).sum(axis=1)
+    return area * edges / 12
+
+
+def _centroid_split_g(vertices: np.ndarray) -> np.ndarray:
+    """批量计算在形心补点后三个小三角形的 A·Σℓ²/12 之和。"""
+    centroid = vertices.mean(axis=1)
+    total = np.zeros(len(vertices))
+    for k in range(3):
+        child = vertices.copy()
+        child[:, k] = centroid
+        total += _g_arrays(child)
+    return total
+
+
 def _split_g(vertices: np.ndarray, point: np.ndarray) -> float:
     """在 point 处补点后，三个小三角形的 A·Σℓ²/12 之和。"""
     total = 0.0
@@ -313,25 +336,29 @@ def _roughness(calculator: TINEarthworkCalculator, points: Sequence[SurveyPoint]
     if calculator.max_edge_length:
         lengths = np.linalg.norm(vertices - np.roll(vertices, -1, axis=1), axis=2)
         keep &= lengths.max(axis=1) <= calculator.max_edge_length
-    heap = []
-    for k in np.nonzero(keep)[0].tolist():
-        corners = vertices[k]
-        area, edges = _triangle_g(corners)
-        if area <= 0:
-            continue
-        k_tri = float(kappa[simplices[k]].mean())
-        g = area * edges / 12
-        out.indicator += k_tri * g
-        out.triangle_sigma.append(([tuple(v) for v in (corners + center).tolist()], k_tri * edges / 12))
-        point = corners.mean(axis=0)
-        heap.append((-k_tri * (g - _split_g(corners, point)), k, corners, point, k_tri))
+    g = _g_arrays(vertices)
+    keep &= g > 0
+    index = np.nonzero(keep)[0]
+    k_tri = kappa[simplices[index]].mean(axis=1)
+    g = g[index]
+    out.indicator = float((k_tri * g).sum())
+    u = vertices[index, 1] - vertices[index, 0]
+    v = vertices[index, 2] - vertices[index, 0]
+    mean_edges = g / (np.abs(u[:, 0] * v[:, 1] - u[:, 1] * v[:, 0]) / 2)     # Σℓ²/12：三角形内平均的 q
+    polygons = (vertices[index] + center).tolist()
+    out.triangle_sigma = [(polygon, value) for polygon, value in zip(polygons, (k_tri * mean_edges).tolist())]
     if not recommend or out.indicator <= 0:
         return
+    # 只有初始收益排在前 recommend 名的三角形可能被选中（每选一个点至多让出一个名额），其余不必入堆
+    gains = k_tri * (g - _centroid_split_g(vertices[index]))
+    top = np.argsort(-gains)[:recommend]
+    heap = [(-float(gains[j]), int(j), vertices[index[j]], vertices[index[j]].mean(axis=0), float(k_tri[j]))
+            for j in top.tolist()]
     heapq.heapify(heap)
     remaining = out.indicator
-    serial = len(simplices)
+    serial = len(index)
     while heap and len(out.recommendations) < recommend:
-        negative, _, corners, point, k_tri = heapq.heappop(heap)
+        negative, _, corners, point, k_value = heapq.heappop(heap)
         gain = -negative
         if gain <= 0:
             break
@@ -347,8 +374,8 @@ def _roughness(calculator: TINEarthworkCalculator, points: Sequence[SurveyPoint]
             if area <= 0 or not _inside(calculator, (centroid + center)[None])[0]:
                 continue
             serial += 1
-            heapq.heappush(heap, (-k_tri * (area * edges / 12 - _split_g(child, centroid)), serial, child,
-                                  centroid, k_tri))
+            heapq.heappush(heap, (-k_value * (area * edges / 12 - _split_g(child, centroid)), serial, child,
+                                  centroid, k_value))
 
 
 # ---------------------------------------------------------------------------
@@ -357,7 +384,8 @@ def _roughness(calculator: TINEarthworkCalculator, points: Sequence[SurveyPoint]
 
 def evaluate_uncertainty(calculator: TINEarthworkCalculator, result: CalculationResult, sigma_measure: float = 0.02,
                          sigma_bias: float = 0.0, recommend: int = 0, seed: int = 0,
-                         repeats: int = REPEATS) -> UncertaintyResult:
+                         repeats: int = REPEATS,
+                         progress: Optional[Callable[[float, str], None]] = None) -> UncertaintyResult:
     """评定 result 的挖方、填方、挖填差值不确定度，并推荐 recommend 个补测点（calculator 须已完成计算）。
 
     比较面为统一高程、斜面、分区或设计三角网时，只有实测地面有误差；两期对比时前期、后期两次测量都计入，
@@ -381,15 +409,20 @@ def evaluate_uncertainty(calculator: TINEarthworkCalculator, result: Calculation
 
     bias = np.zeros(3)
     interp_var = np.zeros(3)
+    count = max(int(repeats), 2)
     if interior < MIN_INTERIOR:
         out.warnings.append(f"内部测点少于 {MIN_INTERIOR} 个，无法用抽稀外推估计内插误差，只计测量误差")
     else:
-        if min(_nearest_cv(points) for points in surveys) < REGULAR_CV:
-            out.warnings.append("测点接近规则格网，抽稀外推对内插偏差的估计可能偏小，95% 区间宜适当放宽")
+        out.regular = min(_nearest_cv(points) for points in surveys) < REGULAR_CV
+        inflation = BIAS_INFLATION_REGULAR if out.regular else BIAS_INFLATION
+        if out.regular:
+            out.warnings.append("测点接近规则格网：随机抽稀会打破规则性，偏差估计不如不规则布点可靠，区间已相应放宽")
         design = list(calculator.compare_points) if result.is_design_tin else None
         scale = 1 / FRACTION - 1
         samples = []
-        for _ in range(max(int(repeats), 2)):
+        for k in range(count):
+            if progress is not None:
+                progress(k / (count + 1), f"抽稀重算 {k + 1}/{count}...")
             subsets = [_subsample(points, hull, FRACTION, rng) for points, hull in zip(surveys, hulls)]
             compare = subsets[1] if period else design
             try:
@@ -402,7 +435,11 @@ def evaluate_uncertainty(calculator: TINEarthworkCalculator, result: Calculation
             out.repeats = len(samples)
             bias = samples.mean(axis=0)
             spread = samples.std(axis=0, ddof=1)
-            interp_var = spread ** 2 * (1 + 1 / len(samples)) + (BIAS_INFLATION * bias) ** 2
+            # 偏差估计本身的误差按 c·B 计；挖填差值 = 挖方 − 填方，两者的偏差估计误差分别计入，
+            # 不能用相减后（大部分抵消了）的 B 来计
+            doubt = (inflation * bias) ** 2
+            doubt[2] = inflation ** 2 * (bias[0] ** 2 + bias[1] ** 2)
+            interp_var = spread ** 2 * (1 + 1 / len(samples)) + doubt
         else:
             out.warnings.append("抽稀后无法重新构网，只计测量误差")
 
@@ -420,6 +457,8 @@ def evaluate_uncertainty(calculator: TINEarthworkCalculator, result: Calculation
     out.measure_sigma = tuple(float(math.sqrt(v)) for v in measure_var)
     out.sigma = tuple(float(math.sqrt(a + b)) for a, b in zip(interp_var, measure_var))
 
+    if progress is not None:
+        progress(count / (count + 1), "估计误差分布、推荐补测点...")
     _roughness(calculator, surveys[-1], sigma_measure, out, recommend, rng)
     return out
 

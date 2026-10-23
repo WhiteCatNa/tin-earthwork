@@ -171,3 +171,26 @@ def test_reports_and_exports(tmp_path):
     project = tmp_path / "p.tinproj.json"
     save_project(str(project), calc.points, SQUARE, uncertainty={"enabled": True, "sigma_measure": 0.01, "recommend": 4})
     assert load_project(str(project))["uncertainty"]["recommend"] == 4
+
+
+def test_recommendations_drawn_on_result_plot():
+    from matplotlib.figure import Figure
+    from utils.plotter import PLOT_COLORS, draw_result
+
+    calc, result = _calc(n=200)
+    result.uncertainty = evaluate_uncertainty(calc, result, sigma_measure=0.005, recommend=6)
+    ax = Figure().add_subplot(111)
+    artists = draw_result(ax, result, calc.points, result.boundary_points, dict(PLOT_COLORS), fine=False)
+    assert len(artists["recommend"].get_xdata()) == 6
+    assert any("推荐补测点" in str(h.get_label()) for h in artists["legend"])
+
+
+def test_progress_callback_and_greedy_matches_full_heap():
+    calc, result = _calc(n=250)
+    steps = []
+    u = evaluate_uncertainty(calc, result, 0.005, recommend=12, progress=lambda f, text: steps.append((f, text)))
+    fractions = [f for f, _ in steps]
+    assert fractions == sorted(fractions) and len(steps) == 9 and 0 <= fractions[-1] < 1
+    # 只把初始收益前 recommend 名放进堆：多推荐几个点时，前 12 个应完全相同
+    more = evaluate_uncertainty(calc, result, 0.005, recommend=40)
+    assert [(r.x, r.y) for r in u.recommendations] == [(r.x, r.y) for r in more.recommendations[:12]]

@@ -143,9 +143,33 @@ def suggest_spacing(ground: Sequence[SurveyPoint]) -> float:
     return float(10 ** (exponent + 1))
 
 
-def _sample_points(platforms: Sequence[Platform], ground_xy: np.ndarray, spacing: float) -> np.ndarray:
-    xmin, ymin = ground_xy.min(axis=0) - spacing
-    xmax, ymax = ground_xy.max(axis=0) + spacing
+def _reach_box(platforms: Sequence[Platform], ground_xy: np.ndarray, ground_z: np.ndarray, spacing: float,
+               cut: bool) -> np.ndarray:
+    """挖方（或填方）坡面可能与地面相交的范围 [xmin, ymin, xmax, ymax]。
+
+    挖方坡面 Ds = H + d/m 到距离 d > m·(地面最高 − H) 处已高过所有地面，不会再有挖方；填方同理。
+    设计三角网只需铺满这个范围，范围外的方量本来就是 0，测点多时可省去大部分叠加计算。
+    """
+    boxes = []
+    for platform in platforms:
+        ring = np.asarray(platform.ring, dtype=float)
+        if cut:
+            reach = platform.cut_ratio * (float(ground_z.max()) - platform.elevation)
+        else:
+            reach = platform.fill_ratio * (platform.elevation - float(ground_z.min()))
+        reach = max(reach, 0.0) + 2 * spacing
+        boxes.append(np.r_[ring.min(axis=0) - reach, ring.max(axis=0) + reach])
+    box = np.array(boxes)
+    lower = np.maximum(box[:, :2].min(axis=0), ground_xy.min(axis=0) - spacing)
+    upper = np.minimum(box[:, 2:].max(axis=0), ground_xy.max(axis=0) + spacing)
+    return np.r_[lower, np.maximum(upper, lower + spacing)]
+
+
+def _sample_points(platforms: Sequence[Platform], ground_xy: np.ndarray, spacing: float,
+                   box: Optional[np.ndarray] = None) -> np.ndarray:
+    if box is None:
+        box = np.r_[ground_xy.min(axis=0) - spacing, ground_xy.max(axis=0) + spacing]
+    xmin, ymin, xmax, ymax = (float(v) for v in box)
     nx = int(math.ceil((xmax - xmin) / spacing)) + 1
     ny = int(math.ceil((ymax - ymin) / spacing)) + 1
     if nx * ny > MAX_SAMPLES:
@@ -191,10 +215,12 @@ def run_slope(ground: Sequence[SurveyPoint], platforms: Sequence[Platform], spac
     if not math.isfinite(spacing) or spacing <= 0:
         raise ValueError("放坡取样间距必须大于 0")
     ground_xy = np.array([(p.x, p.y) for p in ground])
-    samples = _sample_points(platforms, ground_xy, spacing)
-    ds, df = slope_surfaces(platforms, samples)
-    cut_run = _run_surface(ground, _design_points("S", samples, ds))
-    fill_run = _run_surface(ground, _design_points("F", samples, df))
+    ground_z = np.array([p.z for p in ground])
+    cut_samples = _sample_points(platforms, ground_xy, spacing, _reach_box(platforms, ground_xy, ground_z, spacing, True))
+    fill_samples = _sample_points(platforms, ground_xy, spacing,
+                                  _reach_box(platforms, ground_xy, ground_z, spacing, False))
+    cut_run = _run_surface(ground, _design_points("S", cut_samples, slope_surfaces(platforms, cut_samples)[0]))
+    fill_run = _run_surface(ground, _design_points("F", fill_samples, slope_surfaces(platforms, fill_samples)[1]))
     result = SlopeResult(list(platforms), spacing, cut_run.total_cut, fill_run.total_fill)
 
     for platform in platforms:

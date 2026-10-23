@@ -639,6 +639,15 @@ def draw_result(ax, result: CalculationResult, points: List[SurveyPoint],
                                         edgecolors='white', linewidth=0.3 if fine else 0.5, zorder=5,
                                         rasterized=rasterize)
 
+    uncertainty = getattr(result, "uncertainty", None)
+    if uncertainty is not None and uncertainty.recommendations:
+        rx = [r.x for r in uncertainty.recommendations]
+        ry = [r.y for r in uncertainty.recommendations]
+        artists["recommend"], = ax.plot(rx, ry, linestyle='none', marker='*', markersize=10 if fine else 12,
+                                        color=colors['zero'], markeredgecolor='white', markeredgewidth=0.6,
+                                        label=f'推荐补测点 {len(rx)} 个', zorder=9)
+        artists["legend"].append(artists["recommend"])
+
     if boundary:
         bx = [p[0] for p in boundary] + [boundary[0][0]]
         by = [p[1] for p in boundary] + [boundary[0][1]]

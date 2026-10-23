@@ -1,4 +1,6 @@
 """土方调配窗口：设定调配区边长，求最小运输量的调配方案，图表显示并导出 Excel。"""
+import queue
+import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
@@ -21,6 +23,9 @@ class HaulWindow(tk.Toplevel):
         self.compact = compact
         self.project_name = project_name
         self.result: HaulResult = None
+        self._thread = None
+        self._events = queue.Queue()
+        self._poll_id = None
         self.title(f"土方调配 - {project_name}" if project_name else "土方调配")
         self.geometry("1000x700")
         self.configure(bg=COLORS["bg"])
@@ -34,7 +39,8 @@ class HaulWindow(tk.Toplevel):
         entry.pack(side=tk.LEFT, padx=4)
         entry.bind("<Return>", lambda _e: self.compute())
         ttk.Label(bar, text=f"Ks' = {compact:g}（在计算设置中修改）", style="Muted.TLabel").pack(side=tk.LEFT, padx=8)
-        ttk.Button(bar, text="计算调配方案", style="Accent.TButton", command=self.compute).pack(side=tk.LEFT, padx=6)
+        self.compute_button = ttk.Button(bar, text="计算调配方案", style="Accent.TButton", command=self.compute)
+        self.compute_button.pack(side=tk.LEFT, padx=6)
         self.export_button = ttk.Button(bar, text="导出 Excel…", command=self._export, state=tk.DISABLED)
         self.export_button.pack(side=tk.RIGHT)
         self.summary_var = tk.StringVar(value="按方格划分调配区，区内先平衡，余缺部分按运输量（方量×运距）最小调配")
@@ -68,16 +74,46 @@ class HaulWindow(tk.Toplevel):
         return tree
 
     def compute(self):
+        """在后台求调配方案（测点多时线性规划和切分要几秒），完成后刷新表格和图。"""
+        if self._thread is not None:
+            return
         try:
             size = float(self.size_var.get())
-            self.config(cursor="watch")
-            self.update_idletasks()
-            self.result = run_haul(self.calculator, size, self.compact)
-        except ValueError as error:
-            messagebox.showerror("土方调配", str(error) if str(error) else "调配区边长必须是数字", parent=self)
+        except ValueError:
+            messagebox.showerror("土方调配", "调配区边长必须是数字", parent=self)
             return
-        finally:
-            self.config(cursor="")
+        self.summary_var.set("正在计算调配方案…")
+        self.compute_button.config(state=tk.DISABLED)
+        calculator, compact = self.calculator, self.compact
+
+        def worker():
+            try:
+                self._events.put(("done", run_haul(calculator, size, compact)))
+            except Exception as error:      # noqa: BLE001  交给主线程提示
+                self._events.put(("error", error))
+
+        self._thread = threading.Thread(target=worker, daemon=True)
+        self._thread.start()
+        self._poll()
+
+    @property
+    def busy(self) -> bool:
+        return self._thread is not None
+
+    def _poll(self):
+        try:
+            kind, payload = self._events.get_nowait()
+        except queue.Empty:
+            self._poll_id = self.after(50, self._poll)
+            return
+        self._poll_id = None
+        self._thread = None
+        self.compute_button.config(state=tk.NORMAL)
+        if kind == "error":
+            self.summary_var.set(summary_text(self.result) + "（均为自然方）" if self.result else "调配方案未算出")
+            messagebox.showerror("土方调配", str(payload) or "调配失败", parent=self)
+            return
+        self.result = payload
         self.summary_var.set(summary_text(self.result) + "（均为自然方）")
         zones, moves = haul_rows(self.result)
         for tree, rows in ((self.move_tree, moves), (self.zone_tree, zones)):
@@ -124,6 +160,11 @@ class HaulWindow(tk.Toplevel):
         messagebox.showinfo("导出完成", f"已保存：{path}", parent=self)
 
     def destroy(self):
+        if self._poll_id is not None:
+            try:
+                self.after_cancel(self._poll_id)
+            except tk.TclError:
+                pass
         cancel_idle_draw(self.canvas)
         self.figure.clear()
         super().destroy()

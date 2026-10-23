@@ -100,6 +100,8 @@ class CalculationFrame(ttk.Frame):
         self.haul_window = None
         self.slope_window = None
         self.uncertainty_window = None
+        self._uncertainty_thread = None
+        self._uncertainty_after_id = None
         self.slope_platforms: List[Platform] = []
         self.slope_spacing: Optional[float] = None
 
@@ -1089,19 +1091,21 @@ class CalculationFrame(ttk.Frame):
                         result.layers = run_layers(calculator, *layer_spec)
                     except ValueError as error:
                         result.warnings.append(f"分层土方未完成：{error}")
-                if uncertainty_spec is not None:
-                    self._worker_events.put(("progress", 74, "不确定度评定（抽稀重算）..."))
-                    try:
-                        result.uncertainty = evaluate_uncertainty(calculator, result, uncertainty_spec[0],
-                                                                  recommend=uncertainty_spec[1])
-                    except ValueError as error:
-                        result.warnings.append(f"不确定度评定未完成：{error}")
                 if grid_spacing is not None:
                     self._worker_events.put(("progress", 75, "方格网校核..."))
                     try:
                         result.grid_check = run_grid_check(calculator, result, grid_spacing)
                     except ValueError as error:
                         result.warnings.append(f"方格网校核未完成：{error}")
+                if uncertainty_spec is not None:
+                    self._worker_events.put(("progress", 76, "不确定度评定（抽稀重算）..."))
+                    try:
+                        result.uncertainty = evaluate_uncertainty(
+                            calculator, result, uncertainty_spec[0], recommend=uncertainty_spec[1],
+                            progress=lambda fraction, text: self._worker_events.put(
+                                ("progress", 76 + 13 * fraction, f"不确定度评定：{text}")))
+                    except ValueError as error:
+                        result.warnings.append(f"不确定度评定未完成：{error}")
                 self._worker_events.put(("progress", 90, "更新显示..."))
                 self._worker_events.put(("done", result))
             except Exception as error:
@@ -1259,21 +1263,66 @@ class CalculationFrame(ttk.Frame):
         self.haul_window = HaulWindow(self, self.calculator, compact, self._project_name())
 
     def _open_uncertainty(self):
-        """不确定度窗口：内插误差分布与推荐补测点。没评定过时用当前设置补算一次。"""
+        """不确定度窗口：内插误差分布与推荐补测点。没评定过时用当前设置在后台补算一次。"""
         if self.result is None:
             messagebox.showinfo("不确定度", "请先完成计算")
             return
-        if self.result.uncertainty is None:
+        if self.result.uncertainty is not None:
+            self._show_uncertainty_window()
+            return
+        if self._uncertainty_thread is not None:
+            return
+        try:
+            sigma, count = self.uncertainty_values()
+        except ValueError as error:
+            messagebox.showerror("不确定度", str(error))
+            return
+        result, calculator = self.result, self.calculator
+        events = queue.Queue()
+
+        def work():
             try:
-                sigma, count = self.uncertainty_values()
-                self.config(cursor="watch")
-                self.update_idletasks()
-                self.result.uncertainty = evaluate_uncertainty(self.calculator, self.result, sigma, recommend=count)
-            except ValueError as error:
-                messagebox.showerror("不确定度", str(error))
+                events.put(("done", evaluate_uncertainty(
+                    calculator, result, sigma, recommend=count,
+                    progress=lambda fraction, text: events.put(("progress", fraction, text)))))
+            except Exception as error:      # noqa: BLE001  后台线程的异常交给主线程提示
+                events.put(("error", error))
+
+        def poll():
+            self._uncertainty_after_id = None
+            if self._closing:
                 return
-            finally:
-                self.config(cursor="")
+            while True:
+                try:
+                    event = events.get_nowait()
+                except queue.Empty:
+                    break
+                if event[0] == "progress":
+                    self.status_var.set(f"不确定度评定：{event[2]}")
+                    continue
+                self._uncertainty_thread = None
+                self.calculate_button.config(state=tk.NORMAL)
+                if event[0] == "error":
+                    self.status_var.set("不确定度评定失败")
+                    messagebox.showerror("不确定度", str(event[1]))
+                    return
+                if self.result is result:
+                    result.uncertainty = event[1]
+                    self.status_var.set("不确定度评定完成")
+                    self.plotter._current_result = None       # 结果图重画，加上推荐补测点
+                    self._refresh_plot()
+                    self._update_summary_table()
+                    self._show_uncertainty_window()
+                return
+            self._uncertainty_after_id = self.after(50, poll)
+
+        self.status_var.set("不确定度评定：抽稀重算...")
+        self.calculate_button.config(state=tk.DISABLED)      # 评定期间不改动计算器
+        self._uncertainty_thread = threading.Thread(target=work, daemon=True)
+        self._uncertainty_thread.start()
+        self._uncertainty_after_id = self.after(50, poll)
+
+    def _show_uncertainty_window(self):
         if self.uncertainty_window is not None and self.uncertainty_window.winfo_exists():
             self.uncertainty_window.destroy()
         self.uncertainty_window = UncertaintyWindow(self, self.result, self._project_name())
@@ -1398,7 +1447,7 @@ class CalculationFrame(ttk.Frame):
         self._detail_load_token += 1
 
         for attr_name in ("_worker_poll_after_id", "_detail_load_after_id", "_export_poll_after_id",
-                          "_balance_poll_after_id"):
+                          "_balance_poll_after_id", "_uncertainty_after_id"):
             after_id = getattr(self, attr_name, None)
             if after_id is not None:
                 try:
