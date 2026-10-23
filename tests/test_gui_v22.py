@@ -147,7 +147,15 @@ def test_terrain_dialogs(app, tmp_path):
     dialog.cell_var.set("5")
     dialog.method_var.set("center")
     dialog.ok()
-    assert dialog.result == (5.0, "center", False)
+    assert dialog.result == (5.0, "center", False, 0.05)
+    dialog = LasDialog(app, cloud)
+    dialog.method_var.set("adaptive")
+    dialog.tolerance_var.set("0")
+    dialog.ok()
+    assert dialog.result is None
+    dialog.tolerance_var.set("0.1")
+    dialog.ok()
+    assert dialog.result[1:] == ("adaptive", False, 0.1)
 
 
 def test_haul_window(app, tmp_path, monkeypatch):
@@ -250,3 +258,46 @@ def test_uncertainty_on_demand(app):
     assert result.uncertainty is not None
     assert str(cf.calculate_button["state"]) == "normal"
     cf.uncertainty_window.destroy()
+
+
+def test_uncertainty_plan_and_significance(app, tmp_path, monkeypatch):
+    errors = []
+    monkeypatch.setattr("tkinter.messagebox.showerror", lambda title, msg, **k: errors.append(msg))
+    monkeypatch.setattr("tkinter.messagebox.showinfo", lambda *a, **k: None)
+    cf = _load(app, draw_hole=False)
+    cf.design_elevation_var.set(10.5)
+    cf.uncertainty_enabled_var.set(True)
+    cf.sigma_measure_var.set("0.01")
+    cf.recommend_var.set("2")
+    _calculate(app, cf)
+    cf._open_uncertainty()
+    window = cf.uncertainty_window
+    window.view_var.set("significance")
+    window._draw()
+    assert "显著性" in window.ax.get_title()
+    window.target_var.set("abc")
+    window.make_plan()
+    assert errors and window.plan is None
+    window.target_var.set("0.5")
+    window.make_plan()
+    assert window.plan is not None and window.plan_var.get()
+    # 测试数据是斜平面：没有内插误差，精度只受测量误差限制，不需要补测点
+    assert len(window.point_tree.get_children()) == len(window.points_to_export) == 0
+    assert "均匀加密" in window.plan_var.get()
+    window.destroy()
+
+
+def test_grade_window(app, monkeypatch):
+    cf = _load(app, draw_hole=False)
+    monkeypatch.setattr("core.grade_opt.MAX_EVALUATIONS", 20)
+    cf._open_grade()
+    window = cf.grade_window
+    window.zone_var.set("10")
+    window.compute()
+    assert window.busy and str(window.compute_button["state"]) == "disabled"
+    _wait(app, lambda: not window.busy, timeout=120)
+    assert window.result is not None and len(window.tree.get_children()) == 3
+    window.apply()
+    assert cf.design_mode_var.get() == "plane"
+    assert float(cf.plane_vars["h0"].get()) == pytest.approx(window.result.best.plane.h0, abs=1e-3)
+    window.destroy()

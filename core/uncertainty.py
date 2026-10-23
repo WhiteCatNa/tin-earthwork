@@ -26,7 +26,7 @@ TIN 法方量的误差有两部分：
 import heapq
 import math
 from dataclasses import dataclass, field
-from typing import Callable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -77,6 +77,9 @@ class UncertaintyResult:
     indicator: float = 0.0                              # 内插误差指标 Σκ·g (m³)
     recommendations: List[Recommendation] = field(default_factory=list)
     warnings: List[str] = field(default_factory=list)
+    natural_map: Optional["ErrorMap"] = field(default=None, repr=False)   # 实测（前期）地面的内插误差分布
+    compare_map: Optional["ErrorMap"] = field(default=None, repr=False)   # 两期对比时后期地面的内插误差分布
+    significance: Optional[Any] = None                 # 变化显著性（core.significance.SignificanceResult）
 
     @property
     def estimate(self) -> Tuple[float, float, float]:
@@ -306,29 +309,67 @@ def _inside(calculator: TINEarthworkCalculator, xy: np.ndarray) -> np.ndarray:
     return mask
 
 
-def _roughness(calculator: TINEarthworkCalculator, points: Sequence[SurveyPoint], sigma_m: float,
-               out: UncertaintyResult, recommend: int, rng: np.random.Generator) -> None:
-    """留一交叉验证估计局部曲率，生成误差分布图，并贪心推荐补测点。"""
+@dataclass
+class ErrorMap:
+    """一期测量的内插误差分布：三角形 k 内平均内插误差尺度 sigma[k] = κ·Σℓ²/12 (m)。"""
+    center: np.ndarray
+    tri: Any                        # scipy Delaunay（局部坐标 = 全局 − center）
+    sigma: np.ndarray
+    kappa: np.ndarray               # 各测点的局部 κ
+    loo: Optional[LooStats]
+
+    def at(self, xy: np.ndarray) -> np.ndarray:
+        """全局坐标处的内插误差尺度；网外为 NaN。"""
+        simplex = self.tri.find_simplex(np.asarray(xy, dtype=float) - self.center)
+        return np.where(simplex >= 0, self.sigma[np.maximum(simplex, 0)], np.nan)
+
+
+def error_map(points: Sequence[SurveyPoint], sigma_m: float, rng: np.random.Generator,
+              warnings: Optional[List[str]] = None) -> Optional[ErrorMap]:
+    """留一交叉验证估计局部弯曲程度 κ，得到每个三角形的平均内插误差尺度。测点太少时返回 None。"""
     from scipy.spatial import Delaunay, QhullError
 
+    warnings = warnings if warnings is not None else []
     xy_global = np.array([(p.x, p.y) for p in points], dtype=float)
+    if len(xy_global) < 3:
+        return None
     center = xy_global.mean(axis=0)
     xy = xy_global - center
     z = np.array([p.z for p in points], dtype=float)
     try:
         tri = Delaunay(xy)
     except QhullError:
-        return
+        return None
     loo = _loo(xy, z, rng)
     if loo is None or len(loo[0]) < 10:
-        out.warnings.append("内部测点太少，无法用留一交叉验证估计误差分布，不推荐补测点")
-        return
+        warnings.append("内部测点太少，无法用留一交叉验证估计误差分布，不推荐补测点")
+        return None
     kappa2 = _kappa2(loo[1], loo[2], loo[3], sigma_m)
-    out.loo = LooStats(len(loo[0]), float(np.sqrt((loo[1] ** 2).mean())), math.sqrt(kappa2))
+    stats = LooStats(len(loo[0]), float(np.sqrt((loo[1] ** 2).mean())), math.sqrt(kappa2))
     if kappa2 == 0:
-        out.warnings.append("留一残差不大于测量中误差，看不出内插误差，不推荐补测点")
+        warnings.append("留一残差不大于测量中误差，看不出内插误差，不推荐补测点")
+        kappa = np.zeros(len(xy))
+    else:
+        kappa = np.sqrt(_local_kappa2(len(xy), tri.vertex_neighbor_vertices, loo, sigma_m, kappa2))
+    vertices = xy[tri.simplices]
+    area = np.abs((vertices[:, 1, 0] - vertices[:, 0, 0]) * (vertices[:, 2, 1] - vertices[:, 0, 1])
+                  - (vertices[:, 2, 0] - vertices[:, 0, 0]) * (vertices[:, 1, 1] - vertices[:, 0, 1])) / 2
+    mean_edges = np.where(area > 0, _g_arrays(vertices) / np.maximum(area, 1e-300), 0.0)
+    return ErrorMap(center, tri, kappa[tri.simplices].mean(axis=1) * mean_edges, kappa, stats)
+
+
+def _roughness(calculator: TINEarthworkCalculator, points: Sequence[SurveyPoint], sigma_m: float,
+               out: UncertaintyResult, recommend: int, rng: np.random.Generator, role: str = "natural_map") -> None:
+    """留一交叉验证估计局部曲率，生成误差分布图，并贪心推荐补测点。role 为结果中存放误差分布的字段。"""
+    emap = error_map(points, sigma_m, rng, out.warnings)
+    if emap is None:
         return
-    kappa = np.sqrt(_local_kappa2(len(xy), tri.vertex_neighbor_vertices, loo, sigma_m, kappa2))
+    out.loo = emap.loo
+    setattr(out, role, emap)
+    if emap.loo.kappa == 0:
+        return
+    center, tri, kappa = emap.center, emap.tri, emap.kappa
+    xy = tri.points
 
     simplices = tri.simplices
     vertices = xy[simplices]
@@ -459,9 +500,34 @@ def evaluate_uncertainty(calculator: TINEarthworkCalculator, result: Calculation
 
     if progress is not None:
         progress(count / (count + 1), "估计误差分布、推荐补测点...")
-    _roughness(calculator, surveys[-1], sigma_measure, out, recommend, rng)
+    if period:
+        out.natural_map = error_map(surveys[0], sigma_measure, rng)
+    _roughness(calculator, surveys[-1], sigma_measure, out, recommend, rng,
+               "compare_map" if period else "natural_map")
+    try:
+        from core.significance import detect_changes
+        out.significance = detect_changes(calculator, result, out)
+    except ValueError as error:
+        out.warnings.append(f"变化显著性未计算：{error}")
     return out
 
 
 def recommendation_points(result: UncertaintyResult) -> List[XY]:
     return [(r.x, r.y) for r in result.recommendations]
+
+
+def extend_recommendations(calculator: TINEarthworkCalculator, result: CalculationResult, uncertainty: UncertaintyResult,
+                           count: int, seed: int = 0) -> None:
+    """把 uncertainty 的推荐补测点补到 count 个（不重做抽稀外推，只重算误差分布与贪心选点）。"""
+    count = int(count)
+    if count < 0 or count > 1000:
+        raise ValueError("推荐补测点数应在 0~1000 之间")
+    if count <= len(uncertainty.recommendations):
+        return
+    period = result.is_compare and not result.is_design_tin
+    points = list(calculator.compare_points if period else calculator.points)
+    scratch = UncertaintyResult(uncertainty.sigma_measure, uncertainty.sigma_bias)
+    _roughness(calculator, points, uncertainty.sigma_measure, scratch, count, np.random.default_rng(seed),
+               "compare_map" if period else "natural_map")
+    uncertainty.recommendations = scratch.recommendations
+    uncertainty.indicator = scratch.indicator or uncertainty.indicator

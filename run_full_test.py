@@ -24,6 +24,7 @@ from core.layers import run_layers
 from core.slope import Platform, run_slope
 from core.surface import PlaneDesign
 from core.uncertainty import evaluate_uncertainty
+from core.survey_plan import plan_survey
 from utils.data_handler import DataImporter, DataExporter
 
 
@@ -194,7 +195,11 @@ def run_full_pipeline(output_dir="."):
     uncertainty = evaluate_uncertainty(calc, flat_result, sigma_measure=0.02, recommend=10)
     estimate, half = uncertainty.estimate[2], uncertainty.rows()[2][3]
     _require(half > 0 and len(uncertainty.recommendations) == 10, "不确定度评定或补测点推荐未完成")
-    print(f"[12/13] 不确定度评定：挖填差值 {estimate:.1f} ± {half:.1f} m³（95%），推荐补测 {len(uncertainty.recommendations)} 点")
+    significance = uncertainty.significance
+    _require(significance is not None and significance.area > 0, "变化显著性未完成")
+    plan = plan_survey(uncertainty, len(calc.points), 0.02)
+    print(f"[12/13] 不确定度评定：挖填差值 {estimate:.1f} ± {half:.1f} m³（95%），推荐补测 {len(uncertainty.recommendations)} 点；"
+          f"{significance.uncertain_ratio:.0%} 面积高差不显著；\n        规划补测：{plan.summary_text()}")
     print(f"[13/13] 全流程通过，输出目录: {output_dir}")
     return result
 

@@ -4,7 +4,7 @@ from tkinter import messagebox, ttk
 from typing import List, Optional, Sequence, Tuple
 
 from gui.theme import COLORS
-from utils.terrain_import import (THIN_CENTER, THIN_LOWEST, LasCloud, TerrainSource, default_selection,
+from utils.terrain_import import (DEFAULT_TOLERANCE, THIN_ADAPTIVE, THIN_CENTER, THIN_LOWEST, LasCloud, TerrainSource, default_selection,
                                   suggest_cell)
 
 
@@ -94,8 +94,16 @@ class LasDialog(_OptionsDialog):
         ttk.Entry(row, textvariable=self.cell_var, width=8).pack(side=tk.LEFT, padx=6)
         self.method_var = tk.StringVar(value=THIN_LOWEST)
         for value, text in ((THIN_LOWEST, "每格取最低点（去掉植被、建筑等高出地面的点）"),
-                            (THIN_CENTER, "每格取最接近格网中心的点")):
+                            (THIN_CENTER, "每格取最接近格网中心的点"),
+                            (THIN_ADAPTIVE, "保精度抽稀：平坦处少留点、起伏处多留点")):
             ttk.Radiobutton(self.body, text=text, value=value, variable=self.method_var).pack(anchor=tk.W)
+        tolerance = ttk.Frame(self.body)
+        tolerance.pack(fill=tk.X, padx=(22, 0))
+        ttk.Label(tolerance, text="高程容差 (m)").pack(side=tk.LEFT)
+        self.tolerance_var = tk.StringVar(value=f"{DEFAULT_TOLERANCE:g}")
+        ttk.Entry(tolerance, textvariable=self.tolerance_var, width=6).pack(side=tk.LEFT, padx=6)
+        ttk.Label(tolerance, text="每个原始点到抽稀后三角网的高差不超过此值；宜大于点云噪声的 3 倍",
+                  style="Muted.TLabel").pack(side=tk.LEFT)
         self._buttons()
 
     def ok(self):
@@ -106,7 +114,14 @@ class LasDialog(_OptionsDialog):
         except ValueError:
             messagebox.showwarning("提示", "格网边长必须是大于 0 的数字", parent=self)
             return
-        self.result = (cell, self.method_var.get(), bool(self.ground_var.get()))
+        try:
+            tolerance = float(self.tolerance_var.get())
+            if not tolerance > 0:
+                raise ValueError
+        except ValueError:
+            messagebox.showwarning("提示", "高程容差必须是大于 0 的数字", parent=self)
+            return
+        self.result = (cell, self.method_var.get(), bool(self.ground_var.get()), tolerance)
         self.destroy()
 
 
@@ -114,5 +129,5 @@ def ask_dxf_options(parent, sources) -> Optional[Tuple[List[bool], float]]:
     return DxfTerrainDialog(parent, sources).show()
 
 
-def ask_las_options(parent, cloud) -> Optional[Tuple[float, str, bool]]:
+def ask_las_options(parent, cloud) -> Optional[Tuple[float, str, bool, float]]:
     return LasDialog(parent, cloud).show()

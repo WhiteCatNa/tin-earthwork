@@ -15,6 +15,7 @@ from core.grid_check import run_grid_check, suggest_spacing
 from core.surface import PlaneDesign
 from utils.view3d import surface_faces
 from gui.view3d_window import View3DWindow, cancel_idle_draw
+from gui.grade_window import GradeWindow
 from gui.haul_window import HaulWindow
 from gui.uncertainty_window import UncertaintyWindow
 from core.uncertainty import evaluate_uncertainty
@@ -98,6 +99,7 @@ class CalculationFrame(ttk.Frame):
         self._closing = False
         self.view3d = None
         self.haul_window = None
+        self.grade_window = None
         self.slope_window = None
         self.uncertainty_window = None
         self._uncertainty_thread = None
@@ -499,6 +501,8 @@ class CalculationFrame(ttk.Frame):
             row=4, column=0, columnspan=2, sticky="ew", pady=(4, 0), padx=(0, 4))
         ttk.Button(self.plane_frame, text="最小二乘最优斜面", command=self._best_fit_plane).grid(
             row=4, column=2, columnspan=2, sticky="ew", pady=(4, 0))
+        ttk.Button(self.plane_frame, text="按费用优化设计面（含调配运距）…", command=self._open_grade).grid(
+            row=5, column=0, columnspan=4, sticky="ew", pady=(4, 0))
 
         self.compare_frame = ttk.Frame(self.mode_container)
         compare_buttons = ttk.Frame(self.compare_frame)
@@ -955,6 +959,21 @@ class CalculationFrame(ttk.Frame):
 
         self._run_balance("求最优斜面", lambda: best_fit_plane(calculator, factors), done)
 
+    def _open_grade(self):
+        """设计面费用优化窗口：挖填、运距、外运、借土单价一起考虑，求总费用最小的斜面。"""
+        factors = self._balance_inputs()
+        if factors is None:
+            return
+        if self.grade_window is not None and self.grade_window.winfo_exists():
+            self.grade_window.destroy()
+
+        def apply(plane):
+            self.design_mode_var.set("plane")
+            self._on_mode_change()
+            self._set_plane(plane)
+
+        self.grade_window = GradeWindow(self, self.calculator, factors, apply, self._project_name())
+
     def _toggle_partition(self):
         """切换分区高程编辑状态"""
         if self.use_partition_var.get():
@@ -1325,7 +1344,7 @@ class CalculationFrame(ttk.Frame):
     def _show_uncertainty_window(self):
         if self.uncertainty_window is not None and self.uncertainty_window.winfo_exists():
             self.uncertainty_window.destroy()
-        self.uncertainty_window = UncertaintyWindow(self, self.result, self._project_name())
+        self.uncertainty_window = UncertaintyWindow(self, self.result, self._project_name(), self.calculator)
 
     def _open_slope(self):
         """场地放坡窗口：平台 + 自动放坡，不依赖当前计算结果。"""
@@ -1456,7 +1475,7 @@ class CalculationFrame(ttk.Frame):
                     pass
                 setattr(self, attr_name, None)
 
-        for name in ("view3d", "haul_window", "slope_window", "uncertainty_window"):
+        for name in ("view3d", "haul_window", "slope_window", "uncertainty_window", "grade_window"):
             window = getattr(self, name)
             if window is not None:
                 try:

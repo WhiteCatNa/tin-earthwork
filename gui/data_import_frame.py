@@ -237,13 +237,20 @@ class DataImportFrame(ttk.Frame):
                 points = built.points
             else:
                 built = None
+                self.config(cursor="watch")
+                self.update_idletasks()
                 points = terrain_import.cloud_points(data, *options)
         except ValueError as error:
             messagebox.showerror("错误", f"导入失败: {error}")
             return
+        finally:
+            self.config(cursor="")
         issues = DataValidator.validate_points(points)
         self._on_import_complete(points, issues, terrain_import.points_frame(points), quiet=True)
         message = f"导入完成，共 {len(points)} 个测量点"
+        if built is None and len(options) > 3 and options[1] == terrain_import.THIN_ADAPTIVE:
+            message += (f"\n\n保精度抽稀：保留点云中 {len(points) / max(data.count, 1):.2%} 的点，"
+                        f"每个原始点到三角网的高差不超过 {options[3]:g} m")
         if built is not None and built.conflicts:
             message += f"\n\n有 {built.conflicts} 处平面位置重合但高程不同的点，只保留了先读到的一个（高程点优先）。"
         if built is not None and built.flat_ratio > 0.05:

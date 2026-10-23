@@ -580,6 +580,11 @@ class DataExporter:
             if uncertainty.recommendations:
                 rows.append(['  推荐补测点', len(uncertainty.recommendations), '个',
                              f'内插误差指标可降至 {uncertainty.recommendations[-1].remaining:.0%}'])
+            significance = getattr(uncertainty, "significance", None)
+            if significance is not None:
+                rows.append(['变化显著性', f'{significance.confidence:.0%} 检测限', '', '检测限随地面起伏与点距逐处变化'])
+                for label, value, unit, note in significance.rows():
+                    rows.append([f'  {label}', round(value, 3), unit, note])
         grid = result.grid_check
         if grid is not None:
             comparison = {label: (diff, relative) for label, _, _, diff, relative in grid.comparison(result)}
@@ -748,6 +753,15 @@ class DataExporter:
                 for k, item in enumerate(uncertainty.recommendations, 1):
                     ws9.append([f"R{k}", round(item.x, 3), round(item.y, 3), round(item.reduction, 3),
                                 f"{item.remaining:.0%}"])
+            significance = getattr(uncertainty, "significance", None)
+            if significance is not None:
+                ws9.append([])
+                ws9.append([bold(ws9, f"变化显著性（{significance.confidence:.0%} 检测限，格网 {significance.cell:g} m）", 11)])
+                header(ws9, ["项目", "数值", "单位", "说明"])
+                for label, value, unit, note in significance.rows():
+                    ws9.append([label, round(value, 3), unit, note])
+                ws9.append(["对照", round(significance.fixed_lod, 3), "m",
+                            f"只计测量误差的常数检测限，判为显著的面积 {significance.fixed_significant_area:,.0f} m²"])
             for warning in uncertainty.warnings:
                 ws9.append(["提示", warning])
 
@@ -927,6 +941,9 @@ class DataExporter:
                       for label, tin, estimate, half, pct in uncertainty.rows()]
             lines += [f"推荐补测点 R{k}: X={item.x:.3f}, Y={item.y:.3f}"
                       for k, item in enumerate(uncertainty.recommendations, 1)]
+            significance = getattr(uncertainty, "significance", None)
+            if significance is not None:
+                lines.append(f"变化显著性（{significance.confidence:.0%} 检测限）：{significance.summary_text()}")
             lines += [f"- {item}" for item in uncertainty.warnings]
             section_text += "\n【不确定度评定】\n" + "\n".join(lines) + "\n"
         balance_section = ""

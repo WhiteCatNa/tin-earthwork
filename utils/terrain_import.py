@@ -306,6 +306,9 @@ def read_las(filepath: str) -> LasCloud:
 
 THIN_LOWEST = "lowest"
 THIN_CENTER = "center"
+THIN_ADAPTIVE = "adaptive"      # 保精度抽稀：保证每个原始点到抽稀后三角网的高程差不超过给定值
+DEFAULT_TOLERANCE = 0.05
+MAX_ADAPTIVE_CANDIDATES = 2_000_000
 
 
 def suggest_cell(xyz: np.ndarray, target: int = 50_000) -> float:
@@ -327,6 +330,7 @@ def thin_cloud(xyz: np.ndarray, cell: float, method: str = THIN_LOWEST) -> np.nd
         raise ValueError("抽稀格网边长必须大于 0")
     if method not in (THIN_LOWEST, THIN_CENTER):
         raise ValueError(f"未知的抽稀方式: {method}")
+
     if not len(xyz):
         return np.zeros(0, dtype=int)
     base = xyz[:, :2].min(axis=0)
@@ -343,13 +347,72 @@ def thin_cloud(xyz: np.ndarray, cell: float, method: str = THIN_LOWEST) -> np.nd
     return order[first]
 
 
+def adaptive_thin(xyz: np.ndarray, tolerance: float, max_points: int = MAX_CLOUD_POINTS,
+                  rounds: int = 60) -> np.ndarray:
+    """保精度抽稀（批量贪心插入）：从凸包顶点开始构网，每轮在每个三角形里加入高程差最大、且超过
+    tolerance 的那个点，直到所有点到三角网的高程差都不超过 tolerance。返回保留点的下标。
+
+    与格网抽稀相比，平坦处只留很少的点，起伏、坡折处自动加密；保证抽稀后的三角网与全部点的
+    高程差处处（在原始点上）不超过 tolerance，挖填方与用全部点构网相差约不超过 tolerance × 面积，
+    实际通常小得多（正负相抵）。
+    """
+    from scipy.spatial import ConvexHull, Delaunay, QhullError
+
+    if not math.isfinite(tolerance) or tolerance <= 0:
+        raise ValueError("高程容差必须大于 0")
+    n = len(xyz)
+    if n <= 3:
+        return np.arange(n)
+    xy = xyz[:, :2] - xyz[:, :2].mean(axis=0)
+    z = xyz[:, 2]
+    try:
+        selected = np.zeros(n, dtype=bool)
+        selected[ConvexHull(xy).vertices] = True
+    except QhullError:
+        raise ValueError("点云的点共线，无法构网") from None
+    for _ in range(rounds):
+        index = np.nonzero(selected)[0]
+        tri = Delaunay(xy[index])
+        rest = np.nonzero(~selected)[0]
+        if not len(rest):
+            break
+        simplex = tri.find_simplex(xy[rest])
+        inside = simplex >= 0
+        rest, simplex = rest[inside], simplex[inside]
+        transform = tri.transform[simplex]
+        b = np.einsum("nij,nj->ni", transform[:, :2], xy[rest] - transform[:, 2])
+        lam = np.column_stack([b, 1 - b.sum(axis=1)])
+        estimate = (lam * z[index][tri.simplices[simplex]]).sum(axis=1)
+        error = np.abs(z[rest] - estimate)
+        bad = error > tolerance
+        if not bad.any():
+            break
+        # 每个三角形里取误差最大的点
+        order = np.lexsort((-error[bad], simplex[bad]))
+        tri_sorted = simplex[bad][order]
+        first = np.ones(len(order), dtype=bool)
+        first[1:] = tri_sorted[1:] != tri_sorted[:-1]
+        selected[rest[bad][order][first]] = True
+        if selected.sum() > max_points:
+            raise ValueError(f"保精度抽稀后超过 {max_points} 个点，请加大高程容差")
+    return np.nonzero(selected)[0]
+
+
 def cloud_points(cloud: LasCloud, cell: float, method: str = THIN_LOWEST, ground_only: bool = True,
-                 prefix: str = "L") -> List[SurveyPoint]:
-    """点云 → 测点：可只取地面点，再按格网抽稀。"""
+                 tolerance: float = DEFAULT_TOLERANCE, prefix: str = "L") -> List[SurveyPoint]:
+    """点云 → 测点：可只取地面点，再按格网抽稀或保精度抽稀。
+
+    保精度抽稀时 cell 只用于预筛：点数超过 200 万时先按 cell 格网取最低点。
+    """
     xyz = cloud.xyz
     if ground_only and cloud.has_ground_class:
         xyz = xyz[cloud.classification == 2]
-    keep = thin_cloud(xyz, cell, method)
+    if method == THIN_ADAPTIVE:
+        if len(xyz) > MAX_ADAPTIVE_CANDIDATES:
+            xyz = xyz[thin_cloud(xyz, cell, THIN_LOWEST)]
+        keep = adaptive_thin(xyz, tolerance)
+    else:
+        keep = thin_cloud(xyz, cell, method)
     if len(keep) > MAX_CLOUD_POINTS:
         raise ValueError(f"抽稀后仍有 {len(keep)} 个点，请加大格网边长")
     if len(keep) < 3:
