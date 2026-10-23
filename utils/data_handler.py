@@ -21,7 +21,17 @@ from utils.fileio import atomic_write_text
 from version import __version__
 
 def report_labels(result: CalculationResult) -> Dict[str, str]:
-    """报告用语：与设计面比较，或两期对比。"""
+    """报告用语：与设计面比较、与设计三角网比较，或两期对比。"""
+    if result.is_design_tin:
+        return {
+            "natural": "实测高程",
+            "design": "设计高程",
+            "design_item": "设计面",
+            "cut": "实测高于设计面部分",
+            "fill": "实测低于设计面部分",
+            "method": "设计三角网叠加（实测、设计两个三角网精确求交，边界精确裁剪）",
+            "covered": "实测与设计三角网共同覆盖",
+        }
     if result.is_compare:
         return {
             "natural": "前期高程",
@@ -45,6 +55,10 @@ def report_labels(result: CalculationResult) -> Dict[str, str]:
 
 def _percent(value: Optional[float]) -> str:
     return "—" if value is None else f"{value:+.2f}%"
+
+
+def _half_percent(value: Optional[float]) -> str:
+    return "—" if value is None else f"± {value:.2f}%"
 
 
 ISSUE_NAMES = {
@@ -248,6 +262,19 @@ class DataImporter:
                         continue
                 else:
                     raise ValueError("无法识别CSV编码")
+            elif suffix in ['.dxf', '.las']:
+                # 地形图（高程点、注记、等高线）或点云：按默认选项取点，界面上可先选图层、抽稀方式
+                from utils import terrain_import
+                if suffix == '.dxf':
+                    sources = terrain_import.scan_dxf_terrain(filepath)
+                    if not sources:
+                        raise ValueError("DXF 中没有找到高程点、高程注记或带标高的等高线")
+                    points = terrain_import.build_terrain_points(
+                        sources, terrain_import.default_selection(sources)).points
+                else:
+                    cloud = terrain_import.read_las(filepath)
+                    points = terrain_import.cloud_points(cloud, terrain_import.suggest_cell(cloud.xyz))
+                return points, DataValidator.validate_points(points), terrain_import.points_frame(points)
             elif suffix in ['.txt', '.dat']:
                 points, format_errors, df = DataImporter.import_survey_text(
                     filepath, cass=(suffix == '.dat')
@@ -501,22 +528,63 @@ class DataExporter:
             ['计算面积', round(result.computed_area, 3), 'm²', f'计算边界内且{labels["covered"]}的水平面积'],
         ]
         if result.boundary_area > 0:
-            rows.append(['计算边界面积', round(result.boundary_area, 3), 'm²', ''])
+            rows.append(['计算边界面积', round(result.boundary_area, 3), 'm²',
+                         '已扣除挖空区' if result.holes else ''])
             rows.append(['测点覆盖率', round(result.coverage_ratio * 100, 2), '%', '低于 99.5% 时请核对边界'])
+        if result.holes:
+            rows.append(['挖空区', len(result.holes), '个', f'面积 {result.hole_area:.3f} m²，不计方量'])
+        if result.contours is not None:
+            rows.append(['等高线', f'等高距 {result.contours.interval:g} m', '',
+                         f'地面 {len(result.contours.natural)} 条、'
+                         f'{"后期" if result.is_compare and not result.is_design_tin else "设计面"} '
+                         f'{len(result.contours.design)} 条，见 DXF'])
+        if result.trimmed_triangles:
+            rows.append(['剔除长边三角形', len(result.trimmed_triangles), '个',
+                         f'边长超过 {result.max_edge_length:g} m，不计方量'])
         if result.design_description:
             # 斜面、两期对比的说明较长：数值列写类型，完整说明放在说明列
-            short = "两期对比" if result.is_compare else result.design_description.split("：", 1)[0]
+            short = result.design_description.split("：", 1)[0]
             rows.append([labels["design_item"], short, '', result.design_description])
         else:
             rows.append([labels["design_item"], result.design_text, '', ''])
         if result.is_compare:
-            rows.append(['后期测点数', result.compare_point_count, '个', ''])
+            rows.append(['设计点数' if result.is_design_tin else '后期测点数', result.compare_point_count, '个', ''])
         rows += [
             ['三角形数', result.triangle_count, '个',
              '两期三角网叠加后的计算单元' if result.is_compare else '参与计算的三角形'],
             ['混合三角形', result.mixed_triangle_count, '个', '跨越零填挖线，已按零线分割'],
             ['边界裁剪三角形', result.clipped_triangle_count, '个', '跨越计算边界，只计边界内部分'],
         ]
+        if result.soil_balance is not None:
+            rows += result.soil_balance.rows()
+        sections = result.sections
+        if sections is not None:
+            comparison = {label: (diff, relative) for label, _, _, diff, relative in sections.comparison(result)}
+            rows += [
+                ['断面法', f'间距 {sections.spacing:g} m', '',
+                 f'{len(sections.sections)} 个断面，推进方向 {sections.angle:g}°，平均断面法'],
+                ['断面法挖方', round(sections.total_cut, 3), 'm³', f'与 TIN 法相差 {_percent(comparison["挖方"][1])}'],
+                ['断面法填方', round(sections.total_fill, 3), 'm³', f'与 TIN 法相差 {_percent(comparison["填方"][1])}'],
+            ]
+        layers = result.layers
+        if layers is not None:
+            rows.append(['分层土方', layers.title, '', f'{len(layers.rows)} 层'])
+            for row in layers.rows:
+                rows.append([f'  {row.label(layers.mode)}', f'挖 {row.cut:.3f} / 填 {row.fill:.3f}', 'm³', ''])
+        uncertainty = result.uncertainty
+        if uncertainty is not None:
+            rows.append(['不确定度评定', f'测量中误差 {uncertainty.sigma_measure:g} m', '',
+                         f'抽稀外推 {uncertainty.repeats} 次；修正后估计 ± 95% 区间半宽'])
+            for label, _, estimate, half, pct in uncertainty.rows():
+                rows.append([f'  {label}', f'{estimate:.3f} ± {half:.3f}', 'm³', _half_percent(pct)])
+            if uncertainty.recommendations:
+                rows.append(['  推荐补测点', len(uncertainty.recommendations), '个',
+                             f'内插误差指标可降至 {uncertainty.recommendations[-1].remaining:.0%}'])
+            significance = getattr(uncertainty, "significance", None)
+            if significance is not None:
+                rows.append(['变化显著性', f'{significance.confidence:.0%} 检测限', '', '检测限随地面起伏与点距逐处变化'])
+                for label, value, unit, note in significance.rows():
+                    rows.append([f'  {label}', round(value, 3), unit, note])
         grid = result.grid_check
         if grid is not None:
             comparison = {label: (diff, relative) for label, _, _, diff, relative in grid.comparison(result)}
@@ -630,6 +698,73 @@ class DataExporter:
             for row in self.grid_cell_rows(result):
                 ws6.append(row)
 
+        sections = result.sections
+        if sections is not None:
+            ws7 = wb.create_sheet("断面法")
+            for column, width in zip("ABCDEFGH", (10, 14, 16, 16, 14, 16, 16, 30)):
+                ws7.column_dimensions[column].width = width
+            ws7.append([bold(ws7, f"断面法（间距 {sections.spacing:g} m，推进方向 {sections.angle:g}°，平均断面法）", 12)])
+            ws7.append([])
+            header(ws7, ["项目", "TIN 法", "断面法", "差值", "相对差"])
+            for label, tin_value, value, diff, relative in sections.comparison(result):
+                ws7.append([label, round(tin_value, 3), round(value, 3), round(diff, 3), _percent(relative)])
+            ws7.append([])
+            header(ws7, ["断面", "里程(m)", "挖方面积(m²)", "填方面积(m²)", "至下一断面(m)",
+                         "区间挖方(m³)", "区间填方(m³)", "断面起点 X, Y"])
+            for k, section in enumerate(sections.sections):
+                interval = sections.volumes[k] if k < len(sections.volumes) else ("", "", "")
+                ws7.append([section.index, round(section.station, 3), round(section.cut_area, 3),
+                            round(section.fill_area, 3),
+                            *[round(value, 3) if value != "" else "" for value in interval],
+                            f"{section.start[0]:.3f}, {section.start[1]:.3f}"])
+            for warning in sections.warnings:
+                ws7.append(["提示", warning])
+
+        layers = result.layers
+        if layers is not None:
+            ws8 = wb.create_sheet("分层土方")
+            for column, width in zip("ABC", (28, 16, 16)):
+                ws8.column_dimensions[column].width = width
+            ws8.append([bold(ws8, f"分层土方（{layers.title}）", 12)])
+            ws8.append([])
+            header(ws8, ["分层", "挖方(m³)", "填方(m³)"])
+            for row in layers.rows:
+                ws8.append([row.label(layers.mode), round(row.cut, 3), round(row.fill, 3)])
+            ws8.append(["合计", round(layers.total_cut, 3), round(layers.total_fill, 3)])
+
+        uncertainty = result.uncertainty
+        if uncertainty is not None:
+            ws9 = wb.create_sheet("不确定度评定")
+            for column, width in zip("ABCDEF", (16, 16, 16, 18, 14, 40)):
+                ws9.column_dimensions[column].width = width
+            ws9.append([bold(ws9, "土方量不确定度评定", 12)])
+            ws9.append([f"测量中误差 {uncertainty.sigma_measure:g} m，系统误差 {uncertainty.sigma_bias:g} m，"
+                        f"抽稀外推 {uncertainty.repeats} 次"])
+            ws9.append([])
+            header(ws9, ["项目", "TIN 法(m³)", "修正后估计(m³)", "95% 区间半宽(m³)", "半宽占比", "其中内插 / 测量 1σ(m³)"])
+            for (label, tin, estimate, half, pct), interp, measure in zip(
+                    uncertainty.rows(), uncertainty.interp_sigma, uncertainty.measure_sigma):
+                ws9.append([label, round(tin, 3), round(estimate, 3), round(half, 3), _half_percent(pct),
+                            f"{interp:.3f} / {measure:.3f}"])
+            if uncertainty.recommendations:
+                ws9.append([])
+                ws9.append([bold(ws9, "推荐补测点（按收益从大到小）", 11)])
+                header(ws9, ["序号", "X", "Y", "误差指标减少(m³)", "补到此点后剩余"])
+                for k, item in enumerate(uncertainty.recommendations, 1):
+                    ws9.append([f"R{k}", round(item.x, 3), round(item.y, 3), round(item.reduction, 3),
+                                f"{item.remaining:.0%}"])
+            significance = getattr(uncertainty, "significance", None)
+            if significance is not None:
+                ws9.append([])
+                ws9.append([bold(ws9, f"变化显著性（{significance.confidence:.0%} 检测限，格网 {significance.cell:g} m）", 11)])
+                header(ws9, ["项目", "数值", "单位", "说明"])
+                for label, value, unit, note in significance.rows():
+                    ws9.append([label, round(value, 3), unit, note])
+                ws9.append(["对照", round(significance.fixed_lod, 3), "m",
+                            f"只计测量误差的常数检测限，判为显著的面积 {significance.fixed_significant_area:,.0f} m²"])
+            for warning in uncertainty.warnings:
+                ws9.append(["提示", warning])
+
         # 先完整写入内存再落盘：目标文件被占用时不会留下半成品和临时文件
         buffer = io.BytesIO()
         wb.save(buffer)
@@ -643,7 +778,7 @@ class DataExporter:
         return True
 
     def export_boundary_dxf(self, result: CalculationResult, filepath: str) -> bool:
-        """导出计算边界（闭合多段线）和零填挖线到 DXF。
+        """导出计算边界、挖空区（闭合多段线）和零填挖线到 DXF。
 
         采用 R12 格式的 POLYLINE，AutoCAD、CASS 等都能直接打开。
         """
@@ -651,21 +786,31 @@ class DataExporter:
                  "0\nSECTION\n2\nENTITIES\n"]
         if result.boundary_points:
             parts.append(self._dxf_polyline("BOUNDARY", result.boundary_points, closed=True))
+        for hole in result.holes:
+            parts.append(self._dxf_polyline("HOLE", hole, closed=True))
         for polyline in chain_segments(extract_zero_contour_segments(result)):
             if len(polyline) >= 2:
                 parts.append(self._dxf_polyline("ZERO_CONTOUR", polyline, closed=False))
         if result.grid_check is not None:
             parts.extend(self._dxf_grid(result.grid_check))
+        if result.contours is not None:
+            parts.extend(self._dxf_contours(result))
+        if result.sections is not None:
+            size = max(result.sections.spacing * 0.15, 0.3)
+            for section in result.sections.sections:
+                parts.append(self._dxf_polyline("SECTION", [section.start, section.end], closed=False))
+                parts.append(self._dxf_text("SECTION", section.start[0], section.start[1], size, f"{section.index}"))
         parts.append("0\nENDSEC\n0\nEOF\n")
         with open(filepath, "w", encoding="utf-8") as handle:
             handle.write("".join(parts))
         return True
 
     @staticmethod
-    def _dxf_polyline(layer: str, points, closed: bool) -> str:
-        lines = [f"0\nPOLYLINE\n8\n{layer}\n66\n1\n10\n0.0\n20\n0.0\n30\n0.0\n70\n{1 if closed else 0}\n"]
+    def _dxf_polyline(layer: str, points, closed: bool, elevation: float = 0.0) -> str:
+        z = repr(float(elevation))
+        lines = [f"0\nPOLYLINE\n8\n{layer}\n66\n1\n10\n0.0\n20\n0.0\n30\n{z}\n70\n{1 if closed else 0}\n"]
         for x, y in points:
-            lines.append(f"0\nVERTEX\n8\n{layer}\n10\n{float(x)!r}\n20\n{float(y)!r}\n30\n0.0\n")
+            lines.append(f"0\nVERTEX\n8\n{layer}\n10\n{float(x)!r}\n20\n{float(y)!r}\n30\n{z}\n")
         lines.append(f"0\nSEQEND\n8\n{layer}\n")
         return "".join(lines)
 
@@ -707,6 +852,25 @@ class DataExporter:
             parts.append(cls._dxf_text("GRID_VOLUME", cx - a * 0.3, cy, size, text))
         return parts
 
+    @classmethod
+    def _dxf_contours(cls, result: CalculationResult) -> List[str]:
+        """等高线：多段线标高即等高线高程，可直接在 CAD/CASS 中当作等高线使用。
+
+        地面等高线在 CONTOUR（首曲线）/ CONTOUR_MAJOR（计曲线），设计面（两期对比时为后期地面）
+        在 DESIGN_CONTOUR / DESIGN_CONTOUR_MAJOR；计曲线中部标注高程（CONTOUR_LABEL）。
+        """
+        contours = result.contours
+        size = max(contours.interval * 0.5, 0.2)
+        parts: List[str] = []
+        for prefix, items in (("", contours.natural), ("DESIGN_", contours.design)):
+            for contour in items:
+                layer = f"{prefix}CONTOUR_MAJOR" if contour.major else f"{prefix}CONTOUR"
+                parts.append(cls._dxf_polyline(layer, contour.polyline, closed=False, elevation=contour.level))
+                if contour.major:
+                    x, y = contour.polyline[len(contour.polyline) // 2]
+                    parts.append(cls._dxf_text(f"{prefix}CONTOUR_LABEL", x, y, size, f"{contour.level:g}"))
+        return parts
+
     def generate_report_text(self, result: CalculationResult, point_count: int) -> str:
         """生成文本报告"""
         labels = report_labels(result)
@@ -720,11 +884,27 @@ class DataExporter:
         if result.boundary_area > 0:
             area_lines += (
                 f"\n计算边界面积: {result.boundary_area:.3f} m²"
-                f"（测点覆盖率 {result.coverage_ratio * 100:.2f}%）"
+                f"（{'已扣除挖空区，' if result.holes else ''}测点覆盖率 {result.coverage_ratio * 100:.2f}%）"
+            )
+        if result.holes:
+            area_lines += f"\n挖空区: {len(result.holes)} 个，面积 {result.hole_area:.3f} m²，不计方量"
+        if result.trimmed_triangles:
+            area_lines += (
+                f"\n三角网清理: 剔除边长超过 {result.max_edge_length:g} m 的三角形 "
+                f"{len(result.trimmed_triangles)} 个，不计方量"
             )
         warnings = "\n".join(f"- {item}" for item in result.warnings) or "无"
         point_lines = f"测量点数: {point_count}"
-        if result.is_compare:
+        if result.is_design_tin:
+            point_lines = f"实测点数: {point_count}\n设计点数: {result.compare_point_count}"
+            notes = (
+                "1. 实测点、设计点分别构建TIN三角网，两网精确叠加后，每个计算单元内实测地面和设计面均为平面。\n"
+                "2. 高差 = 实测高程 − 设计高程；正为挖方，负为填方。\n"
+                "3. 跨越计算边界的单元按边界精确裁剪；只计算实测与设计三角网都覆盖的部分。\n"
+                "4. 混合挖填单元已按零填挖线分割计算，避免正负高差抵消。\n"
+                "5. 计算结果仅供工程参考，正式计量请以复核成果为准。"
+            )
+        elif result.is_compare:
             point_lines = f"前期测点数: {point_count}\n后期测点数: {result.compare_point_count}"
             notes = (
                 "1. 前期、后期测点分别构建TIN三角网，两网精确叠加后，每个计算单元内两期地面均为平面。\n"
@@ -741,6 +921,37 @@ class DataExporter:
                 "4. 所有三角形均保留面积、顶点高程、高差及分项体积，可逐项复核。\n"
                 "5. 计算结果仅供工程参考，正式计量请以复核成果为准。"
             )
+        section_text = ""
+        if result.sections is not None:
+            lines = [f"断面间距 {result.sections.spacing:g} m，推进方向 {result.sections.angle:g}°，"
+                     f"共 {len(result.sections.sections)} 个断面，平均断面法"]
+            for label, tin_value, value, diff, relative in result.sections.comparison(result):
+                lines.append(f"{label}: 断面法 {value:.3f} m³，TIN 法 {tin_value:.3f} m³，"
+                             f"相差 {diff:+.3f} m³（{_percent(relative)}）")
+            lines += [f"- {item}" for item in result.sections.warnings]
+            section_text = "\n【断面法校核】\n" + "\n".join(lines) + "\n"
+        if result.layers is not None:
+            section_text += "\n【分层土方】\n" + result.layers.title + "\n" + "\n".join(
+                f"{row.label(result.layers.mode)}: 挖方 {row.cut:.3f} m³，填方 {row.fill:.3f} m³"
+                for row in result.layers.rows) + "\n"
+        if result.uncertainty is not None:
+            uncertainty = result.uncertainty
+            lines = [f"测量中误差 {uncertainty.sigma_measure:g} m，抽稀外推 {uncertainty.repeats} 次（修正后估计 ± 95% 区间半宽）"]
+            lines += [f"{label}: TIN 法 {tin:.3f} m³，修正后 {estimate:.3f} ± {half:.3f} m³（{_half_percent(pct)}）"
+                      for label, tin, estimate, half, pct in uncertainty.rows()]
+            lines += [f"推荐补测点 R{k}: X={item.x:.3f}, Y={item.y:.3f}"
+                      for k, item in enumerate(uncertainty.recommendations, 1)]
+            significance = getattr(uncertainty, "significance", None)
+            if significance is not None:
+                lines.append(f"变化显著性（{significance.confidence:.0%} 检测限）：{significance.summary_text()}")
+            lines += [f"- {item}" for item in uncertainty.warnings]
+            section_text += "\n【不确定度评定】\n" + "\n".join(lines) + "\n"
+        balance_section = ""
+        if result.soil_balance is not None:
+            balance_section = "\n【土方平衡】\n" + "\n".join(
+                f"{label}: {value}{' ' + unit if unit else ''}" + (f"（{note}）" if note else "")
+                for label, value, unit, note in result.soil_balance.rows()
+            ) + "\n"
         grid_section = ""
         grid = result.grid_check
         if grid is not None:
@@ -777,7 +988,7 @@ class DataExporter:
 总填方量: {result.total_fill:.3f} m³
 挖填差值: {result.net_volume:.3f} m³
 {balance}
-{grid_section}
+{balance_section}{section_text}{grid_section}
 【计算提示】
 {warnings}
 
@@ -819,6 +1030,10 @@ class DataExporter:
 
             figure = create_standalone_figure(result, points, boundary, self.project_name)
             pdf.savefig(figure)
+            if result.sections is not None:
+                from utils.plotter import create_section_pages
+                for page in create_section_pages(result, self.project_name):
+                    pdf.savefig(page)
         return True
 
 
@@ -838,6 +1053,9 @@ def _point_rows(points: List[SurveyPoint]) -> List[Dict[str, Any]]:
         }
         for point in points
     ]
+
+
+DESIGN_MODES += ("design_tin",)   # 设计三角网：设计点在 design_points 中
 
 
 def _points_from_rows(rows) -> List[SurveyPoint]:
@@ -872,6 +1090,19 @@ def save_project(
     design_plane: Optional[Dict[str, float]] = None,
     compare_points: Optional[List[SurveyPoint]] = None,
     compare_source: str = "",
+    design_points: Optional[List[SurveyPoint]] = None,
+    design_source: str = "",
+    holes: Optional[List[List[Tuple[float, float]]]] = None,
+    max_edge_length: Optional[float] = None,
+    soil_factors: Optional[Dict[str, float]] = None,
+    contours_enabled: bool = True,
+    contour_interval: Optional[float] = None,
+    sections_enabled: bool = False,
+    section_spacing: Optional[float] = None,
+    section_angle: float = 0.0,
+    layers: Optional[Dict[str, Any]] = None,
+    slope_design: Optional[Dict[str, Any]] = None,
+    uncertainty: Optional[Dict[str, Any]] = None,
     grid_enabled: bool = False,
     grid_spacing: Optional[float] = None,
 ) -> None:
@@ -891,6 +1122,19 @@ def save_project(
         "grid_check": {"enabled": bool(grid_enabled), "spacing": None if grid_spacing is None else float(grid_spacing)},
         "compare_source": compare_source,
         "boundary": [[float(x), float(y)] for x, y in boundary],
+        "holes": [[[float(x), float(y)] for x, y in hole] for hole in (holes or [])],
+        "max_edge_length": None if not max_edge_length else float(max_edge_length),
+        "soil_factors": {key: float(value) for key, value in (soil_factors or {}).items()} or None,
+        "contours": {"enabled": bool(contours_enabled),
+                     "interval": None if not contour_interval else float(contour_interval)},
+        "design_points": _point_rows(design_points or []),
+        "design_source": design_source,
+        "sections": {"enabled": bool(sections_enabled),
+                     "spacing": None if not section_spacing else float(section_spacing),
+                     "angle": float(section_angle or 0.0)},
+        "layers": layers or None,
+        "slope_design": slope_design or None,
+        "uncertainty": uncertainty or None,
         "points": _point_rows(points),
         "compare_points": _point_rows(compare_points or []),
     }
@@ -923,6 +1167,19 @@ def load_project(filepath: str) -> Dict[str, Any]:
         "grid_spacing": None if grid.get("spacing") is None else float(grid["spacing"]),
         "compare_source": payload.get("compare_source") or "",
         "boundary": boundary,
+        "holes": [[(float(x), float(y)) for x, y in hole] for hole in (payload.get("holes") or [])],
+        "max_edge_length": None if not payload.get("max_edge_length") else float(payload["max_edge_length"]),
+        "soil_factors": payload.get("soil_factors") or None,
+        "contours_enabled": bool((payload.get("contours") or {"enabled": True}).get("enabled", True)),
+        "contour_interval": (payload.get("contours") or {}).get("interval") or None,
+        "design_points": _points_from_rows(payload.get("design_points")),
+        "design_source": payload.get("design_source") or "",
+        "sections_enabled": bool((payload.get("sections") or {}).get("enabled")),
+        "section_spacing": (payload.get("sections") or {}).get("spacing") or None,
+        "section_angle": float((payload.get("sections") or {}).get("angle") or 0.0),
+        "layers": payload.get("layers") or None,
+        "slope_design": payload.get("slope_design") or None,
+        "uncertainty": payload.get("uncertainty") or None,
         "points": _points_from_rows(payload.get("points")),
         "compare_points": compare_points,
     }

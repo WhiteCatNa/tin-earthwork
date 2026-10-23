@@ -162,6 +162,27 @@ def select_boundary_polyline(polylines: List[DxfPolyline]) -> DxfPolyline:
     return max(usable, key=score)
 
 
+def import_holes_from_dxf(filepath: str,
+                          boundary: Optional[List[Tuple[float, float]]] = None) -> List[List[Tuple[float, float]]]:
+    """把 DXF 中的闭合多段线作为挖空区读入；给定计算边界时只取完整位于边界以内的。"""
+    import numpy as np
+    from core.geometry import normalize_ring, ring_inside_ring
+
+    outer = normalize_ring(boundary) if boundary and len(boundary) >= 3 else None
+    holes: List[List[Tuple[float, float]]] = []
+    for item in parse_dxf_polylines(filepath):
+        closed = item.closed or (len(item.points) >= 2 and item.points[0] == item.points[-1])
+        ring = _ring_points(item.points)
+        if not closed or len(ring) < 3:
+            continue
+        if outer is not None and not ring_inside_ring(np.asarray(ring, dtype=float), outer):
+            continue
+        holes.append(ring)
+    if not holes:
+        raise ValueError("DXF 中没有位于计算边界以内的闭合多段线")
+    return holes
+
+
 def import_boundary_from_dxf(filepath: str) -> List[Tuple[float, float]]:
     """从 DXF 取出一条计算边界多边形。"""
     chosen = select_boundary_polyline(parse_dxf_polylines(filepath))

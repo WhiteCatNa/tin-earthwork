@@ -26,6 +26,9 @@ PROJECT_SUFFIXES = (".tinproj.json", ".json")
 DESIGN_SETTING_KEYS = (
     "design_elevation", "use_partition", "partition", "design_mode", "design_plane",
     "compare_points", "compare_source", "grid_enabled", "grid_spacing",
+    "max_edge_length", "soil_factors", "contours_enabled", "contour_interval",
+    "sections_enabled", "section_spacing", "section_angle", "design_points", "design_source",
+    "layers", "slope_design", "uncertainty",
 )
 DEFAULT_WINDOW_SIZE = (1400, 900)
 MIN_WINDOW_SIZE = (1200, 800)
@@ -53,6 +56,7 @@ class MainApplication(tk.Tk):
         # 数据状态
         self.points: list[SurveyPoint] = []
         self.boundary: list[tuple[float, float]] = []
+        self.holes: list[list[tuple[float, float]]] = []   # 挖空区
         self.project_name_var = tk.StringVar(value=DEFAULT_PROJECT_NAME)
         self.project_path = None
         self._pending_design_settings = None  # 打开工程时读到、等计算页创建后再应用的设置
@@ -225,7 +229,7 @@ class MainApplication(tk.Tk):
         self._update_project_label()
         if self.calc_frame is not None:
             # 测点变了，旧结果作废；须重新确认边界后才能计算和导出
-            self.calc_frame.update_inputs(points, self.boundary)
+            self.calc_frame.update_inputs(points, self.boundary, self.holes)
             self.notebook.tab(2, state='disabled')
 
         # 启用边界页面
@@ -247,30 +251,34 @@ class MainApplication(tk.Tk):
             transform = lambda x, y: (y, x)
         if transform is not None:
             self.boundary = [transform(x, y) for x, y in self.boundary]
+            self.holes = [[transform(x, y) for x, y in hole] for hole in self.holes]
             self.boundary_frame.transform_boundary(transform)
         self.boundary_frame.set_points(self.points)
         if self.calc_frame is not None:
             try:
-                self.calc_frame.update_inputs(self.points, self.boundary)
+                self.calc_frame.update_inputs(self.points, self.boundary, self.holes)
             except tk.TclError:
                 pass
         self.status_var.set(f"测点已更新，共 {len(self.points)} 个")
 
-    def _on_boundary_set(self, boundary: list[tuple[float, float]]):
+    def _on_boundary_set(self, boundary: list[tuple[float, float]], holes=None):
         """边界设置完成回调"""
         self.boundary = boundary
-        self.status_var.set(f"边界已设置 ({len(boundary)} 个点) - 请进行计算")
+        self.holes = [list(hole) for hole in holes or []]
+        extra = f"，挖空区 {len(self.holes)} 个" if self.holes else ""
+        self.status_var.set(f"边界已设置 ({len(boundary)} 个点{extra}) - 请进行计算")
         self.step_var.set("步骤 3/3: 计算结果")
         self._update_step_indicator(2)
         
         # 创建或更新计算页面
         if self.calc_frame is None:
             self.calc_frame = CalculationFrame(
-                self.notebook, self.points, self.boundary, project_name_getter=lambda: self.project_name
+                self.notebook, self.points, self.boundary, project_name_getter=lambda: self.project_name,
+                holes=self.holes,
             )
             self.notebook.add(self.calc_frame, text="  ③ 计算设置与结果  ")
         else:
-            self.calc_frame.update_inputs(self.points, self.boundary)
+            self.calc_frame.update_inputs(self.points, self.boundary, self.holes)
         if self._pending_design_settings is not None:
             settings, self._pending_design_settings = self._pending_design_settings, None
             self.calc_frame.apply_design_settings(**settings)
@@ -300,6 +308,7 @@ class MainApplication(tk.Tk):
         return {
             "points": self.points,
             "boundary": list(self.boundary) or list(self.boundary_frame.boundary),
+            "holes": list(self.holes) or list(self.boundary_frame.holes),
             "project_name": self.project_name,
             **self._collect_design_settings(),
         }
@@ -320,7 +329,9 @@ class MainApplication(tk.Tk):
             raise ValueError("工程文件中没有测量点")
         self.project_name = data.get("project_name") or DEFAULT_PROJECT_NAME
         self.boundary = []
+        self.holes = []
         self.boundary_frame.set_boundary([])
+        self.boundary_frame.set_holes(data.get("holes") or [])
         self.import_frame.load_points(points)
         self._on_points_loaded(points)
         settings = {key: data[key] for key in DESIGN_SETTING_KEYS if key in data}
@@ -331,7 +342,7 @@ class MainApplication(tk.Tk):
         boundary = data.get("boundary") or []
         if boundary:
             self.boundary_frame.set_boundary(boundary)
-            self._on_boundary_set(list(boundary))
+            self._on_boundary_set(list(boundary), data.get("holes") or [])
         self._update_project_label()
 
     def load_project_from(self, filepath: str) -> None:

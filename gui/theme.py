@@ -40,6 +40,7 @@ PLOT_COLORS = {
     "points": COLORS["ink"],
     "selected": COLORS["cut"],
     "text_bg": COLORS["sheet"],
+    "contour": "#8A5A2B",
 }
 
 _FONT_FAMILY = None
