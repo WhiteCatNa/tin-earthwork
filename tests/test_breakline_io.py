@@ -106,3 +106,44 @@ def test_project_without_breaklines_stays_v2(tmp_path):
     assert payload["format_version"] == 2 and "breaklines" not in payload
     data = load_project(path)
     assert data["breaklines"] == [] and data["compare_breaklines"] == []
+
+
+def test_reports_with_breaklines(tmp_path):
+    import openpyxl
+
+    from tests.test_breaklines import EXACT_CUT, _calc, _survey
+    from utils.data_handler import DataExporter
+
+    points, lines = _survey()
+    calc = _calc(points, lines=[Breakline([(x, y, None) for x, y in line], name=f"坡线{k}")
+                                for k, line in enumerate(lines, 1)])
+    result = calc.run_full_calculation()
+    result.without_breaklines = calc.volumes_without_breaklines()
+    assert result.total_cut == pytest.approx(EXACT_CUT, abs=1e-6)
+    assert result.without_breaklines[0] != pytest.approx(EXACT_CUT, abs=1.0)
+    # 不加特征线的对比不改动原计算器的三角网
+    assert calc.calculate_volumes().total_cut == pytest.approx(EXACT_CUT, abs=1e-6)
+
+    exporter = DataExporter("沟")
+    rows = {row[0]: row for row in exporter.summary_rows(result)}
+    assert rows["特征线"][1] == 4
+    assert rows["不加特征线挖方"][1] == round(result.without_breaklines[0], 3)
+
+    excel = tmp_path / "report.xlsx"
+    exporter.export_summary_excel(result, str(excel), points)
+    book = openpyxl.load_workbook(excel)
+    assert "特征线" in book.sheetnames
+    sheet = list(book["特征线"].values)
+    assert sheet[0] == ("序号", "名称", "期次", "顶点", "X", "Y", "高程")
+    assert len(sheet) - 1 == sum(len(line) for line in lines)
+    assert "约束Delaunay" in str(list(book["土方量汇总表"].values))
+
+    dxf = tmp_path / "result.dxf"
+    exporter.export_boundary_dxf(result, str(dxf))
+    text = dxf.read_text(encoding="utf-8")
+    assert text.count("\nBREAKLINE\n") > 0
+    assert text.count("0\n3DFACE\n8\nTIN\n") == result.triangle_count
+    assert import_boundary_from_dxf(dxf) == [(0, 0), (100, 0), (100, 60), (0, 60)]
+
+    report = exporter.generate_report_text(result, len(points))
+    assert "4 条特征线参与构网" in report and "不加特征线时挖方" in report

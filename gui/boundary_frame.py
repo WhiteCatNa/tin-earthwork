@@ -6,19 +6,29 @@ from tkinter import ttk, filedialog, messagebox
 from typing import List, Tuple, Callable, Optional
 from utils.plotter import EarthworkPlotter
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-from core.calculator import SurveyPoint
+from core.breaklines import Breakline
+from core.calculator import DUPLICATE_TOLERANCE, SurveyPoint
 from core.geometry import ring_self_intersects
 import numpy as np
+
+TARGET_BOUNDARY = "boundary"
+TARGET_BREAKLINE = "breakline"
+BOUNDARY_TITLE = '边界编辑模式 - 左键添加点，右键结束'
+BREAKLINE_TITLE = '特征线绘制 - 左键点测点添加顶点，右键结束这一条'
 
 
 class BoundaryFrame(ttk.Frame):
     """计算边界设置页面"""
     
-    def __init__(self, parent, points: List[SurveyPoint], on_boundary_set: Callable[[List[Tuple[float, float]]], None]):
+    def __init__(self, parent, points: List[SurveyPoint], on_boundary_set: Callable[[List[Tuple[float, float]]], None],
+                 on_breaklines_changed: Optional[Callable[[List[Breakline]], None]] = None):
         super().__init__(parent)
         self.points = points
         self.on_boundary_set = on_boundary_set
+        self.on_breaklines_changed = on_breaklines_changed
         self.boundary: List[Tuple[float, float]] = []
+        self.breaklines: List[Breakline] = []
+        self.drawing: List[Tuple[float, float]] = []  # 正在绘制的特征线顶点
         self.edit_mode = True
         self.current_point: Optional[Tuple[float, float]] = None
         self._point_xy = np.empty((0, 2), dtype=float)
@@ -55,6 +65,13 @@ class BoundaryFrame(ttk.Frame):
         self.edit_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(mode_frame, text="编辑模式（左键添加）", variable=self.edit_var,
                        command=self._toggle_edit_mode).pack(anchor=tk.W)
+        target_row = ttk.Frame(mode_frame)
+        target_row.pack(anchor=tk.W, pady=(4, 0))
+        ttk.Label(target_row, text="左键绘制：").pack(side=tk.LEFT)
+        self.target_var = tk.StringVar(value=TARGET_BOUNDARY)
+        for value, text in ((TARGET_BOUNDARY, "计算边界"), (TARGET_BREAKLINE, "特征线")):
+            ttk.Radiobutton(target_row, text=text, value=value, variable=self.target_var,
+                            command=self._on_target_change).pack(side=tk.LEFT, padx=(0, 8))
 
         # 边界点列表
         ttk.Label(ctrl_frame, text="边界点坐标:", style="Title.TLabel").grid(row=1, column=0, sticky="w", pady=(10, 0))
@@ -95,13 +112,27 @@ class BoundaryFrame(ttk.Frame):
         ttk.Button(btn_frame, text="确认边界", command=self._confirm_boundary,
                   style='Accent.TButton').grid(row=3, column=0, columnspan=6, sticky="ew", pady=2)
 
+        # 特征线：沟边、坎边、坡顶、坡脚等，构网时三角形不跨越
+        line_frame = ttk.LabelFrame(ctrl_frame, text="特征线（可选）", padding=6)
+        line_frame.grid(row=4, column=0, sticky="ew", pady=(8, 0))
+        line_frame.grid_columnconfigure((0, 1), weight=1, uniform="breakline_buttons")
+        self.breakline_status_var = tk.StringVar()
+        ttk.Label(line_frame, textvariable=self.breakline_status_var, style="Muted.TLabel").grid(
+            row=0, column=0, columnspan=2, sticky="w")
+        for index, (text, command) in enumerate((
+            ("导入 DXF 特征线…", self.import_breaklines_dxf), ("结束当前线", self._finish_drawing),
+            ("删除最后一条", self._delete_last_breakline), ("清空特征线", self._clear_breaklines),
+        )):
+            ttk.Button(line_frame, text=text, command=command).grid(
+                row=1 + index // 2, column=index % 2, sticky="ew", padx=(0 if index % 2 == 0 else 2, 0), pady=2)
+
         self.coord_var = tk.StringVar(value="X: --  Y: --")
         ttk.Label(ctrl_frame, textvariable=self.coord_var, style="Muted.TLabel").grid(
-            row=4, column=0, sticky="w", pady=(10, 2)
+            row=5, column=0, sticky="w", pady=(10, 2)
         )
         self.boundary_status_var = tk.StringVar(value="待添加边界点")
         ttk.Label(ctrl_frame, textvariable=self.boundary_status_var, style="Accent.TLabel").grid(
-            row=5, column=0, sticky="w"
+            row=6, column=0, sticky="w"
         )
         self._update_boundary_status()
 
@@ -111,9 +142,10 @@ class BoundaryFrame(ttk.Frame):
                     "2. 手工边界按顺时针或逆时针逐点左键点击\n"
                     "3. 点会自动吸附到附近测量点；右键或“撤销”可回退\n"
                     "4. 至少 3 个点，系统会自动闭合；确认前检查状态提示\n"
-                    "5. 也可导入 DXF 多段线或 CSV/TXT（前两列为 X、Y）")
+                    "5. 也可导入 DXF 多段线或 CSV/TXT（前两列为 X、Y）\n"
+                    "6. 有沟、坎、坡时选“特征线”，沿坡顶、坡脚点测点")
         self.info_label = ttk.Label(ctrl_frame, text=info_text, justify=tk.LEFT, style="Hint.TLabel")
-        self.info_label.grid(row=6, column=0, sticky="w", pady=(10, 0))
+        self.info_label.grid(row=7, column=0, sticky="w", pady=(10, 0))
         self.ctrl_frame, self.list_frame = ctrl_frame, list_frame
         ctrl_frame.bind("<Configure>", self._adapt_hint)
 
@@ -139,7 +171,17 @@ class BoundaryFrame(ttk.Frame):
     def _on_canvas_click(self, event):
         if not self.edit_mode or event.inaxes != self.plotter.ax:
             return
-            
+        if self.target_var.get() == TARGET_BREAKLINE:
+            if event.button == 1 and event.xdata is not None and event.ydata is not None:
+                self.add_drawing_vertex(event.xdata, event.ydata)
+            elif event.button == 3:
+                if len(self.drawing) >= 2:
+                    self._finish_drawing()
+                elif self.drawing:
+                    self.drawing.pop()
+                    self._refresh_plot()
+            return
+
         if event.button == 1:  # 左键添加点
             if event.xdata is not None and event.ydata is not None:
                 x, y = self._snap_to_point(event.xdata, event.ydata)
@@ -156,25 +198,152 @@ class BoundaryFrame(ttk.Frame):
     def _on_canvas_motion(self, event):
         if event.inaxes == self.plotter.ax and event.xdata is not None and event.ydata is not None:
             self.coord_var.set(f"X: {event.xdata:.3f}  Y: {event.ydata:.3f}")
-            if self.edit_mode and self.boundary:
+            drawing_line = self.target_var.get() == TARGET_BREAKLINE
+            anchor = self.drawing if drawing_line else self.boundary
+            if self.edit_mode and anchor:
                 self.current_point = (event.xdata, event.ydata)
-                self.plotter.update_boundary_preview(self.boundary, self.current_point)
+                self.plotter.update_boundary_preview(anchor, self.current_point)
 
     def _snap_to_point(self, x: float, y: float, threshold: float = 5.0) -> Tuple[float, float]:
         """吸附到最近的测量点。"""
+        snapped = self._nearest_point(x, y, threshold)
+        return snapped if snapped is not None else (x, y)
+
+    def _nearest_point(self, x: float, y: float, threshold: float) -> Optional[Tuple[float, float]]:
+        """threshold 以内最近测点的坐标，没有则为 None。"""
         if not self.points:
-            return x, y
+            return None
         if self._point_xy is None or len(self._point_xy) != len(self.points):
             self._point_xy = np.array([(point.x, point.y) for point in self.points], dtype=float)
         distances = np.sum((self._point_xy - (x, y)) ** 2, axis=1)
         point_index = int(np.argmin(distances))
-        if distances[point_index] < threshold ** 2:
-            return tuple(self._point_xy[point_index])
-        return x, y
-        
+        if distances[point_index] <= threshold ** 2:
+            return tuple(float(v) for v in self._point_xy[point_index])
+        return None
+
     def _refresh_plot(self):
-        self.plotter.plot_boundary_edit(self.points, self.boundary, self.current_point)
+        drawing_line = getattr(self, "target_var", None) is not None and self.target_var.get() == TARGET_BREAKLINE
+        self.plotter.plot_boundary_edit(
+            self.points, self.boundary, self.current_point, breaklines=self.breaklines, drawing=self.drawing,
+            title=BREAKLINE_TITLE if drawing_line else BOUNDARY_TITLE,
+        )
         self._update_boundary_status()
+        self._update_breakline_status()
+
+    # ------------------------------------------------------------------
+    # 特征线
+    # ------------------------------------------------------------------
+
+    def _on_target_change(self):
+        self.current_point = None
+        self._refresh_plot()
+
+    def _update_breakline_status(self, message: Optional[str] = None):
+        if not hasattr(self, "breakline_status_var"):
+            return
+        if message is None:
+            message = f"已有 {len(self.breaklines)} 条特征线" if self.breaklines else "未设置特征线"
+            if self.drawing:
+                message += f"；正在绘制，已点 {len(self.drawing)} 个顶点"
+        self.breakline_status_var.set(message)
+
+    def add_drawing_vertex(self, x: float, y: float) -> bool:
+        """在正在绘制的特征线上加一个顶点；须点在测点上（吸附范围内），否则提示并忽略。"""
+        snapped = self._nearest_point(x, y, 5.0)
+        if snapped is None:
+            self._update_breakline_status("特征线顶点须点在测点上：附近 5 m 内没有测点")
+            return False
+        if not self.drawing or self.drawing[-1] != snapped:
+            self.drawing.append(snapped)
+        self.current_point = None
+        self._refresh_plot()
+        return True
+
+    def _finish_drawing(self):
+        if len(self.drawing) >= 2:
+            self.breaklines.append(Breakline([(x, y, None) for x, y in self.drawing],
+                                             name=f"特征线{len(self.breaklines) + 1}"))
+            self._notify_breaklines()
+        self.drawing = []
+        self.current_point = None
+        self._refresh_plot()
+
+    def _delete_last_breakline(self):
+        if self.drawing:
+            self.drawing = []
+        elif self.breaklines:
+            self.breaklines.pop()
+            self._notify_breaklines()
+        self._refresh_plot()
+
+    def _clear_breaklines(self):
+        self.drawing = []
+        if self.breaklines:
+            self.breaklines = []
+            self._notify_breaklines()
+        self._refresh_plot()
+
+    def set_breaklines(self, lines: List[Breakline]):
+        """外部设置特征线（打开工程时）。"""
+        self.breaklines = list(lines)
+        self.drawing = []
+        try:
+            self._refresh_plot()
+        except tk.TclError:
+            pass
+
+    def _notify_breaklines(self):
+        if self.on_breaklines_changed is not None:
+            self.on_breaklines_changed(list(self.breaklines))
+
+    def offsite_vertices(self, lines: List[Breakline]) -> int:
+        """不带高程、又不在任何测点上的顶点数（这样的特征线计算时会报错）。"""
+        flat = [(x, y) for line in lines for x, y, z in line.vertices if z is None]
+        if not flat or not self.points:
+            return len(flat)
+        from scipy.spatial import cKDTree
+        tree = cKDTree([(p.x, p.y) for p in self.points])
+        distances, _ = tree.query(flat)
+        return int(np.count_nonzero(distances > DUPLICATE_TOLERANCE))
+
+    def import_breaklines_dxf(self, filepath: Optional[str] = None, layers: Optional[List[str]] = None) -> bool:
+        """从 DXF 导入特征线；图层多于一个时让用户选择图层。"""
+        from utils.dxf_io import import_breaklines_from_dxf, list_dxf_layers
+        if filepath is None:
+            filepath = filedialog.askopenfilename(title="导入特征线（DXF）",
+                                                  filetypes=[("DXF图形", "*.dxf"), ("所有文件", "*.*")])
+            if not filepath:
+                return False
+        try:
+            if layers is None:
+                available = list_dxf_layers(filepath)
+                if not available:
+                    messagebox.showwarning("提示", "DXF 中没有多段线或直线")
+                    return False
+                layers = list(available) if len(available) == 1 else ask_layers(self, available)
+                if not layers:
+                    return False
+            lines = import_breaklines_from_dxf(filepath, layers)
+        except Exception as error:
+            messagebox.showerror("错误", f"导入特征线失败: {error}")
+            return False
+        start = len(self.breaklines)
+        for offset, line in enumerate(lines, 1):
+            line.name = f"特征线{start + offset}（{line.name.rsplit('-', 1)[0]}）"
+        self.breaklines.extend(lines)
+        self._notify_breaklines()
+        self._refresh_plot()
+        message = f"导入特征线 {len(lines)} 条（图层：{'、'.join(layers)}）"
+        missing = self.offsite_vertices(lines)
+        if missing:
+            messagebox.showwarning(
+                "特征线已导入，请注意",
+                message + f"\n\n有 {missing} 个不带高程的顶点不在测点上，计算时会报错。"
+                "请在 CAD 中把顶点捕捉到测点，或改用带高程的三维多段线。",
+            )
+        else:
+            messagebox.showinfo("成功", message)
+        return True
 
     def _update_boundary_status(self):
         if not hasattr(self, 'boundary_status_var'):
@@ -214,8 +383,13 @@ class BoundaryFrame(ttk.Frame):
             pass
 
     def transform_boundary(self, func: Callable[[float, float], Tuple[float, float]]):
-        """对边界每个顶点做同一变换（平移、X/Y 互换）。"""
+        """对边界和特征线的每个顶点做同一变换（平移、X/Y 互换）。"""
         self.boundary = [func(x, y) for x, y in self.boundary]
+        self.drawing = [func(x, y) for x, y in self.drawing]
+        if self.breaklines:
+            self.breaklines = [Breakline([(*func(x, y), z) for x, y, z in line.vertices], name=line.name)
+                               for line in self.breaklines]
+            self._notify_breaklines()
         self.current_point = None
         self._update_boundary_list()
         try:
@@ -332,3 +506,29 @@ class BoundaryFrame(ttk.Frame):
         self.boundary = list(boundary)
         self._refresh_plot()
         self._update_boundary_list()
+
+
+def ask_layers(parent, layers: dict) -> Optional[List[str]]:
+    """选择作为特征线的 DXF 图层（多选），取消时返回 None。"""
+    dialog = tk.Toplevel(parent)
+    dialog.title("选择特征线图层")
+    dialog.transient(parent.winfo_toplevel())
+    ttk.Label(dialog, text="选择作为特征线的图层（可多选）：", padding=8).pack(anchor=tk.W)
+    listbox = tk.Listbox(dialog, selectmode=tk.MULTIPLE, height=min(12, max(4, len(layers))), exportselection=False)
+    names = list(layers)
+    for name in names:
+        listbox.insert(tk.END, f"{name}（{layers[name]} 条线）")
+    listbox.pack(fill=tk.BOTH, expand=True, padx=8)
+    chosen: List[str] = []
+
+    def accept():
+        chosen.extend(names[i] for i in listbox.curselection())
+        dialog.destroy()
+
+    buttons = ttk.Frame(dialog, padding=8)
+    buttons.pack(fill=tk.X)
+    ttk.Button(buttons, text="确定", command=accept, style="Accent.TButton").pack(side=tk.RIGHT)
+    ttk.Button(buttons, text="取消", command=dialog.destroy).pack(side=tk.RIGHT, padx=6)
+    dialog.grab_set()
+    parent.wait_window(dialog)
+    return chosen or None

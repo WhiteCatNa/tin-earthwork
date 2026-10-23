@@ -5,6 +5,7 @@
 无论哪种，最终都落到“每个三角形顶点上的高差 = 实测 − 比较面”，三角形内线性变化，
 由同一套边界裁剪与零线分割精确计算。
 """
+import copy
 import math
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -110,6 +111,13 @@ class CalculationResult:
     design_description: str = ""          # 斜面、两期对比时的比较面说明
     compare_point_count: int = 0          # 两期对比时后期测点数
     grid_check: Optional[Any] = None      # 方格网校核结果（core.grid_check.GridCheckResult）
+    breaklines: List[Breakline] = field(default_factory=list)          # 参与构网的特征线（前期）
+    compare_breaklines: List[Breakline] = field(default_factory=list)  # 两期对比时后期的特征线
+    without_breaklines: Optional[Tuple[float, float]] = None           # 不加特征线时的 (挖方, 填方)，供对比
+
+    @property
+    def has_breaklines(self) -> bool:
+        return bool(self.breaklines or self.compare_breaklines)
 
     @property
     def is_compare(self) -> bool:
@@ -755,8 +763,18 @@ class TINEarthworkCalculator:
         result.design_description = self._design_description()
         if self.compare_points:
             result.compare_point_count = len(self.compare_points)
+            result.compare_breaklines = list(self.compare_breaklines)
+        result.breaklines = list(self.breaklines)
         result.warnings = list(self.warnings) + self._coverage_warnings(result)
         return result
+
+    def volumes_without_breaklines(self) -> Tuple[float, float]:
+        """同样的测点、比较面和边界，不加特征线时的 (挖方, 填方)，用于说明特征线的影响。"""
+        plain = copy.copy(self)
+        plain.breaklines, plain.compare_breaklines = [], []
+        plain.build_tin()
+        result = plain.calculate_volumes()
+        return result.total_cut, result.total_fill
 
     def _design_description(self) -> str:
         if self.compare_points:
