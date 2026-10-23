@@ -6,6 +6,7 @@ import os
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from typing import Any, List, Callable, Optional, Dict, Tuple
+from core.breaklines import Breakline
 from core.calculator import SurveyPoint, CalculationResult, TINEarthworkCalculator, format_id_list
 from core.grid_check import run_grid_check, suggest_spacing
 from core.surface import PlaneDesign
@@ -27,9 +28,13 @@ class CalculationFrame(ttk.Frame):
     """计算设置与结果页面"""
     
     def __init__(self, parent, points: List[SurveyPoint], boundary: List[Tuple[float, float]],
-                 project_name_getter: Optional[Callable[[], str]] = None):
+                 project_name_getter: Optional[Callable[[], str]] = None,
+                 breaklines_getter: Optional[Callable[[], List[Breakline]]] = None):
         super().__init__(parent)
         self.project_name_getter = project_name_getter
+        # 前期（或唯一一期）的特征线在边界页绘制、导入，计算时读取
+        self.breaklines_getter = breaklines_getter or (lambda: [])
+        self.compare_breaklines: List[Breakline] = []
         self.points = points
         self.boundary = boundary
         self.calculator = TINEarthworkCalculator()
@@ -87,8 +92,9 @@ class CalculationFrame(ttk.Frame):
     def apply_design_settings(self, design_elevation: float, use_partition: bool, partition: Dict[str, float],
                               design_mode: str = "flat", design_plane: Optional[Dict[str, float]] = None,
                               compare_points: Optional[List[SurveyPoint]] = None, compare_source: str = "",
-                              grid_enabled: bool = False, grid_spacing: Optional[float] = None):
-        """恢复工程文件中的比较面、分区、后期测点和方格网设置。"""
+                              grid_enabled: bool = False, grid_spacing: Optional[float] = None,
+                              compare_breaklines: Optional[List[Breakline]] = None):
+        """恢复工程文件中的比较面、分区、后期测点（及其特征线）和方格网设置。"""
         self.design_elevation_var.set(design_elevation)
         self.use_partition_var.set(bool(use_partition))
         self.partition_data = dict(partition or {})
@@ -98,6 +104,7 @@ class CalculationFrame(ttk.Frame):
             for key, _ in PLANE_FIELDS:
                 self.plane_vars[key].set(f"{getattr(plane, key):g}")
         self.set_compare_points(list(compare_points or []), compare_source)
+        self.set_compare_breaklines(list(compare_breaklines or []))
         self.grid_enabled_var.set(bool(grid_enabled))
         if grid_spacing:
             self.grid_spacing_var.set(f"{grid_spacing:g}")
@@ -140,6 +147,7 @@ class CalculationFrame(ttk.Frame):
             "partition": dict(self.partition_data),
             "compare_points": list(self.compare_points),
             "compare_source": self.compare_source,
+            "compare_breaklines": list(self.compare_breaklines),
             "grid_enabled": bool(self.grid_enabled_var.get()),
             "grid_spacing": spacing,
         }
@@ -269,6 +277,15 @@ class CalculationFrame(ttk.Frame):
         self.compare_label.pack(anchor=tk.W, pady=(4, 0))
         ttk.Label(self.compare_frame, text="前期 = 数据导入页的测点；高差 = 前期 − 后期",
                   style="Muted.TLabel").pack(anchor=tk.W)
+        line_buttons = ttk.Frame(self.compare_frame)
+        line_buttons.pack(fill=tk.X, pady=(4, 0))
+        ttk.Button(line_buttons, text="后期特征线（DXF）…",
+                   command=self.import_compare_breaklines_dxf).pack(side=tk.LEFT)
+        ttk.Button(line_buttons, text="清除", command=lambda: self.set_compare_breaklines([])).pack(
+            side=tk.LEFT, padx=6)
+        self.compare_breakline_label = ttk.Label(self.compare_frame, style="Muted.TLabel",
+                                                 text="后期未设特征线（前期特征线在边界页设置）")
+        self.compare_breakline_label.pack(anchor=tk.W)
 
         # 分区设计高程（统一高程、斜面时可用）
         self.partition_check = ttk.Checkbutton(body, text="分区设计高程（个别点单独指定）",
@@ -303,6 +320,7 @@ class CalculationFrame(ttk.Frame):
         self.show_contour_var = tk.BooleanVar(value=True)
         self.show_points_var = tk.BooleanVar(value=True)
         self.show_boundary_var = tk.BooleanVar(value=True)
+        self.show_breaklines_var = tk.BooleanVar(value=True)
 
         # 右侧：结果显示
         right_frame = ttk.Frame(self)
@@ -333,7 +351,8 @@ class CalculationFrame(ttk.Frame):
         toggles.pack(fill=tk.X, padx=4, pady=(4, 0))
         ttk.Label(toggles, text="显示：", style="Muted.TLabel").pack(side=tk.LEFT)
         for text, variable in (("TIN网格", self.show_tin_var), ("零填挖线", self.show_contour_var),
-                               ("测量点", self.show_points_var), ("计算边界", self.show_boundary_var)):
+                               ("测量点", self.show_points_var), ("计算边界", self.show_boundary_var),
+                               ("特征线", self.show_breaklines_var)):
             ttk.Checkbutton(toggles, text=text, variable=variable, command=self._refresh_plot).pack(
                 side=tk.LEFT, padx=(0, 10))
 
@@ -460,7 +479,50 @@ class CalculationFrame(ttk.Frame):
             return
         swapped = [SurveyPoint(p.id, p.y, p.x, p.z) for p in self.compare_points]
         self.set_compare_points(swapped, self.compare_source)
+        if self.compare_breaklines:
+            self.set_compare_breaklines([
+                Breakline([(y, x, z) for x, y, z in line.vertices], name=line.name)
+                for line in self.compare_breaklines
+            ])
         self.compare_label.config(text=self.compare_label.cget("text") + "，已互换 X/Y")
+
+    def set_compare_breaklines(self, lines: List[Breakline]):
+        """设置两期对比时后期测量的特征线。"""
+        self.compare_breaklines = list(lines)
+        if hasattr(self, "compare_breakline_label"):
+            if self.compare_breaklines:
+                self.compare_breakline_label.config(text=f"后期特征线 {len(self.compare_breaklines)} 条",
+                                                    foreground=COLORS["ink"])
+            else:
+                self.compare_breakline_label.config(text="后期未设特征线（前期特征线在边界页设置）",
+                                                    foreground=COLORS["dim"])
+
+    def import_compare_breaklines_dxf(self, filepath: Optional[str] = None,
+                                      layers: Optional[List[str]] = None) -> bool:
+        """从 DXF 导入后期测量的特征线。"""
+        from gui.boundary_frame import ask_layers
+        from utils.dxf_io import import_breaklines_from_dxf, list_dxf_layers
+        if filepath is None:
+            filepath = filedialog.askopenfilename(title="导入后期特征线（DXF）",
+                                                  filetypes=[("DXF图形", "*.dxf"), ("所有文件", "*.*")])
+            if not filepath:
+                return False
+        try:
+            if layers is None:
+                available = list_dxf_layers(filepath)
+                if not available:
+                    messagebox.showwarning("提示", "DXF 中没有多段线或直线")
+                    return False
+                layers = list(available) if len(available) == 1 else ask_layers(self, available)
+                if not layers:
+                    return False
+            lines = import_breaklines_from_dxf(filepath, layers)
+        except Exception as error:
+            messagebox.showerror("错误", f"导入特征线失败: {error}")
+            return False
+        self.set_compare_breaklines(self.compare_breaklines + lines)
+        messagebox.showinfo("成功", f"导入后期特征线 {len(lines)} 条（图层：{'、'.join(layers)}）")
+        return True
 
     def _toggle_partition(self):
         """切换分区高程编辑状态"""
@@ -526,6 +588,8 @@ class CalculationFrame(ttk.Frame):
         use_partition = self.use_partition_var.get() and mode != "compare"
         partition_data = self.partition_data.copy() if use_partition else {}
         compare_points = list(self.compare_points)
+        breaklines = list(self.breaklines_getter())
+        compare_breaklines = list(self.compare_breaklines) if mode == "compare" else []
         try:
             design_elevation = self.design_elevation_value()
             plane = self.plane_value() if mode == "plane" else None
@@ -546,6 +610,7 @@ class CalculationFrame(ttk.Frame):
             try:
                 calculator = self.calculator
                 calculator.set_compare_points(compare_points if mode == "compare" else None)
+                calculator.set_breaklines(breaklines, compare_breaklines)
                 if plane is not None:
                     calculator.set_design_plane(plane, partition_data)
                 elif partition_data:
@@ -564,6 +629,9 @@ class CalculationFrame(ttk.Frame):
                         result.warnings.insert(0, (
                             f"有 {len(unlisted)} 个测点不在分区高程表中，按{base} 计算：{format_id_list(unlisted)}"
                         ))
+                if result.has_breaklines:
+                    self._worker_events.put(("progress", 60, "计算不加特征线时的方量（对比）..."))
+                    result.without_breaklines = calculator.volumes_without_breaklines()
                 if grid_spacing is not None:
                     self._worker_events.put(("progress", 75, "方格网校核..."))
                     try:
@@ -634,6 +702,13 @@ class CalculationFrame(ttk.Frame):
             f"三角形数: {self.result.triangle_count}\n"
             f"混合三角形: {self.result.mixed_triangle_count}"
         )
+        if self.result.without_breaklines is not None:
+            cut, fill = self.result.without_breaklines
+            summary += (
+                f"\n\n特征线 {len(self.result.breaklines) + len(self.result.compare_breaklines)} 条参与构网；"
+                f"不加特征线时挖方 {cut:.2f} m³、填方 {fill:.2f} m³"
+                f"（相差 {self.result.total_cut - cut:+.2f}、{self.result.total_fill - fill:+.2f}）"
+            )
         warnings = list(self.result.warnings)
         grid = self.result.grid_check
         if grid is not None:
@@ -664,7 +739,8 @@ class CalculationFrame(ttk.Frame):
                 show_tin=self.show_tin_var.get(),
                 show_contour=self.show_contour_var.get(),
                 show_points=self.show_points_var.get(),
-                show_boundary=self.show_boundary_var.get()
+                show_boundary=self.show_boundary_var.get(),
+                show_breaklines=self.show_breaklines_var.get(),
             )
         else:
             self.plotter.plot_points_only(self.points)

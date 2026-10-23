@@ -198,8 +198,10 @@ class DataImportFrame(ttk.Frame):
             try:
                 points, issues, raw_df = DataImporter.import_file(filepath)
                 self.after(0, lambda: self._on_import_complete(points, issues, raw_df))
-            except Exception as e:
-                self.after(0, lambda: self._on_import_error(str(e)))
+            except Exception as error:
+                # 异常变量在 except 块结束后即被删除，先取出文字再交给主线程
+                message = str(error)
+                self.after(0, lambda: self._on_import_error(message))
 
         import threading
         threading.Thread(target=import_worker, daemon=True).start()

@@ -15,6 +15,7 @@ from openpyxl.cell import WriteOnlyCell
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
+from core.breaklines import Breakline
 from core.calculator import CalculationResult, SurveyPoint, chain_segments, extract_zero_contour_segments
 from utils.dxf_io import read_text_with_encodings
 from utils.fileio import atomic_write_text
@@ -22,6 +23,17 @@ from version import __version__
 
 def report_labels(result: CalculationResult) -> Dict[str, str]:
     """报告用语：与设计面比较，或两期对比。"""
+    labels = _base_labels(result)
+    if result.has_breaklines:
+        method = labels["method"]
+        if "Delaunay剖分" in method:
+            labels["method"] = method.replace("Delaunay剖分", "约束Delaunay剖分，按特征线构网")
+        else:
+            labels["method"] = method.replace("（", "（按特征线构网，", 1)
+    return labels
+
+
+def _base_labels(result: CalculationResult) -> Dict[str, str]:
     if result.is_compare:
         return {
             "natural": "前期高程",
@@ -41,6 +53,15 @@ def report_labels(result: CalculationResult) -> Dict[str, str]:
         "method": "TIN三角网法（Delaunay剖分，边界精确裁剪）",
         "covered": "有测点覆盖",
     }
+
+
+def breakline_note(result: CalculationResult) -> str:
+    """特征线的一句话说明（汇总表、文本报告共用）。"""
+    if result.is_compare:
+        text = f"前期 {len(result.breaklines)} 条、后期 {len(result.compare_breaklines)} 条特征线"
+    else:
+        text = f"{len(result.breaklines)} 条特征线"
+    return text + "参与构网，三角形的边不跨越特征线"
 
 
 def _percent(value: Optional[float]) -> str:
@@ -527,6 +548,31 @@ class DataExporter:
                 ['方格网法挖填差值', round(grid.net_volume, 3), 'm³',
                  f'与 TIN 法相差 {comparison["挖填差值"][0]:+.3f} m³'],
             ]
+        if result.has_breaklines:
+            rows.append(['特征线', len(result.breaklines) + len(result.compare_breaklines), '条',
+                         breakline_note(result)])
+        if result.without_breaklines is not None:
+            cut, fill = result.without_breaklines
+            rows += [
+                ['不加特征线挖方', round(cut, 3), 'm³', f'加特征线后相差 {result.total_cut - cut:+.3f} m³'],
+                ['不加特征线填方', round(fill, 3), 'm³', f'加特征线后相差 {result.total_fill - fill:+.3f} m³'],
+            ]
+        return rows
+
+    @staticmethod
+    def breakline_rows(result: CalculationResult) -> List[List[Any]]:
+        """特征线页：每个顶点一行。"""
+        rows = []
+        groups = [("前期" if result.is_compare else "", result.breaklines)]
+        if result.is_compare:
+            groups.append(("后期", result.compare_breaklines))
+        number = 0
+        for period, lines in groups:
+            for line in lines:
+                number += 1
+                for index, (x, y, z) in enumerate(line.vertices, 1):
+                    rows.append([number, line.name, period, index, round(x, 3), round(y, 3),
+                                 "取测点高程" if z is None else round(z, 3)])
         return rows
 
     @staticmethod
@@ -630,6 +676,15 @@ class DataExporter:
             for row in self.grid_cell_rows(result):
                 ws6.append(row)
 
+        if result.has_breaklines:
+            ws7 = wb.create_sheet("特征线")
+            ws7.freeze_panes = "A2"
+            for column, width in zip("ABCDEFG", (8, 18, 8, 10, 16, 16, 14)):
+                ws7.column_dimensions[column].width = width
+            header(ws7, ["序号", "名称", "期次", "顶点", "X", "Y", "高程"])
+            for row in self.breakline_rows(result):
+                ws7.append(row)
+
         # 先完整写入内存再落盘：目标文件被占用时不会留下半成品和临时文件
         buffer = io.BytesIO()
         wb.save(buffer)
@@ -656,6 +711,10 @@ class DataExporter:
                 parts.append(self._dxf_polyline("ZERO_CONTOUR", polyline, closed=False))
         if result.grid_check is not None:
             parts.extend(self._dxf_grid(result.grid_check))
+        for line in list(result.breaklines) + list(result.compare_breaklines):
+            if len(line.vertices) >= 2:
+                parts.append(self._dxf_polyline("BREAKLINE", [(x, y) for x, y, _ in line.vertices], closed=False))
+        parts.extend(self._dxf_tin(result))
         parts.append("0\nENDSEC\n0\nEOF\n")
         with open(filepath, "w", encoding="utf-8") as handle:
             handle.write("".join(parts))
@@ -668,6 +727,21 @@ class DataExporter:
             lines.append(f"0\nVERTEX\n8\n{layer}\n10\n{float(x)!r}\n20\n{float(y)!r}\n30\n0.0\n")
         lines.append(f"0\nSEQEND\n8\n{layer}\n")
         return "".join(lines)
+
+    @staticmethod
+    def _dxf_tin(result: CalculationResult) -> List[str]:
+        """参与计算的三角形，TIN 图层的 3DFACE（顶点带实测/前期高程），便于在 CAD 中与其他软件的三角网核对。"""
+        parts = []
+        for tri in result.triangles:
+            if tri.is_boundary:
+                continue
+            corners = list(tri.vertex_points) + [tri.vertex_points[-1]]
+            codes = "".join(
+                f"1{k}\n{float(p.x)!r}\n2{k}\n{float(p.y)!r}\n3{k}\n{float(p.z)!r}\n"
+                for k, p in enumerate(corners)
+            )
+            parts.append(f"0\n3DFACE\n8\nTIN\n{codes}")
+        return parts
 
     @staticmethod
     def _dxf_text(layer: str, x: float, y: float, height: float, text: str) -> str:
@@ -741,6 +815,12 @@ class DataExporter:
                 "4. 所有三角形均保留面积、顶点高程、高差及分项体积，可逐项复核。\n"
                 "5. 计算结果仅供工程参考，正式计量请以复核成果为准。"
             )
+        if result.has_breaklines:
+            notes += f"\n6. {breakline_note(result)}。"
+            if result.without_breaklines is not None:
+                cut, fill = result.without_breaklines
+                notes += (f"不加特征线时挖方 {cut:.3f} m³、填方 {fill:.3f} m³，"
+                          f"加特征线后分别相差 {result.total_cut - cut:+.3f}、{result.total_fill - fill:+.3f} m³。")
         grid_section = ""
         grid = result.grid_check
         if grid is not None:
@@ -822,7 +902,9 @@ class DataExporter:
         return True
 
 
-PROJECT_FORMAT_VERSION = 2
+PROJECT_FORMAT_VERSION = 3
+# 没有特征线的工程仍按第 2 版保存，2.0 版程序也能打开
+PROJECT_FORMAT_VERSION_NO_BREAKLINES = 2
 DESIGN_MODES = ("flat", "plane", "compare")
 
 
@@ -874,13 +956,16 @@ def save_project(
     compare_source: str = "",
     grid_enabled: bool = False,
     grid_spacing: Optional[float] = None,
+    breaklines: Optional[List[Breakline]] = None,
+    compare_breaklines: Optional[List[Breakline]] = None,
 ) -> None:
-    """保存可再次打开的工程文件（测点、边界、设计面、后期测点、方格网设置）。"""
+    """保存可再次打开的工程文件（测点、边界、设计面、后期测点、方格网设置、特征线）。"""
     if design_mode not in DESIGN_MODES:
         raise ValueError(f"未知的设计面类型: {design_mode}")
     payload = {
         "format": "tin-earthwork-project",
-        "format_version": PROJECT_FORMAT_VERSION,
+        "format_version": PROJECT_FORMAT_VERSION if (breaklines or compare_breaklines)
+        else PROJECT_FORMAT_VERSION_NO_BREAKLINES,
         "app_version": __version__,
         "project_name": project_name,
         "design_mode": design_mode,
@@ -894,6 +979,9 @@ def save_project(
         "points": _point_rows(points),
         "compare_points": _point_rows(compare_points or []),
     }
+    if breaklines or compare_breaklines:
+        payload["breaklines"] = [line.to_dict() for line in breaklines or []]
+        payload["compare_breaklines"] = [line.to_dict() for line in compare_breaklines or []]
     atomic_write_text(filepath, json.dumps(payload, ensure_ascii=False, indent=2))
 
 
@@ -925,4 +1013,6 @@ def load_project(filepath: str) -> Dict[str, Any]:
         "boundary": boundary,
         "points": _points_from_rows(payload.get("points")),
         "compare_points": compare_points,
+        "breaklines": [Breakline.from_dict(item) for item in payload.get("breaklines") or []],
+        "compare_breaklines": [Breakline.from_dict(item) for item in payload.get("compare_breaklines") or []],
     }

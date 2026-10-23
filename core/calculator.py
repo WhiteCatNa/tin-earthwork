@@ -5,13 +5,16 @@
 无论哪种，最终都落到“每个三角形顶点上的高差 = 实测 − 比较面”，三角形内线性变化，
 由同一套边界裁剪与零线分割精确计算。
 """
+import copy
 import math
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
-from scipy.spatial import Delaunay, QhullError
+from scipy.spatial import Delaunay, QhullError, cKDTree
 
+from core.breaklines import Breakline
+from core.cdt import constrained_delaunay
 from core.overlay import clip_convex, overlay_triangulations
 from core.surface import PlaneDesign, TinSurface
 from core.geometry import (
@@ -44,6 +47,10 @@ MODE_COMPARE = "compare"
 # 两期对比时，后期测点在明细中的点号前缀；叠加产生的交点命名前缀
 COMPARE_ID_PREFIX = "后期-"
 CROSSING_ID_PREFIX = "交点"
+# 特征线上新增的构网顶点（3D 折线顶点、特征线交点）的点号前缀
+BREAKLINE_ID_PREFIX = "特征线"
+# 两条特征线在交点处插值高程相差超过该值时提示 (m)
+BREAKLINE_CROSS_WARN = 0.05
 
 
 @dataclass
@@ -104,6 +111,13 @@ class CalculationResult:
     design_description: str = ""          # 斜面、两期对比时的比较面说明
     compare_point_count: int = 0          # 两期对比时后期测点数
     grid_check: Optional[Any] = None      # 方格网校核结果（core.grid_check.GridCheckResult）
+    breaklines: List[Breakline] = field(default_factory=list)          # 参与构网的特征线（前期）
+    compare_breaklines: List[Breakline] = field(default_factory=list)  # 两期对比时后期的特征线
+    without_breaklines: Optional[Tuple[float, float]] = None           # 不加特征线时的 (挖方, 填方)，供对比
+
+    @property
+    def has_breaklines(self) -> bool:
+        return bool(self.breaklines or self.compare_breaklines)
 
     @property
     def is_compare(self) -> bool:
@@ -168,16 +182,18 @@ class TINEarthworkCalculator:
         self.compare_points: List[SurveyPoint] = []       # 两期对比的后期测点；空表示与设计面比较
         self.boundary_polygon: List[XY] = []
         self.triangles: List[Triangle] = []
-        self.delaunay = None
         self.warnings: List[str] = []
         self._origin: Tuple[float, float] = (0.0, 0.0)
         self._ring: Optional[np.ndarray] = None       # 局部坐标下的逆时针边界
         self._regions: Dict[int, np.ndarray] = {}     # 被裁剪三角形在边界内的部分（局部坐标）
         self._boundary_area = 0.0
         self._eps = 1e-9
-        # 构网时的前期/后期 Delaunay 与参与构网的点序号，供任意位置插值（方格网校核）
-        self._tin_a: Optional[Tuple[Delaunay, np.ndarray]] = None
-        self._tin_b: Optional[Tuple[Delaunay, np.ndarray]] = None
+        # 构网时的前期/后期三角网（曲面 + 参与构网的顶点），供任意位置插值（方格网校核）
+        self._tin_a: Optional[Tuple[TinSurface, List[SurveyPoint]]] = None
+        self._tin_b: Optional[Tuple[TinSurface, List[SurveyPoint]]] = None
+        self.breaklines: List[Breakline] = []          # 前期（或唯一一期）测量的特征线
+        self.compare_breaklines: List[Breakline] = []  # 两期对比时后期测量的特征线
+        self.breakline_points: List[SurveyPoint] = []  # 最近一次构网时特征线上新增的顶点
         self._overlap_ratio: Optional[float] = None   # 两期对比：共同覆盖面积 / 前期范围面积
 
     @property
@@ -194,6 +210,14 @@ class TINEarthworkCalculator:
             else:
                 pt.design_z = self.design_elevation
             pt.delta_z = pt.z - pt.design_z
+        # 特征线上新增的顶点不在分区里；分区、逐点设计高程要重新构网才能刷新
+        if not self.design_overrides:
+            for pt in self.breakline_points:
+                if self.design_plane is not None:
+                    pt.design_z = float(self.design_plane.elevation(pt.x, pt.y))
+                else:
+                    pt.design_z = self.design_elevation
+                pt.delta_z = pt.z - pt.design_z
 
     def set_design_elevation(self, elevation: float):
         """设置统一设计高程"""
@@ -237,6 +261,11 @@ class TINEarthworkCalculator:
                 self.design_elevation = next(iter(unique))
         else:
             self._apply_design()
+
+    def set_breaklines(self, lines: Optional[Sequence[Breakline]], compare_lines: Optional[Sequence[Breakline]] = None):
+        """设置特征线：lines 用于前期（或唯一一期）测量，compare_lines 用于两期对比的后期测量。"""
+        self.breaklines = list(lines or [])
+        self.compare_breaklines = list(compare_lines or [])
 
     def set_boundary(self, boundary: List[XY]):
         """设置计算边界"""
@@ -305,6 +334,140 @@ class TINEarthworkCalculator:
             )
         return delaunay
 
+    @staticmethod
+    def _surface(local: np.ndarray, simplices: np.ndarray, vertex_points: Sequence[SurveyPoint],
+                 design: bool) -> Tuple[TinSurface, List[SurveyPoint]]:
+        """只保留参与构网的顶点（去掉重复点、未参与构网的点），供插值与求覆盖范围。"""
+        used, compact = np.unique(simplices, return_inverse=True)
+        vertices = [vertex_points[i] for i in used.tolist()]
+        values = {"z": np.array([p.z for p in vertices], dtype=float)}
+        if design:
+            values["design_z"] = np.array([p.design_z for p in vertices], dtype=float)
+        return TinSurface(local[used], compact.reshape(-1, 3), values), vertices
+
+    def _design_at(self, local_xy: np.ndarray, points: Sequence[SurveyPoint], local: np.ndarray,
+                   unique: np.ndarray) -> np.ndarray:
+        """特征线上新增顶点的设计高程：统一高程、斜面按设计面取值；分区或逐点设计高程按测点三角网插值。"""
+        local_xy = np.asarray(local_xy, dtype=float).reshape(-1, 2)
+        per_point = bool(self.design_overrides) or any(points[i].has_design_z for i in unique.tolist())
+        if not per_point:
+            if self.design_plane is not None:
+                ox, oy = self._origin
+                return np.asarray(self.design_plane.elevation(local_xy[:, 0] + ox, local_xy[:, 1] + oy), dtype=float)
+            return np.full(len(local_xy), float(self.design_elevation))
+        tin = Delaunay(local[unique])
+        surface = TinSurface(local[unique], tin.simplices,
+                             {"design_z": np.array([points[i].design_z for i in unique.tolist()], dtype=float)})
+        return surface.extrapolate(local_xy, "design_z")
+
+    def _period_tin(self, points: List[SurveyPoint], local: np.ndarray, unique: np.ndarray,
+                    lines: Sequence[Breakline], label: str, design: bool,
+                    id_prefix: str = "") -> Tuple[List[SurveyPoint], np.ndarray, np.ndarray]:
+        """构建一期测量的三角网，有特征线时按约束构网。
+
+        返回 (特征线上新增的顶点, 其局部坐标, 三角形)。三角形的顶点序号小于 len(points) 时指向 points，
+        否则指向新增顶点（序号 − len(points)）。
+        """
+        if not lines:
+            return [], np.zeros((0, 2)), unique[self._delaunay(local[unique], points, unique, label).simplices]
+
+        tree = cKDTree(local[unique])
+        # 构网用的点：unique 测点在前，特征线新增顶点在后
+        node_xy: List[Tuple[float, float]] = [tuple(row) for row in local[unique].tolist()]
+        node_z: List[float] = [points[i].z for i in unique.tolist()]
+        node_names: List[str] = []
+        virtual_keys: Dict[Tuple[int, int], int] = {}
+        segments: List[Tuple[int, int]] = []
+        segment_line: List[int] = []
+        ox, oy = self._origin
+        prefix = f"{label}" if label else ""
+
+        for line_index, line in enumerate(lines):
+            name = line.label(line_index)
+            chain: List[int] = []
+            for vertex_index, (x, y, z) in enumerate(line.vertices):
+                if not (math.isfinite(x) and math.isfinite(y) and (z is None or math.isfinite(z))):
+                    raise ValueError(f"{prefix}{name}的第 {vertex_index + 1} 个顶点坐标或高程不是数字")
+                xy = (x - ox, y - oy)
+                distance, nearest = tree.query(xy)
+                if distance <= DUPLICATE_TOLERANCE:
+                    node = int(nearest)
+                    if z is not None and abs(z - node_z[node]) > ELEVATION_TOLERANCE:
+                        raise ValueError(
+                            f"{prefix}{name}的第 {vertex_index + 1} 个顶点与测点 {points[unique[node]].id} 位置相同，"
+                            f"但高程不同（{z:.3f} 与 {node_z[node]:.3f}），请核对"
+                        )
+                elif z is None:
+                    raise ValueError(
+                        f"{prefix}{name}的第 {vertex_index + 1} 个顶点 ({x:.3f}, {y:.3f}) 不在任何测点上，也没有高程。"
+                        "不带高程的特征线，顶点必须落在测点上"
+                    )
+                else:
+                    key = (int(round(xy[0] / DUPLICATE_TOLERANCE)), int(round(xy[1] / DUPLICATE_TOLERANCE)))
+                    node = virtual_keys.get(key, -1)
+                    if node < 0:
+                        node = len(node_xy)
+                        virtual_keys[key] = node
+                        node_xy.append(xy)
+                        node_z.append(z)
+                        node_names.append(f"{id_prefix}{BREAKLINE_ID_PREFIX}{line_index + 1}-{vertex_index + 1}")
+                    elif abs(node_z[node] - z) > ELEVATION_TOLERANCE:
+                        raise ValueError(
+                            f"{prefix}特征线在 ({x:.3f}, {y:.3f}) 处有两个高程不同的顶点（{node_z[node]:.3f} 与 {z:.3f}），请核对"
+                        )
+                if not chain or chain[-1] != node:
+                    chain.append(node)
+            for a, b in zip(chain, chain[1:]):
+                segments.append((a, b))
+                segment_line.append(line_index)
+
+        try:
+            cdt = constrained_delaunay(np.array(node_xy, dtype=float), segments, tol=DUPLICATE_TOLERANCE)
+        except ValueError as exc:
+            raise ValueError(f"无法按特征线构建{label}三角网：{exc}") from exc
+        if len(cdt.coplanar):
+            dropped = [str(points[unique[i]].id) for i in cdt.coplanar.tolist() if i < len(unique)]
+            if dropped:
+                self.warnings.append(
+                    f"有 {len(dropped)} 个{label}测点与相邻点距离过近，未参与构网：{format_id_list(dropped)}"
+                )
+
+        # 特征线相交处的新增顶点：高程沿各自所在的特征线线性插值
+        z_all = node_z + [0.0] * len(cdt.added)
+        names = node_names + [""] * len(cdt.added)
+        crossing = 0
+        for vertex in cdt.added:
+            estimates = []
+            for segment, t in vertex.parents:
+                a, b = segments[segment]
+                estimates.append(z_all[a] + (z_all[b] - z_all[a]) * t)
+            z_all[vertex.index] = float(np.mean(estimates))
+            crossing += 1
+            names[vertex.index - len(unique)] = f"{id_prefix}{BREAKLINE_ID_PREFIX}交点{crossing}"
+            spread = max(estimates) - min(estimates)
+            if spread > BREAKLINE_CROSS_WARN:
+                owners = sorted({segment_line[segment] for segment, _ in vertex.parents})
+                listed = "、".join(lines[k].label(k) for k in owners)
+                x, y = cdt.points[vertex.index]
+                self.warnings.append(
+                    f"{prefix}{listed}在 ({x + ox:.3f}, {y + oy:.3f}) 处相交，各线在交点的插值高程相差 {spread:.3f} m，"
+                    "已取平均值。如果这几条线不应相交，请检查特征线"
+                )
+
+        extra_local = cdt.points[len(unique):]
+        extra = [
+            SurveyPoint(id=names[i], x=float(x + ox), y=float(y + oy), z=float(z_all[len(unique) + i]))
+            for i, (x, y) in enumerate(extra_local.tolist())
+        ]
+        if design and extra:
+            designs = self._design_at(extra_local, points, local, unique)
+            for point, value in zip(extra, designs.tolist()):
+                point.design_z = float(value)
+                point.delta_z = point.z - point.design_z
+        # 构网序号 → 返回约定的序号
+        mapping = np.concatenate([unique, len(points) + np.arange(len(extra))]).astype(np.int64)
+        return extra, extra_local, mapping[cdt.simplices]
+
     def _prepare_boundary(self) -> Optional[np.ndarray]:
         if not self.boundary_polygon:
             return None
@@ -342,6 +505,7 @@ class TINEarthworkCalculator:
         origin = coords.min(axis=0)
         self._origin = (float(origin[0]), float(origin[1]))
         self._tin_a = self._tin_b = None
+        self.breakline_points = []
         return self._classify(vertex_points, coords - origin, np.asarray(simplices, dtype=np.int64).reshape(-1, 3))
 
     def _triangulate_design(self):
@@ -351,11 +515,15 @@ class TINEarthworkCalculator:
         origin = coords[unique].min(axis=0)
         self._origin = (float(origin[0]), float(origin[1]))
         local = coords - origin
-        self.delaunay = self._delaunay(local[unique], self.points, unique)
-        self._tin_a = (self.delaunay, unique)
+        self.breakline_points = []
+        extra, extra_local, simplices = self._period_tin(self.points, local, unique, self.breaklines, "", design=True)
+        self.breakline_points = extra
+        vertex_points = self.points + extra
+        local_all = np.vstack([local, extra_local]) if extra else local
+        self._tin_a = self._surface(local_all, simplices, vertex_points, design=True)
         self._tin_b = None
         self._overlap_ratio = None
-        return self.points, local, unique[self.delaunay.simplices]
+        return vertex_points, local_all, simplices
 
     def _triangulate_compare(self):
         """前期、后期各自构网后叠加；叠加后的顶点 z 为前期高程，design_z 为后期高程。"""
@@ -371,14 +539,18 @@ class TINEarthworkCalculator:
         self._origin = (float(origin[0]), float(origin[1]))
         local_a = coords_a - origin
         local_b = coords_b - origin
-        tin_a = self._delaunay(local_a[unique_a], before, unique_a, "前期")
-        tin_b = self._delaunay(local_b[unique_b], after, unique_b, "后期")
-        self.delaunay = tin_a
-        self._tin_a = (tin_a, unique_a)
-        self._tin_b = (tin_b, unique_b)
+        extra_a, extra_local_a, simp_a = self._period_tin(before, local_a, unique_a, self.breaklines, "前期", design=False)
+        extra_b, extra_local_b, simp_b = self._period_tin(
+            after, local_b, unique_b, self.compare_breaklines, "后期", design=False, id_prefix=COMPARE_ID_PREFIX)
+        self.breakline_points = extra_a + extra_b
+        before_all, after_all = before + extra_a, after + extra_b
+        local_a_all = np.vstack([local_a, extra_local_a]) if extra_a else local_a
+        local_b_all = np.vstack([local_b, extra_local_b]) if extra_b else local_b
+        self._tin_a = self._surface(local_a_all, simp_a, before_all, design=False)
+        self._tin_b = self._surface(local_b_all, simp_b, after_all, design=False)
 
-        tri_a = local_a[unique_a][tin_a.simplices]
-        tri_b = local_b[unique_b][tin_b.simplices]
+        tri_a = local_a_all[simp_a]
+        tri_b = local_b_all[simp_b]
         extent = float(max(np.ptp(local_a[unique_a], axis=0).max(), np.ptp(local_b[unique_b], axis=0).max())) or 1.0
         area_tol = (extent * 1e-9) * extent * 1e-3
         cells = overlay_triangulations(tri_a, tri_b, area_tol)
@@ -386,8 +558,8 @@ class TINEarthworkCalculator:
             raise ValueError(
                 "前期和后期测量的范围没有重叠，无法对比。请检查两期坐标是否同一坐标系、X/Y 方向是否一致。"
             )
-        planes_a = _triangle_planes(tri_a, np.array([before[i].z for i in unique_a])[tin_a.simplices])
-        planes_b = _triangle_planes(tri_b, np.array([after[i].z for i in unique_b])[tin_b.simplices])
+        planes_a = _triangle_planes(tri_a, np.array([p.z for p in before_all])[simp_a])
+        planes_b = _triangle_planes(tri_b, np.array([p.z for p in after_all])[simp_b])
 
         # 所有交集多边形的顶点摊平后按坐标去重（批量处理，避免逐点 Python 调用）
         sizes = np.fromiter((len(polygon) for polygon, _, _ in cells), dtype=np.int64, count=len(cells))
@@ -426,6 +598,10 @@ class TINEarthworkCalculator:
             names[tuple(row)] = f"{COMPARE_ID_PREFIX}{after[index].id}"
         for index, row in zip(unique_a, np.round(local_a[unique_a] / key_tol).astype(np.int64).tolist()):
             names[tuple(row)] = str(before[index].id)
+        # 特征线新增顶点：后期在前、前期在后，与上面一样前期优先
+        for extra, extra_local in ((extra_b, extra_local_b), (extra_a, extra_local_a)):
+            for point, row in zip(extra, np.round(np.asarray(extra_local).reshape(-1, 2) / key_tol).astype(np.int64).tolist()):
+                names.setdefault(tuple(row), str(point.id))
         ox, oy = self._origin
         crossing = 0
         vertex_points: List[SurveyPoint] = []
@@ -587,8 +763,18 @@ class TINEarthworkCalculator:
         result.design_description = self._design_description()
         if self.compare_points:
             result.compare_point_count = len(self.compare_points)
+            result.compare_breaklines = list(self.compare_breaklines)
+        result.breaklines = list(self.breaklines)
         result.warnings = list(self.warnings) + self._coverage_warnings(result)
         return result
+
+    def volumes_without_breaklines(self) -> Tuple[float, float]:
+        """同样的测点、比较面和边界，不加特征线时的 (挖方, 填方)，用于说明特征线的影响。"""
+        plain = copy.copy(self)
+        plain.breaklines, plain.compare_breaklines = [], []
+        plain.build_tin()
+        result = plain.calculate_volumes()
+        return result.total_cut, result.total_fill
 
     def _design_description(self) -> str:
         if self.compare_points:
@@ -630,15 +816,14 @@ class TINEarthworkCalculator:
         """(地面曲面, 取值键, 比较面曲面, 取值键)，局部坐标。须在 build_tin() 之后调用。"""
         if self._tin_a is None:
             raise ValueError("请先构建三角网")
-        tin_a, unique_a = self._tin_a
-        surface_a = TinSurface(tin_a, {
-            "z": np.array([self.points[i].z for i in unique_a]),
-            "design_z": np.array([self.points[i].design_z for i in unique_a]),
-        })
+        surface_a, vertices_a = self._tin_a
+        surface_a.values["z"] = np.array([p.z for p in vertices_a], dtype=float)
+        # 设计高程可能在构网后被改过，取当前值
+        surface_a.values["design_z"] = np.array([p.design_z for p in vertices_a], dtype=float)
         if self._tin_b is None:
             return surface_a, "z", surface_a, "design_z"
-        tin_b, unique_b = self._tin_b
-        surface_b = TinSurface(tin_b, {"z": np.array([self.compare_points[i].z for i in unique_b])})
+        surface_b, vertices_b = self._tin_b
+        surface_b.values["z"] = np.array([p.z for p in vertices_b], dtype=float)
         return surface_a, "z", surface_b, "z"
 
     def sample_surfaces(self, xy: np.ndarray, extrapolate: bool = False) -> Tuple[np.ndarray, np.ndarray]:
