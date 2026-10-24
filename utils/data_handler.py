@@ -6,7 +6,7 @@ import json
 import math
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import openpyxl
@@ -15,6 +15,7 @@ from openpyxl.cell import WriteOnlyCell
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
+from core.breaklines import Breakline
 from core.calculator import CalculationResult, SurveyPoint, chain_segments, extract_zero_contour_segments
 from utils.dxf_io import read_text_with_encodings
 from utils.fileio import atomic_write_text
@@ -22,6 +23,28 @@ from version import __version__
 
 def report_labels(result: CalculationResult) -> Dict[str, str]:
     """报告用语：与设计面比较，或两期对比。"""
+    labels = _base_labels(result)
+    if result.has_breaklines:
+        method = labels["method"]
+        if "Delaunay剖分" in method:
+            labels["method"] = method.replace("Delaunay剖分", "约束Delaunay剖分，按特征线构网")
+        else:
+            labels["method"] = method.replace("（", "（按特征线构网，", 1)
+    return labels
+
+
+def _base_labels(result: CalculationResult) -> Dict[str, str]:
+    """报告用语：与设计面比较、与设计三角网比较，或两期对比。"""
+    if result.is_design_tin:
+        return {
+            "natural": "实测高程",
+            "design": "设计高程",
+            "design_item": "设计面",
+            "cut": "实测高于设计面部分",
+            "fill": "实测低于设计面部分",
+            "method": "设计三角网叠加（实测、设计两个三角网精确求交，边界精确裁剪）",
+            "covered": "实测与设计三角网共同覆盖",
+        }
     if result.is_compare:
         return {
             "natural": "前期高程",
@@ -43,8 +66,21 @@ def report_labels(result: CalculationResult) -> Dict[str, str]:
     }
 
 
+def breakline_note(result: CalculationResult) -> str:
+    """特征线的一句话说明（汇总表、文本报告共用）。"""
+    if result.is_compare:
+        text = f"前期 {len(result.breaklines)} 条、后期 {len(result.compare_breaklines)} 条特征线"
+    else:
+        text = f"{len(result.breaklines)} 条特征线"
+    return text + "参与构网，三角形的边不跨越特征线"
+
+
 def _percent(value: Optional[float]) -> str:
     return "—" if value is None else f"{value:+.2f}%"
+
+
+def _half_percent(value: Optional[float]) -> str:
+    return "—" if value is None else f"± {value:.2f}%"
 
 
 ISSUE_NAMES = {
@@ -198,13 +234,23 @@ class DataImporter:
         z_column = mapping.get("z")
         design_column = mapping.get("design_z")
 
+        # 点号直接从列里取：逐行取时整数会随其他列升成浮点，点号 7 就成了 “7.0”
+        id_values = None
+        if id_column is not None:
+            id_series = df[id_column]
+            if isinstance(id_series, pd.DataFrame):   # 表头里有重名的列，取第一列
+                id_series = id_series.iloc[:, 0]
+            id_values = id_series.tolist()
+
         for row_number, (index, row) in enumerate(df.iterrows(), start=1):
             try:
                 if x_column is None or y_column is None or z_column is None:
                     raise KeyError("缺少 X/Y/Z 列映射")
-                raw_id = row[id_column] if id_column is not None else None
+                raw_id = id_values[row_number - 1] if id_values is not None else None
                 if raw_id is None or pd.isna(raw_id) or str(raw_id).strip() == "":
                     point_id = f"P{row_number}"
+                elif isinstance(raw_id, float) and raw_id.is_integer():
+                    point_id = str(int(raw_id))   # 列里有空点号时整列是浮点
                 else:
                     point_id = str(raw_id).strip()
                 design_z = 0.0
@@ -235,10 +281,13 @@ class DataImporter:
         path = Path(filepath)
         suffix = path.suffix.lower()
         
+        # 没有表头的 CSV 按“点号,X,Y,高程”文本读；交给 pandas 会把第一个测点当成表头丢掉
+        as_text = suffix in ['.txt', '.dat'] or (suffix == '.csv' and not DataImporter._csv_has_header(filepath))
+
         try:
             if suffix in ['.xlsx', '.xls']:
                 df = pd.read_excel(filepath)
-            elif suffix == '.csv':
+            elif suffix == '.csv' and not as_text:
                 # 尝试多种编码
                 for enc in ['utf-8', 'gbk', 'gb2312', 'utf-16']:
                     try:
@@ -248,7 +297,20 @@ class DataImporter:
                         continue
                 else:
                     raise ValueError("无法识别CSV编码")
-            elif suffix in ['.txt', '.dat']:
+            elif suffix in ['.dxf', '.las']:
+                # 地形图（高程点、注记、等高线）或点云：按默认选项取点，界面上可先选图层、抽稀方式
+                from utils import terrain_import
+                if suffix == '.dxf':
+                    sources = terrain_import.scan_dxf_terrain(filepath)
+                    if not sources:
+                        raise ValueError("DXF 中没有找到高程点、高程注记或带标高的等高线")
+                    points = terrain_import.build_terrain_points(
+                        sources, terrain_import.default_selection(sources)).points
+                else:
+                    cloud = terrain_import.read_las(filepath)
+                    points = terrain_import.cloud_points(cloud, terrain_import.suggest_cell(cloud.xyz))
+                return points, DataValidator.validate_points(points), terrain_import.points_frame(points)
+            elif as_text:
                 points, format_errors, df = DataImporter.import_survey_text(
                     filepath, cass=(suffix == '.dat')
                 )
@@ -271,6 +333,19 @@ class DataImporter:
         issues = DataValidator.validate_points(points)
         issues["format_errors"].extend(format_errors)
         return points, issues, df
+
+    @staticmethod
+    def _csv_has_header(filepath: str) -> bool:
+        """CSV 的第一行是不是表头（而不是第一个测点）。读不了的文件当作有表头，由后面的读取报错。"""
+        try:
+            text = read_text_with_encodings(filepath)
+        except OSError:
+            return True
+        for raw in text.splitlines():
+            line = raw.strip()
+            if line:
+                return DataImporter._is_survey_header(DataImporter._split_survey_fields(line))
+        return True
 
     @staticmethod
     def _split_survey_fields(line: str) -> List[str]:
@@ -501,22 +576,63 @@ class DataExporter:
             ['计算面积', round(result.computed_area, 3), 'm²', f'计算边界内且{labels["covered"]}的水平面积'],
         ]
         if result.boundary_area > 0:
-            rows.append(['计算边界面积', round(result.boundary_area, 3), 'm²', ''])
+            rows.append(['计算边界面积', round(result.boundary_area, 3), 'm²',
+                         '已扣除挖空区' if result.holes else ''])
             rows.append(['测点覆盖率', round(result.coverage_ratio * 100, 2), '%', '低于 99.5% 时请核对边界'])
+        if result.holes:
+            rows.append(['挖空区', len(result.holes), '个', f'面积 {result.hole_area:.3f} m²，不计方量'])
+        if result.contours is not None:
+            rows.append(['等高线', f'等高距 {result.contours.interval:g} m', '',
+                         f'地面 {len(result.contours.natural)} 条、'
+                         f'{"后期" if result.is_compare and not result.is_design_tin else "设计面"} '
+                         f'{len(result.contours.design)} 条，见 DXF'])
+        if result.trimmed_triangles:
+            rows.append(['剔除长边三角形', len(result.trimmed_triangles), '个',
+                         f'边长超过 {result.max_edge_length:g} m，不计方量'])
         if result.design_description:
             # 斜面、两期对比的说明较长：数值列写类型，完整说明放在说明列
-            short = "两期对比" if result.is_compare else result.design_description.split("：", 1)[0]
+            short = result.design_description.split("：", 1)[0]
             rows.append([labels["design_item"], short, '', result.design_description])
         else:
             rows.append([labels["design_item"], result.design_text, '', ''])
         if result.is_compare:
-            rows.append(['后期测点数', result.compare_point_count, '个', ''])
+            rows.append(['设计点数' if result.is_design_tin else '后期测点数', result.compare_point_count, '个', ''])
         rows += [
             ['三角形数', result.triangle_count, '个',
              '两期三角网叠加后的计算单元' if result.is_compare else '参与计算的三角形'],
             ['混合三角形', result.mixed_triangle_count, '个', '跨越零填挖线，已按零线分割'],
             ['边界裁剪三角形', result.clipped_triangle_count, '个', '跨越计算边界，只计边界内部分'],
         ]
+        if result.soil_balance is not None:
+            rows += result.soil_balance.rows()
+        sections = result.sections
+        if sections is not None:
+            comparison = {label: (diff, relative) for label, _, _, diff, relative in sections.comparison(result)}
+            rows += [
+                ['断面法', f'间距 {sections.spacing:g} m', '',
+                 f'{len(sections.sections)} 个断面，推进方向 {sections.angle:g}°，平均断面法'],
+                ['断面法挖方', round(sections.total_cut, 3), 'm³', f'与 TIN 法相差 {_percent(comparison["挖方"][1])}'],
+                ['断面法填方', round(sections.total_fill, 3), 'm³', f'与 TIN 法相差 {_percent(comparison["填方"][1])}'],
+            ]
+        layers = result.layers
+        if layers is not None:
+            rows.append(['分层土方', layers.title, '', f'{len(layers.rows)} 层'])
+            for row in layers.rows:
+                rows.append([f'  {row.label(layers.mode)}', f'挖 {row.cut:.3f} / 填 {row.fill:.3f}', 'm³', ''])
+        uncertainty = result.uncertainty
+        if uncertainty is not None:
+            rows.append(['不确定度评定', f'测量中误差 {uncertainty.sigma_measure:g} m', '',
+                         f'抽稀外推 {uncertainty.repeats} 次；修正后估计 ± 95% 区间半宽'])
+            for label, _, estimate, half, pct in uncertainty.rows():
+                rows.append([f'  {label}', f'{estimate:.3f} ± {half:.3f}', 'm³', _half_percent(pct)])
+            if uncertainty.recommendations:
+                rows.append(['  推荐补测点', len(uncertainty.recommendations), '个',
+                             f'内插误差指标可降至 {uncertainty.recommendations[-1].remaining:.0%}'])
+            significance = getattr(uncertainty, "significance", None)
+            if significance is not None:
+                rows.append(['变化显著性', f'{significance.confidence:.0%} 检测限', '', '检测限随地面起伏与点距逐处变化'])
+                for label, value, unit, note in significance.rows():
+                    rows.append([f'  {label}', round(value, 3), unit, note])
         grid = result.grid_check
         if grid is not None:
             comparison = {label: (diff, relative) for label, _, _, diff, relative in grid.comparison(result)}
@@ -527,6 +643,31 @@ class DataExporter:
                 ['方格网法挖填差值', round(grid.net_volume, 3), 'm³',
                  f'与 TIN 法相差 {comparison["挖填差值"][0]:+.3f} m³'],
             ]
+        if result.has_breaklines:
+            rows.append(['特征线', len(result.breaklines) + len(result.compare_breaklines), '条',
+                         breakline_note(result)])
+        if result.without_breaklines is not None:
+            cut, fill = result.without_breaklines
+            rows += [
+                ['不加特征线挖方', round(cut, 3), 'm³', f'加特征线后相差 {result.total_cut - cut:+.3f} m³'],
+                ['不加特征线填方', round(fill, 3), 'm³', f'加特征线后相差 {result.total_fill - fill:+.3f} m³'],
+            ]
+        return rows
+
+    @staticmethod
+    def breakline_rows(result: CalculationResult) -> List[List[Any]]:
+        """特征线页：每个顶点一行。"""
+        rows = []
+        groups = [("前期" if result.is_compare else "", result.breaklines)]
+        if result.is_compare:
+            groups.append(("后期", result.compare_breaklines))
+        number = 0
+        for period, lines in groups:
+            for line in lines:
+                number += 1
+                for index, (x, y, z) in enumerate(line.vertices, 1):
+                    rows.append([number, line.name, period, index, round(x, 3), round(y, 3),
+                                 "取测点高程" if z is None else round(z, 3)])
         return rows
 
     @staticmethod
@@ -583,6 +724,9 @@ class DataExporter:
         for row in self.summary_rows(result):
             ws1.append(row)
 
+        if result.boundary_points:
+            self._write_boundary_sheet(wb.create_sheet("计算边界"), result, points or [], header, bold)
+
         ws2 = wb.create_sheet("三角形计算明细")
         ws2.freeze_panes = "B2"
         detail_headers = self.detail_headers(result)
@@ -630,11 +774,105 @@ class DataExporter:
             for row in self.grid_cell_rows(result):
                 ws6.append(row)
 
+        if result.has_breaklines:
+            ws7 = wb.create_sheet("特征线")
+            ws7.freeze_panes = "A2"
+            for column, width in zip("ABCDEFG", (8, 18, 8, 10, 16, 16, 14)):
+                ws7.column_dimensions[column].width = width
+            header(ws7, ["序号", "名称", "期次", "顶点", "X", "Y", "高程"])
+            for row in self.breakline_rows(result):
+                ws7.append(row)
+        sections = result.sections
+        if sections is not None:
+            ws7 = wb.create_sheet("断面法")
+            for column, width in zip("ABCDEFGH", (10, 14, 16, 16, 14, 16, 16, 30)):
+                ws7.column_dimensions[column].width = width
+            ws7.append([bold(ws7, f"断面法（间距 {sections.spacing:g} m，推进方向 {sections.angle:g}°，平均断面法）", 12)])
+            ws7.append([])
+            header(ws7, ["项目", "TIN 法", "断面法", "差值", "相对差"])
+            for label, tin_value, value, diff, relative in sections.comparison(result):
+                ws7.append([label, round(tin_value, 3), round(value, 3), round(diff, 3), _percent(relative)])
+            ws7.append([])
+            header(ws7, ["断面", "里程(m)", "挖方面积(m²)", "填方面积(m²)", "至下一断面(m)",
+                         "区间挖方(m³)", "区间填方(m³)", "断面起点 X, Y"])
+            for k, section in enumerate(sections.sections):
+                interval = sections.volumes[k] if k < len(sections.volumes) else ("", "", "")
+                ws7.append([section.index, round(section.station, 3), round(section.cut_area, 3),
+                            round(section.fill_area, 3),
+                            *[round(value, 3) if value != "" else "" for value in interval],
+                            f"{section.start[0]:.3f}, {section.start[1]:.3f}"])
+            for warning in sections.warnings:
+                ws7.append(["提示", warning])
+
+        layers = result.layers
+        if layers is not None:
+            ws8 = wb.create_sheet("分层土方")
+            for column, width in zip("ABC", (28, 16, 16)):
+                ws8.column_dimensions[column].width = width
+            ws8.append([bold(ws8, f"分层土方（{layers.title}）", 12)])
+            ws8.append([])
+            header(ws8, ["分层", "挖方(m³)", "填方(m³)"])
+            for row in layers.rows:
+                ws8.append([row.label(layers.mode), round(row.cut, 3), round(row.fill, 3)])
+            ws8.append(["合计", round(layers.total_cut, 3), round(layers.total_fill, 3)])
+
+        uncertainty = result.uncertainty
+        if uncertainty is not None:
+            ws9 = wb.create_sheet("不确定度评定")
+            for column, width in zip("ABCDEF", (16, 16, 16, 18, 14, 40)):
+                ws9.column_dimensions[column].width = width
+            ws9.append([bold(ws9, "土方量不确定度评定", 12)])
+            ws9.append([f"测量中误差 {uncertainty.sigma_measure:g} m，系统误差 {uncertainty.sigma_bias:g} m，"
+                        f"抽稀外推 {uncertainty.repeats} 次"])
+            ws9.append([])
+            header(ws9, ["项目", "TIN 法(m³)", "修正后估计(m³)", "95% 区间半宽(m³)", "半宽占比", "其中内插 / 测量 1σ(m³)"])
+            for (label, tin, estimate, half, pct), interp, measure in zip(
+                    uncertainty.rows(), uncertainty.interp_sigma, uncertainty.measure_sigma):
+                ws9.append([label, round(tin, 3), round(estimate, 3), round(half, 3), _half_percent(pct),
+                            f"{interp:.3f} / {measure:.3f}"])
+            if uncertainty.recommendations:
+                ws9.append([])
+                ws9.append([bold(ws9, "推荐补测点（按收益从大到小）", 11)])
+                header(ws9, ["序号", "X", "Y", "误差指标减少(m³)", "补到此点后剩余"])
+                for k, item in enumerate(uncertainty.recommendations, 1):
+                    ws9.append([f"R{k}", round(item.x, 3), round(item.y, 3), round(item.reduction, 3),
+                                f"{item.remaining:.0%}"])
+            significance = getattr(uncertainty, "significance", None)
+            if significance is not None:
+                ws9.append([])
+                ws9.append([bold(ws9, f"变化显著性（{significance.confidence:.0%} 检测限，格网 {significance.cell:g} m）", 11)])
+                header(ws9, ["项目", "数值", "单位", "说明"])
+                for label, value, unit, note in significance.rows():
+                    ws9.append([label, round(value, 3), unit, note])
+                ws9.append(["对照", round(significance.fixed_lod, 3), "m",
+                            f"只计测量误差的常数检测限，判为显著的面积 {significance.fixed_significant_area:,.0f} m²"])
+            for warning in uncertainty.warnings:
+                ws9.append(["提示", warning])
+
         # 先完整写入内存再落盘：目标文件被占用时不会留下半成品和临时文件
         buffer = io.BytesIO()
         wb.save(buffer)
         Path(filepath).write_bytes(buffer.getvalue())
         return True
+
+    @staticmethod
+    def _write_boundary_sheet(ws, result: CalculationResult, points: List[SurveyPoint], header, bold) -> None:
+        """计算边界坐标表：顶点坐标、对应测点点号、边长，末尾写周长和面积。"""
+        from core.boundary_check import edge_lengths
+        from utils.boundary_io import BOUNDARY_TABLE_HEADERS, boundary_table
+
+        ring = result.boundary_points
+        for column, width in zip("ABCDE", (8, 14, 18, 18, 18)):
+            ws.column_dimensions[column].width = width
+        ws.append([bold(ws, "计算边界坐标表", 12)])
+        ws.append([f"共 {len(ring)} 个顶点，按连线顺序排列；“点号”为与该顶点重合的测点，空白表示不是测点"])
+        ws.append([])
+        header(ws, BOUNDARY_TABLE_HEADERS)
+        for row in boundary_table(ring, points):
+            ws.append(row)
+        ws.append([])
+        ws.append(["周长", "", "", "", round(sum(edge_lengths(ring)), 3)])
+        ws.append(["面积", "", "", "", round(result.boundary_area, 3)])
 
     def export_triangles_csv(self, result: CalculationResult, filepath: str) -> bool:
         """导出三角形明细CSV"""
@@ -642,8 +880,9 @@ class DataExporter:
         df.to_csv(filepath, index=False, encoding='utf-8-sig')
         return True
 
-    def export_boundary_dxf(self, result: CalculationResult, filepath: str) -> bool:
-        """导出计算边界（闭合多段线）和零填挖线到 DXF。
+    def export_boundary_dxf(self, result: CalculationResult, filepath: str,
+                            points: Optional[List[SurveyPoint]] = None) -> bool:
+        """导出计算边界（闭合多段线，顶点标点号）、挖空区和零填挖线到 DXF。
 
         采用 R12 格式的 POLYLINE，AutoCAD、CASS 等都能直接打开。
         """
@@ -651,23 +890,87 @@ class DataExporter:
                  "0\nSECTION\n2\nENTITIES\n"]
         if result.boundary_points:
             parts.append(self._dxf_polyline("BOUNDARY", result.boundary_points, closed=True))
+            parts.extend(self._dxf_boundary_labels(result.boundary_points, points or []))
+        for hole in result.holes:
+            parts.append(self._dxf_polyline("HOLE", hole, closed=True))
         for polyline in chain_segments(extract_zero_contour_segments(result)):
             if len(polyline) >= 2:
                 parts.append(self._dxf_polyline("ZERO_CONTOUR", polyline, closed=False))
         if result.grid_check is not None:
             parts.extend(self._dxf_grid(result.grid_check))
+        for line in list(result.breaklines) + list(result.compare_breaklines):
+            if len(line.vertices) >= 2:
+                parts.append(self._dxf_polyline("BREAKLINE", [(x, y) for x, y, _ in line.vertices], closed=False))
+        parts.extend(self._dxf_tin(result))
+        if result.contours is not None:
+            parts.extend(self._dxf_contours(result))
+        if result.sections is not None:
+            size = max(result.sections.spacing * 0.15, 0.3)
+            for section in result.sections.sections:
+                parts.append(self._dxf_polyline("SECTION", [section.start, section.end], closed=False))
+                parts.append(self._dxf_text("SECTION", section.start[0], section.start[1], size, f"{section.index}"))
         parts.append("0\nENDSEC\n0\nEOF\n")
         with open(filepath, "w", encoding="utf-8") as handle:
             handle.write("".join(parts))
         return True
 
+    def export_boundary_only_dxf(self, ring: Sequence[Tuple[float, float]], filepath: str,
+                                 points: Optional[List[SurveyPoint]] = None) -> bool:
+        """只导出计算边界（边界页“导出边界”用），本程序“导入边界文件”可原样读回。"""
+        parts = ["0\nSECTION\n2\nHEADER\n9\n$ACADVER\n1\nAC1009\n0\nENDSEC\n",
+                 "0\nSECTION\n2\nENTITIES\n",
+                 self._dxf_polyline("BOUNDARY", ring, closed=True)]
+        parts.extend(self._dxf_boundary_labels(ring, points or []))
+        parts.append("0\nENDSEC\n0\nEOF\n")
+        with open(filepath, "w", encoding="utf-8") as handle:
+            handle.write("".join(parts))
+        return True
+
+    # 顶点多于这个数（如圆弧折线化后的边界）时不标注，免得图上糊成一片
+    BOUNDARY_LABEL_LIMIT = 500
+
+    @classmethod
+    def _dxf_boundary_labels(cls, ring, points: List[SurveyPoint]) -> List[str]:
+        """BOUNDARY_POINT 图层：每个边界顶点标对应的测点点号，不是测点的标序号。
+
+        R12 的文字按图纸代码页解释，含中文的点号改标序号，避免乱码。
+        """
+        if not ring or len(ring) > cls.BOUNDARY_LABEL_LIMIT:
+            return []
+        from utils.boundary_io import vertex_ids
+
+        xs = [float(x) for x, _ in ring]
+        ys = [float(y) for _, y in ring]
+        size = max(max(xs) - min(xs), max(ys) - min(ys)) * 0.012 or 0.5
+        labels = []
+        for index, ((x, y), point_id) in enumerate(zip(ring, vertex_ids(ring, points)), 1):
+            text = point_id if point_id and point_id.isascii() else str(index)
+            labels.append(cls._dxf_text("BOUNDARY_POINT", float(x) + size * 0.4, float(y) + size * 0.4, size, text))
+        return labels
+
     @staticmethod
-    def _dxf_polyline(layer: str, points, closed: bool) -> str:
-        lines = [f"0\nPOLYLINE\n8\n{layer}\n66\n1\n10\n0.0\n20\n0.0\n30\n0.0\n70\n{1 if closed else 0}\n"]
+    def _dxf_polyline(layer: str, points, closed: bool, elevation: float = 0.0) -> str:
+        z = repr(float(elevation))
+        lines = [f"0\nPOLYLINE\n8\n{layer}\n66\n1\n10\n0.0\n20\n0.0\n30\n{z}\n70\n{1 if closed else 0}\n"]
         for x, y in points:
-            lines.append(f"0\nVERTEX\n8\n{layer}\n10\n{float(x)!r}\n20\n{float(y)!r}\n30\n0.0\n")
+            lines.append(f"0\nVERTEX\n8\n{layer}\n10\n{float(x)!r}\n20\n{float(y)!r}\n30\n{z}\n")
         lines.append(f"0\nSEQEND\n8\n{layer}\n")
         return "".join(lines)
+
+    @staticmethod
+    def _dxf_tin(result: CalculationResult) -> List[str]:
+        """参与计算的三角形，TIN 图层的 3DFACE（顶点带实测/前期高程），便于在 CAD 中与其他软件的三角网核对。"""
+        parts = []
+        for tri in result.triangles:
+            if tri.is_boundary:
+                continue
+            corners = list(tri.vertex_points) + [tri.vertex_points[-1]]
+            codes = "".join(
+                f"1{k}\n{float(p.x)!r}\n2{k}\n{float(p.y)!r}\n3{k}\n{float(p.z)!r}\n"
+                for k, p in enumerate(corners)
+            )
+            parts.append(f"0\n3DFACE\n8\nTIN\n{codes}")
+        return parts
 
     @staticmethod
     def _dxf_text(layer: str, x: float, y: float, height: float, text: str) -> str:
@@ -707,6 +1010,25 @@ class DataExporter:
             parts.append(cls._dxf_text("GRID_VOLUME", cx - a * 0.3, cy, size, text))
         return parts
 
+    @classmethod
+    def _dxf_contours(cls, result: CalculationResult) -> List[str]:
+        """等高线：多段线标高即等高线高程，可直接在 CAD/CASS 中当作等高线使用。
+
+        地面等高线在 CONTOUR（首曲线）/ CONTOUR_MAJOR（计曲线），设计面（两期对比时为后期地面）
+        在 DESIGN_CONTOUR / DESIGN_CONTOUR_MAJOR；计曲线中部标注高程（CONTOUR_LABEL）。
+        """
+        contours = result.contours
+        size = max(contours.interval * 0.5, 0.2)
+        parts: List[str] = []
+        for prefix, items in (("", contours.natural), ("DESIGN_", contours.design)):
+            for contour in items:
+                layer = f"{prefix}CONTOUR_MAJOR" if contour.major else f"{prefix}CONTOUR"
+                parts.append(cls._dxf_polyline(layer, contour.polyline, closed=False, elevation=contour.level))
+                if contour.major:
+                    x, y = contour.polyline[len(contour.polyline) // 2]
+                    parts.append(cls._dxf_text(f"{prefix}CONTOUR_LABEL", x, y, size, f"{contour.level:g}"))
+        return parts
+
     def generate_report_text(self, result: CalculationResult, point_count: int) -> str:
         """生成文本报告"""
         labels = report_labels(result)
@@ -720,11 +1042,27 @@ class DataExporter:
         if result.boundary_area > 0:
             area_lines += (
                 f"\n计算边界面积: {result.boundary_area:.3f} m²"
-                f"（测点覆盖率 {result.coverage_ratio * 100:.2f}%）"
+                f"（{'已扣除挖空区，' if result.holes else ''}测点覆盖率 {result.coverage_ratio * 100:.2f}%）"
+            )
+        if result.holes:
+            area_lines += f"\n挖空区: {len(result.holes)} 个，面积 {result.hole_area:.3f} m²，不计方量"
+        if result.trimmed_triangles:
+            area_lines += (
+                f"\n三角网清理: 剔除边长超过 {result.max_edge_length:g} m 的三角形 "
+                f"{len(result.trimmed_triangles)} 个，不计方量"
             )
         warnings = "\n".join(f"- {item}" for item in result.warnings) or "无"
         point_lines = f"测量点数: {point_count}"
-        if result.is_compare:
+        if result.is_design_tin:
+            point_lines = f"实测点数: {point_count}\n设计点数: {result.compare_point_count}"
+            notes = (
+                "1. 实测点、设计点分别构建TIN三角网，两网精确叠加后，每个计算单元内实测地面和设计面均为平面。\n"
+                "2. 高差 = 实测高程 − 设计高程；正为挖方，负为填方。\n"
+                "3. 跨越计算边界的单元按边界精确裁剪；只计算实测与设计三角网都覆盖的部分。\n"
+                "4. 混合挖填单元已按零填挖线分割计算，避免正负高差抵消。\n"
+                "5. 计算结果仅供工程参考，正式计量请以复核成果为准。"
+            )
+        elif result.is_compare:
             point_lines = f"前期测点数: {point_count}\n后期测点数: {result.compare_point_count}"
             notes = (
                 "1. 前期、后期测点分别构建TIN三角网，两网精确叠加后，每个计算单元内两期地面均为平面。\n"
@@ -741,6 +1079,43 @@ class DataExporter:
                 "4. 所有三角形均保留面积、顶点高程、高差及分项体积，可逐项复核。\n"
                 "5. 计算结果仅供工程参考，正式计量请以复核成果为准。"
             )
+        if result.has_breaklines:
+            notes += f"\n6. {breakline_note(result)}。"
+            if result.without_breaklines is not None:
+                cut, fill = result.without_breaklines
+                notes += (f"不加特征线时挖方 {cut:.3f} m³、填方 {fill:.3f} m³，"
+                          f"加特征线后分别相差 {result.total_cut - cut:+.3f}、{result.total_fill - fill:+.3f} m³。")
+        section_text = ""
+        if result.sections is not None:
+            lines = [f"断面间距 {result.sections.spacing:g} m，推进方向 {result.sections.angle:g}°，"
+                     f"共 {len(result.sections.sections)} 个断面，平均断面法"]
+            for label, tin_value, value, diff, relative in result.sections.comparison(result):
+                lines.append(f"{label}: 断面法 {value:.3f} m³，TIN 法 {tin_value:.3f} m³，"
+                             f"相差 {diff:+.3f} m³（{_percent(relative)}）")
+            lines += [f"- {item}" for item in result.sections.warnings]
+            section_text = "\n【断面法校核】\n" + "\n".join(lines) + "\n"
+        if result.layers is not None:
+            section_text += "\n【分层土方】\n" + result.layers.title + "\n" + "\n".join(
+                f"{row.label(result.layers.mode)}: 挖方 {row.cut:.3f} m³，填方 {row.fill:.3f} m³"
+                for row in result.layers.rows) + "\n"
+        if result.uncertainty is not None:
+            uncertainty = result.uncertainty
+            lines = [f"测量中误差 {uncertainty.sigma_measure:g} m，抽稀外推 {uncertainty.repeats} 次（修正后估计 ± 95% 区间半宽）"]
+            lines += [f"{label}: TIN 法 {tin:.3f} m³，修正后 {estimate:.3f} ± {half:.3f} m³（{_half_percent(pct)}）"
+                      for label, tin, estimate, half, pct in uncertainty.rows()]
+            lines += [f"推荐补测点 R{k}: X={item.x:.3f}, Y={item.y:.3f}"
+                      for k, item in enumerate(uncertainty.recommendations, 1)]
+            significance = getattr(uncertainty, "significance", None)
+            if significance is not None:
+                lines.append(f"变化显著性（{significance.confidence:.0%} 检测限）：{significance.summary_text()}")
+            lines += [f"- {item}" for item in uncertainty.warnings]
+            section_text += "\n【不确定度评定】\n" + "\n".join(lines) + "\n"
+        balance_section = ""
+        if result.soil_balance is not None:
+            balance_section = "\n【土方平衡】\n" + "\n".join(
+                f"{label}: {value}{' ' + unit if unit else ''}" + (f"（{note}）" if note else "")
+                for label, value, unit, note in result.soil_balance.rows()
+            ) + "\n"
         grid_section = ""
         grid = result.grid_check
         if grid is not None:
@@ -777,7 +1152,7 @@ class DataExporter:
 总填方量: {result.total_fill:.3f} m³
 挖填差值: {result.net_volume:.3f} m³
 {balance}
-{grid_section}
+{balance_section}{section_text}{grid_section}
 【计算提示】
 {warnings}
 
@@ -817,12 +1192,63 @@ class DataExporter:
             )
             pdf.savefig(summary)
 
+            for page in self._boundary_pages(boundary or result.boundary_points, points, result):
+                pdf.savefig(page)
+
             figure = create_standalone_figure(result, points, boundary, self.project_name)
             pdf.savefig(figure)
+            if result.sections is not None:
+                from utils.plotter import create_section_pages
+                for page in create_section_pages(result, self.project_name):
+                    pdf.savefig(page)
         return True
 
+    # 计算书里的边界坐标表：每页行数、最多列出的顶点数（更多时指向 Excel 报告）
+    PDF_BOUNDARY_ROWS_PER_PAGE = 40
+    PDF_BOUNDARY_ROW_LIMIT = 120
 
-PROJECT_FORMAT_VERSION = 2
+    def _boundary_pages(self, ring, points: List[SurveyPoint], result: CalculationResult):
+        """计算书的“计算边界坐标表”页。"""
+        from matplotlib.figure import Figure
+        from core.boundary_check import edge_lengths
+        from utils.boundary_io import BOUNDARY_TABLE_HEADERS, boundary_table
+
+        if not ring:
+            return []
+        summary = (f"共 {len(ring)} 个顶点，周长 {sum(edge_lengths(ring)):.3f} m，"
+                   f"面积 {abs(result.boundary_area):.3f} m²")
+        rows = boundary_table(ring, points)
+        if len(rows) > self.PDF_BOUNDARY_ROW_LIMIT:
+            page = Figure(figsize=(8.27, 11.69))
+            axis = page.add_subplot(111)
+            axis.axis("off")
+            axis.text(0.06, 0.97, f"计算边界坐标表\n\n{summary}\n顶点较多（多为圆弧折线化），"
+                      f"坐标见 Excel 报告的“计算边界”表。", va="top", ha="left", fontsize=10,
+                      transform=axis.transAxes)
+            return [page]
+        pages = []
+        per_page = self.PDF_BOUNDARY_ROWS_PER_PAGE
+        for start in range(0, len(rows), per_page):
+            page = Figure(figsize=(8.27, 11.69))
+            axis = page.add_subplot(111)
+            axis.axis("off")
+            title = "计算边界坐标表" + (f"（续 {start // per_page + 1}）" if start else "")
+            axis.set_title(f"{self.project_name}  {title}\n{summary}", fontsize=10, loc="left")
+            chunk = rows[start:start + per_page]
+            cells = [[str(n), point_id or "", f"{x:.3f}", f"{y:.3f}", f"{length:.3f}"]
+                     for n, point_id, x, y, length in chunk]
+            table = axis.table(cellText=cells, colLabels=BOUNDARY_TABLE_HEADERS, loc="upper center",
+                               colWidths=[0.08, 0.16, 0.24, 0.24, 0.2], cellLoc="center")
+            table.auto_set_font_size(False)
+            table.set_fontsize(8)
+            table.scale(1, 1.25)
+            pages.append(page)
+        return pages
+
+
+PROJECT_FORMAT_VERSION = 3
+# 仅含 2.0 设置的工程保留旧格式；新计算设置须让旧程序明确拒绝，避免静默漏算。
+PROJECT_FORMAT_VERSION_LEGACY = 2
 DESIGN_MODES = ("flat", "plane", "compare")
 
 
@@ -838,6 +1264,9 @@ def _point_rows(points: List[SurveyPoint]) -> List[Dict[str, Any]]:
         }
         for point in points
     ]
+
+
+DESIGN_MODES += ("design_tin",)   # 设计三角网：设计点在 design_points 中
 
 
 def _points_from_rows(rows) -> List[SurveyPoint]:
@@ -874,13 +1303,36 @@ def save_project(
     compare_source: str = "",
     grid_enabled: bool = False,
     grid_spacing: Optional[float] = None,
+    breaklines: Optional[List[Breakline]] = None,
+    compare_breaklines: Optional[List[Breakline]] = None,
+    *,
+    design_points: Optional[List[SurveyPoint]] = None,
+    design_source: str = "",
+    holes: Optional[List[List[Tuple[float, float]]]] = None,
+    max_edge_length: Optional[float] = None,
+    soil_factors: Optional[Dict[str, float]] = None,
+    contours_enabled: bool = True,
+    contour_interval: Optional[float] = None,
+    sections_enabled: bool = False,
+    section_spacing: Optional[float] = None,
+    section_angle: float = 0.0,
+    layers: Optional[Dict[str, Any]] = None,
+    slope_design: Optional[Dict[str, Any]] = None,
+    uncertainty: Optional[Dict[str, Any]] = None,
 ) -> None:
-    """保存可再次打开的工程文件（测点、边界、设计面、后期测点、方格网设置）。"""
+    """保存工程；保留旧位置参数，新增工程设置通过关键字传入。"""
     if design_mode not in DESIGN_MODES:
         raise ValueError(f"未知的设计面类型: {design_mode}")
+    requires_v3 = bool(
+        breaklines or compare_breaklines or holes or max_edge_length
+        or any(float((soil_factors or {}).get(key, 1.0)) != 1.0 for key in ("loose", "compact"))
+        or design_mode == "design_tin" or sections_enabled or (layers or {}).get("enabled")
+        or (slope_design or {}).get("platforms")
+        or (uncertainty or {}).get("enabled")
+    )
     payload = {
         "format": "tin-earthwork-project",
-        "format_version": PROJECT_FORMAT_VERSION,
+        "format_version": PROJECT_FORMAT_VERSION if requires_v3 else PROJECT_FORMAT_VERSION_LEGACY,
         "app_version": __version__,
         "project_name": project_name,
         "design_mode": design_mode,
@@ -891,9 +1343,25 @@ def save_project(
         "grid_check": {"enabled": bool(grid_enabled), "spacing": None if grid_spacing is None else float(grid_spacing)},
         "compare_source": compare_source,
         "boundary": [[float(x), float(y)] for x, y in boundary],
+        "holes": [[[float(x), float(y)] for x, y in hole] for hole in (holes or [])],
+        "max_edge_length": None if not max_edge_length else float(max_edge_length),
+        "soil_factors": {key: float(value) for key, value in (soil_factors or {}).items()} or None,
+        "contours": {"enabled": bool(contours_enabled),
+                     "interval": None if not contour_interval else float(contour_interval)},
+        "design_points": _point_rows(design_points or []),
+        "design_source": design_source,
+        "sections": {"enabled": bool(sections_enabled),
+                     "spacing": None if not section_spacing else float(section_spacing),
+                     "angle": float(section_angle or 0.0)},
+        "layers": layers or None,
+        "slope_design": slope_design or None,
+        "uncertainty": uncertainty or None,
         "points": _point_rows(points),
         "compare_points": _point_rows(compare_points or []),
     }
+    if breaklines or compare_breaklines:
+        payload["breaklines"] = [line.to_dict() for line in breaklines or []]
+        payload["compare_breaklines"] = [line.to_dict() for line in compare_breaklines or []]
     atomic_write_text(filepath, json.dumps(payload, ensure_ascii=False, indent=2))
 
 
@@ -923,6 +1391,21 @@ def load_project(filepath: str) -> Dict[str, Any]:
         "grid_spacing": None if grid.get("spacing") is None else float(grid["spacing"]),
         "compare_source": payload.get("compare_source") or "",
         "boundary": boundary,
+        "holes": [[(float(x), float(y)) for x, y in hole] for hole in (payload.get("holes") or [])],
+        "max_edge_length": None if not payload.get("max_edge_length") else float(payload["max_edge_length"]),
+        "soil_factors": payload.get("soil_factors") or None,
+        "contours_enabled": bool((payload.get("contours") or {"enabled": True}).get("enabled", True)),
+        "contour_interval": (payload.get("contours") or {}).get("interval") or None,
+        "design_points": _points_from_rows(payload.get("design_points")),
+        "design_source": payload.get("design_source") or "",
+        "sections_enabled": bool((payload.get("sections") or {}).get("enabled")),
+        "section_spacing": (payload.get("sections") or {}).get("spacing") or None,
+        "section_angle": float((payload.get("sections") or {}).get("angle") or 0.0),
+        "layers": payload.get("layers") or None,
+        "slope_design": payload.get("slope_design") or None,
+        "uncertainty": payload.get("uncertainty") or None,
         "points": _points_from_rows(payload.get("points")),
         "compare_points": compare_points,
+        "breaklines": [Breakline.from_dict(item) for item in payload.get("breaklines") or []],
+        "compare_breaklines": [Breakline.from_dict(item) for item in payload.get("compare_breaklines") or []],
     }

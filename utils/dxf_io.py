@@ -1,7 +1,11 @@
-"""DXF 边界读写：解析 LWPOLYLINE / POLYLINE，选出计算边界。"""
+"""DXF 边界与特征线读写：解析多段线（含圆弧段）及直线，并保留顶点高程。"""
+import math
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+
+from core.breaklines import Breakline
 
 
 BOUNDARY_LAYER_HINTS = (
@@ -14,12 +18,34 @@ BOUNDARY_LAYER_HINTS = (
     "kz",
 )
 
+# 圆弧段折线化：插入的点偏离圆弧不超过该值（米），每小段圆心角不超过 ARC_MAX_STEP
+ARC_SAGITTA_TOLERANCE = 0.005
+ARC_MAX_STEP = math.pi / 8
+# 单段弧的小段数上限，只为防异常数据；半径 10 km 的整圆约需 3100 段
+ARC_MAX_SEGMENTS = 4096
+# 弓高小于该值（米）的弧段按直线处理
+ARC_MIN_SAGITTA = 1e-6
+
 
 @dataclass
 class DxfPolyline:
     layer: str = "0"
     closed: bool = False
+    # 圆弧段已折线化
     points: List[Tuple[float, float]] = field(default_factory=list)
+    arc_count: int = 0
+    z: List[Optional[float]] = field(default_factory=list)  # 逐点高程（3D 多段线、直线）
+    elevation: Optional[float] = None  # 2D 多段线的整体标高（LWPOLYLINE 38 组码、POLYLINE 头部 30 组码）
+    is_3d: bool = False
+    kind: str = "POLYLINE"
+
+    def vertex_elevations(self) -> List[Optional[float]]:
+        """每个顶点的高程；没有高程（2D 且标高为 0 或缺省）时为 None。"""
+        if self.is_3d:
+            return [None if value is None else float(value) for value in self.z]
+        if self.elevation:
+            return [float(self.elevation)] * len(self.points)
+        return [None] * len(self.points)
 
 
 def read_text_with_encodings(filepath: str) -> str:
@@ -68,30 +94,124 @@ def _bbox_area(points: List[Tuple[float, float]]) -> float:
     return max(0.0, (max(xs) - min(xs)) * (max(ys) - min(ys)))
 
 
+def _area_scale(sweep: float, count: int) -> float:
+    """圆弧等分成 count 小段时，中间点所在同心圆与圆弧的半径比 r'/r，使折线与圆弧面积相等。
+
+    扇形面积 r²·|θ|/2 = 两端三角形 r·r'·sinφ/2 × 2 + 中间三角形 r'²·sinφ/2 × (count − 2)，φ = |θ| / count。
+    """
+    sin_step = math.sin(abs(sweep) / count)
+    if count == 2:
+        return abs(sweep) / (2.0 * sin_step)
+    a, b = (count - 2) * sin_step, 2.0 * sin_step
+    return (math.sqrt(b * b + 4.0 * a * abs(sweep)) - b) / (2.0 * a)
+
+
+def _arc_points(start: Tuple[float, float], end: Tuple[float, float], bulge: float) -> List[Tuple[float, float]]:
+    """带凸度线段上插入的中间点（不含两端）。凸度 = tan(圆心角 / 4)，正值为逆时针。
+
+    中间点取在比圆弧半径略大的同心圆上，使折线围出的面积与圆弧严格相等
+    （点全落在圆弧上时折线内接，面积总是偏小）；折线偏离圆弧不超过 ARC_SAGITTA_TOLERANCE。
+    """
+    (x1, y1), (x2, y2) = start, end
+    chord = math.hypot(x2 - x1, y2 - y1)
+    if abs(bulge) * chord / 2.0 < ARC_MIN_SAGITTA:
+        return []
+
+    sweep = 4.0 * math.atan(bulge)
+    radius = chord * (1.0 + bulge * bulge) / (4.0 * abs(bulge))
+    offset = (1.0 - bulge * bulge) / (4.0 * bulge)
+    cx = (x1 + x2) / 2.0 - (y2 - y1) * offset
+    cy = (y1 + y2) / 2.0 + (x2 - x1) * offset
+
+    # 先按内接折线的弓高定小段数，保证折线向内不超限
+    step = ARC_MAX_STEP
+    if radius > ARC_SAGITTA_TOLERANCE:
+        step = min(step, 2.0 * math.acos(1.0 - ARC_SAGITTA_TOLERANCE / radius))
+    count = min(max(2, math.ceil(abs(sweep) / step)), ARC_MAX_SEGMENTS)
+    # 小段数很少时中间点外移较多，再加密到向外也不超限
+    scale = _area_scale(sweep, count)
+    while radius * (scale - 1.0) > ARC_SAGITTA_TOLERANCE and count < ARC_MAX_SEGMENTS:
+        count += 1
+        scale = _area_scale(sweep, count)
+
+    start_angle = math.atan2(y1 - cy, x1 - cx)
+    return [
+        (
+            cx + radius * scale * math.cos(start_angle + sweep * index / count),
+            cy + radius * scale * math.sin(start_angle + sweep * index / count),
+        )
+        for index in range(1, count)
+    ]
+
+
+def _flatten_arcs(polyline: DxfPolyline, bulges: List[float]) -> None:
+    """把带凸度的线段换成折线。末点的凸度只在多段线闭合时生效（管回到首点的那一段）。"""
+    vertices = polyline.points
+    elevations = list(polyline.z) if len(polyline.z) == len(vertices) else [None] * len(vertices)
+    flattened: List[Tuple[float, float]] = []
+    flattened_z: List[Optional[float]] = []
+    for index, vertex in enumerate(vertices):
+        flattened.append(vertex)
+        flattened_z.append(elevations[index])
+        if index + 1 < len(vertices):
+            following = vertices[index + 1]
+        elif polyline.closed:
+            following = vertices[0]
+        else:
+            break
+        inserted = _arc_points(vertex, following, bulges[index])
+        if inserted:
+            polyline.arc_count += 1
+            flattened.extend(inserted)
+            start_z, end_z = elevations[index], elevations[(index + 1) % len(vertices)]
+            flattened_z.extend(
+                start_z + (end_z - start_z) * step / (len(inserted) + 1)
+                if start_z is not None and end_z is not None else None
+                for step in range(1, len(inserted) + 1)
+            )
+    polyline.points = flattened
+    polyline.z = flattened_z
+
+
 def parse_dxf_polylines(filepath: str) -> List[DxfPolyline]:
-    """解析 DXF 中的 LWPOLYLINE 与 POLYLINE（VERTEX/SEQEND）。"""
+    """解析 DXF 多段线与 LINE，保留高程并把圆弧段折线化。"""
     text = read_text_with_encodings(filepath)
     polylines: List[DxfPolyline] = []
     current: Optional[DxfPolyline] = None
+    bulges: List[float] = []          # 与 current.points 一一对应
     in_polyline = False
     collect_xy = False
     pending_x: Optional[float] = None
+    pending_x2: Optional[float] = None
+    pending_bulge = 0.0               # 凸度先于坐标出现时暂存
+    vertex_has_point = False          # 当前顶点的坐标是否已读到
 
     def finish_current():
-        nonlocal current, in_polyline, collect_xy, pending_x
+        nonlocal current, bulges, in_polyline, collect_xy, pending_x, pending_x2, pending_bulge, vertex_has_point
         if current is not None and current.points:
+            if current.kind == "LINE" and any(current.z):
+                current.is_3d = True
+            if any(bulges):
+                _flatten_arcs(current, bulges)
             polylines.append(current)
         current = None
+        bulges = []
         in_polyline = False
         collect_xy = False
-        pending_x = None
+        pending_x = pending_x2 = None
+        pending_bulge = 0.0
+        vertex_has_point = False
 
     for code, value in _iter_group_pairs(text):
         if code == 0:
             entity = value.upper()
             if entity == "LWPOLYLINE":
                 finish_current()
-                current = DxfPolyline()
+                current = DxfPolyline(kind="LWPOLYLINE")
+                collect_xy = True
+            elif entity == "LINE":
+                finish_current()
+                current = DxfPolyline(kind="LINE")
                 collect_xy = True
             elif entity == "POLYLINE":
                 finish_current()
@@ -104,6 +224,8 @@ def parse_dxf_polylines(filepath: str) -> List[DxfPolyline]:
                     in_polyline = True
                 collect_xy = True
                 pending_x = None
+                pending_bulge = 0.0
+                vertex_has_point = False
             elif entity == "SEQEND":
                 finish_current()
             elif entity in {"ENDSEC", "EOF", "SECTION"}:
@@ -126,18 +248,57 @@ def parse_dxf_polylines(filepath: str) -> List[DxfPolyline]:
                 flags = int(float(value))
             except ValueError:
                 flags = 0
-            if flags & 1:
+            if current.kind == "LINE":
+                continue
+            if flags & 1 and not (in_polyline and collect_xy):
                 current.closed = True
+            if (flags & 8 and in_polyline and not collect_xy) or (flags & 32 and in_polyline and collect_xy):
+                current.is_3d = True
         elif code == 10:
             if collect_xy:
                 pending_x = _as_float(value)
+                if not in_polyline:
+                    # LWPOLYLINE 的每个 10 开始一个新顶点
+                    pending_bulge = 0.0
+                    vertex_has_point = False
         elif code == 20:
             if not collect_xy:
                 continue
             y_value = _as_float(value)
             if pending_x is not None and y_value is not None:
                 current.points.append((pending_x, y_value))
+                current.z.append(None)
+                bulges.append(pending_bulge)
+                pending_bulge = 0.0
+                vertex_has_point = True
             pending_x = None
+        elif code == 42:
+            if not collect_xy:
+                continue
+            bulge = _as_float(value) or 0.0
+            if vertex_has_point:
+                bulges[-1] = bulge
+            else:
+                pending_bulge = bulge
+        elif code == 30:
+            if in_polyline and not collect_xy:
+                current.elevation = _as_float(value)
+            elif collect_xy and current.points and current.kind != "LWPOLYLINE":
+                current.z[-1] = _as_float(value)
+        elif code == 38 and current.kind == "LWPOLYLINE":
+            current.elevation = _as_float(value)
+        elif current.kind == "LINE" and code in (11, 21, 31):
+            if code == 11:
+                pending_x2 = _as_float(value)
+            elif code == 21:
+                y_value = _as_float(value)
+                if pending_x2 is not None and y_value is not None and len(current.points) == 1:
+                    current.points.append((pending_x2, y_value))
+                    current.z.append(None)
+                    bulges.append(0.0)
+                pending_x2 = None
+            elif len(current.points) == 2:
+                current.z[-1] = _as_float(value)
 
     finish_current()
     return polylines
@@ -162,10 +323,97 @@ def select_boundary_polyline(polylines: List[DxfPolyline]) -> DxfPolyline:
     return max(usable, key=score)
 
 
-def import_boundary_from_dxf(filepath: str) -> List[Tuple[float, float]]:
-    """从 DXF 取出一条计算边界多边形。"""
+def import_holes_from_dxf(filepath: str,
+                          boundary: Optional[List[Tuple[float, float]]] = None) -> List[List[Tuple[float, float]]]:
+    """把 DXF 中的闭合多段线作为挖空区读入；给定计算边界时只取完整位于边界以内的。"""
+    import numpy as np
+    from core.geometry import normalize_ring, ring_inside_ring
+
+    outer = normalize_ring(boundary) if boundary and len(boundary) >= 3 else None
+    holes: List[List[Tuple[float, float]]] = []
+    for item in parse_dxf_polylines(filepath):
+        closed = item.closed or (len(item.points) >= 2 and item.points[0] == item.points[-1])
+        ring = _ring_points(item.points)
+        if not closed or len(ring) < 3:
+            continue
+        if outer is not None and not ring_inside_ring(np.asarray(ring, dtype=float), outer):
+            continue
+        holes.append(ring)
+    if not holes:
+        raise ValueError("DXF 中没有位于计算边界以内的闭合多段线")
+    return holes
+
+
+def read_boundary_from_dxf(filepath: str) -> Tuple[List[Tuple[float, float]], int]:
+    """从 DXF 取出一条计算边界多边形，同时返回其中折线化了几段圆弧。"""
     chosen = select_boundary_polyline(parse_dxf_polylines(filepath))
     ring = _ring_points(chosen.points)
     if len(ring) < 3:
         raise ValueError("DXF 边界顶点不足 3 个")
-    return ring
+    return ring, chosen.arc_count
+
+
+def import_boundary_from_dxf(filepath: str) -> List[Tuple[float, float]]:
+    """从 DXF 取出一条计算边界多边形。"""
+    return read_boundary_from_dxf(filepath)[0]
+
+
+def _parse_dxf_lines(text: str) -> List[DxfPolyline]:
+    """LINE 实体，每条作为两点的多段线（底图显示、吸附用）。"""
+    lines: List[DxfPolyline] = []
+    current: Optional[dict] = None
+
+    def finish():
+        if current is not None and all(key in current for key in (10, 20, 11, 21)):
+            lines.append(DxfPolyline(layer=current.get(8, "0"), closed=False,
+                                     points=[(current[10], current[20]), (current[11], current[21])]))
+
+    for code, value in _iter_group_pairs(text):
+        if code == 0:
+            finish()
+            current = {} if value.upper() == "LINE" else None
+        elif current is not None:
+            if code == 8:
+                current[8] = value
+            elif code in (10, 20, 11, 21):
+                number = _as_float(value)
+                if number is not None:
+                    current[code] = number
+    finish()
+    return lines
+
+
+def read_dxf_backdrop(filepath: str) -> List[DxfPolyline]:
+    """读取 DXF 里的多段线（圆弧已折线化）和直线，作为边界页的底图。块（INSERT）里的图形不读。"""
+    items = [item for item in parse_dxf_polylines(filepath) if len(item.points) >= 2]
+    # 保持底图原有顺序：先多段线，再直线；LINE 已在统一解析器中读取，不能重复追加。
+    return [item for item in items if item.kind != "LINE"] + [item for item in items if item.kind == "LINE"]
+
+
+def list_dxf_layers(filepath: str) -> Dict[str, int]:
+    """DXF 中各图层的线条数（多段线与直线），供选择特征线图层。"""
+    counts = Counter(item.layer or "0" for item in parse_dxf_polylines(filepath) if len(item.points) >= 2)
+    return dict(sorted(counts.items()))
+
+
+def import_breaklines_from_dxf(filepath: str, layers: Optional[Sequence[str]] = None) -> List[Breakline]:
+    """把 DXF 中的多段线、直线作为特征线读入；layers 为空时读取全部图层。
+
+    3D 多段线、带高程的直线按顶点高程读入；2D 线（标高为 0 或缺省）不带高程，顶点须落在测点上。
+    闭合多段线首尾相连。
+    """
+    wanted = None if layers is None else {str(layer) for layer in layers}
+    lines: List[Breakline] = []
+    for item in parse_dxf_polylines(filepath):
+        layer = item.layer or "0"
+        if wanted is not None and layer not in wanted:
+            continue
+        vertices = [(x, y, z) for (x, y), z in zip(item.points, item.vertex_elevations())]
+        if item.closed and len(vertices) >= 3 and vertices[0][:2] != vertices[-1][:2]:
+            vertices.append(vertices[0])
+        if len(vertices) < 2:
+            continue
+        lines.append(Breakline(vertices=vertices, name=f"{layer}-{len(lines) + 1}"))
+    if not lines:
+        raise ValueError("DXF 所选图层中没有多段线或直线")
+    return lines

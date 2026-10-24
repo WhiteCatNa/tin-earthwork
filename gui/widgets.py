@@ -33,8 +33,9 @@ class WrappingButtonRow(ttk.Frame):
         self._layout = None
         self.bind("<Configure>", self._relayout)
 
-    def add(self, text: str, command, **kwargs) -> ttk.Button:
-        button = ttk.Button(self, text=text, command=command, **kwargs)
+    def add(self, text: str, command, widget=ttk.Button, **kwargs) -> ttk.Widget:
+        """加一个按钮；widget 可换成 ttk.Checkbutton 等同样带 text/command 的控件。"""
+        button = widget(self, text=text, command=command, **kwargs)
         self.buttons.append(button)
         self._layout = None
         self._relayout()
