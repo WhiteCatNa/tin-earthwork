@@ -174,11 +174,13 @@ class BoundaryFrame(ttk.Frame):
             ttk.Radiobutton(target_row, text=text, value=value, variable=self.target_var,
                             command=self._on_target_change).pack(side=tk.LEFT, padx=(0, 8))
 
-        hole_row = ttk.Frame(mode_frame)
+        hole_frame = ttk.LabelFrame(ctrl_frame, text="挖空区（不计方量）", padding=6)
+        hole_frame.grid(row=4, column=0, sticky="ew", pady=(4, 0))
+        hole_row = ttk.Frame(hole_frame)
         hole_row.pack(fill=tk.X, pady=(4, 0))
         self.hole_status_var = tk.StringVar(value="挖空区：无")
         ttk.Label(hole_row, textvariable=self.hole_status_var, style="Muted.TLabel").pack(side=tk.LEFT)
-        hole_buttons = ttk.Frame(mode_frame)
+        hole_buttons = ttk.Frame(hole_frame)
         hole_buttons.pack(fill=tk.X, pady=(2, 0))
         hole_buttons.grid_columnconfigure((0, 1, 2), weight=1, uniform="hole_buttons")
         for column, (text, command) in enumerate((("完成挖空区", self._finish_hole),
@@ -186,6 +188,13 @@ class BoundaryFrame(ttk.Frame):
                                                    ("清空挖空区", self._clear_holes))):
             ttk.Button(hole_buttons, text=text, command=command).grid(
                 row=0, column=column, sticky="ew", padx=(0 if column == 0 else 2, 0 if column == 2 else 2))
+
+        hole_edit = ttk.Frame(hole_frame)
+        hole_edit.pack(fill=tk.X, pady=(4, 0))
+        for text, command in (("撤销顶点", self._undo_last_point), ("重做顶点", self._redo_last),
+                              ("删除选中顶点", self._delete_selected), ("清空当前轮廓", self._clear_boundary)):
+            ttk.Button(hole_edit, text=text, command=command, width=0).pack(
+                side=tk.LEFT, fill=tk.X, expand=True, padx=2)
 
         # 边界点列表
         self.list_title_var = tk.StringVar(value="边界点坐标:")
@@ -255,8 +264,10 @@ class BoundaryFrame(ttk.Frame):
                         ("理顺顺序", self._untangle), ("删除选中点", self._delete_selected),
                         ("清空边界", self._clear_boundary)])
 
-        ttk.Separator(btn_frame, orient='horizontal').pack(side=tk.TOP, fill=tk.X, pady=4)
-        ttk.Button(btn_frame, text="确认边界", command=self._confirm_boundary,
+        confirm_frame = ttk.Frame(ctrl_frame)
+        confirm_frame.grid(row=5, column=0, sticky="ew", pady=4)
+        ttk.Separator(confirm_frame, orient='horizontal').pack(side=tk.TOP, fill=tk.X, pady=4)
+        ttk.Button(confirm_frame, text="确认边界", command=self._confirm_boundary,
                   style='Accent.TButton').pack(side=tk.TOP, fill=tk.X, pady=2)
 
         # 特征线：沟边、坎边、坡顶、坡脚等，构网时三角形不跨越
@@ -273,6 +284,10 @@ class BoundaryFrame(ttk.Frame):
             ttk.Button(line_frame, text=text, command=command).grid(
                 row=1 + index // 2, column=index % 2, sticky="ew", padx=(0 if index % 2 == 0 else 2, 0), pady=2)
 
+        self.boundary_tools_frame = btn_frame
+        self.breakline_tools_frame = line_frame
+        self.hole_tools_frame = hole_frame
+        self._sync_target_tools()
         self._update_boundary_status()
 
         # 信息提示
@@ -613,7 +628,19 @@ class BoundaryFrame(ttk.Frame):
     def _target(self) -> List[XY]:
         return self.drawing_hole if self.target_var.get() == TARGET_HOLE else self.boundary
 
+    def _sync_target_tools(self):
+        """只显示当前绘制对象的工具，把空间留给坐标列表；确认按钮始终可见。"""
+        target = self.target_var.get()
+        for value, frame in ((TARGET_BOUNDARY, self.boundary_tools_frame),
+                             (TARGET_BREAKLINE, self.breakline_tools_frame),
+                             (TARGET_HOLE, self.hole_tools_frame)):
+            if target == value:
+                frame.grid()
+            else:
+                frame.grid_remove()
+
     def _on_target_change(self):
+        self._sync_target_tools()
         self._press = None
         self._selected = None
         self.list_title_var.set("挖空区顶点坐标:" if self.target_var.get() == TARGET_HOLE else "边界点坐标:")

@@ -47,3 +47,7 @@ def test_new_topology_prevents_legacy_reader_silently_ignoring_it(tmp_path):
     assert [(p.id, p.z) for p in loaded["design_points"]] == [("D", 8)]
     save_project(path, points, [])
     assert json.loads(path.read_text())["format_version"] == 2
+    save_project(path, points, [], soil_factors={"loose": 1.0, "compact": 1.0},
+                 layers={"enabled": False, "mode": "elevation", "values": []},
+                 slope_design={"platforms": [], "spacing": None}, uncertainty={"enabled": False})
+    assert json.loads(path.read_text())["format_version"] == 2

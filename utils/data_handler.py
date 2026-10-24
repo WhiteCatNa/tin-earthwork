@@ -1324,8 +1324,10 @@ def save_project(
     if design_mode not in DESIGN_MODES:
         raise ValueError(f"未知的设计面类型: {design_mode}")
     requires_v3 = bool(
-        breaklines or compare_breaklines or holes or max_edge_length or soil_factors
-        or design_mode == "design_tin" or sections_enabled or layers or slope_design
+        breaklines or compare_breaklines or holes or max_edge_length
+        or any(float((soil_factors or {}).get(key, 1.0)) != 1.0 for key in ("loose", "compact"))
+        or design_mode == "design_tin" or sections_enabled or (layers or {}).get("enabled")
+        or (slope_design or {}).get("platforms")
         or (uncertainty or {}).get("enabled")
     )
     payload = {

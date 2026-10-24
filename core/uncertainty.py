@@ -30,7 +30,8 @@ from typing import Any, Callable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from core.calculator import CalculationResult, SurveyPoint, TINEarthworkCalculator
+from core.breaklines import Breakline
+from core.calculator import DUPLICATE_TOLERANCE, CalculationResult, SurveyPoint, TINEarthworkCalculator
 from core.geometry import points_in_ring
 
 XY = Tuple[float, float]
@@ -123,6 +124,20 @@ def _hull_mask(points: Sequence[SurveyPoint]) -> np.ndarray:
     except QhullError:
         mask[:] = True
     return mask
+
+
+def _sampling_mask(points: Sequence[SurveyPoint], lines: Sequence[Breakline]) -> np.ndarray:
+    """抽稀时固定凸包及不带高程的特征线顶点，保留约束构网所需的测点。"""
+    fixed = _hull_mask(points)
+    vertices = [(x, y) for line in lines for x, y, z in line.vertices if z is None]
+    if not points or not vertices:
+        return fixed
+    from scipy.spatial import cKDTree
+
+    tree = cKDTree(np.array([(p.x, p.y) for p in points], dtype=float))
+    distances, indices = tree.query(np.asarray(vertices, dtype=float))
+    fixed[indices[distances <= DUPLICATE_TOLERANCE]] = True
+    return fixed
 
 
 def _subsample(points: Sequence[SurveyPoint], hull: np.ndarray, fraction: float,
@@ -445,7 +460,8 @@ def evaluate_uncertainty(calculator: TINEarthworkCalculator, result: Calculation
 
     period = result.is_compare and not result.is_design_tin
     surveys = [list(calculator.points)] + ([list(calculator.compare_points)] if period else [])
-    hulls = [_hull_mask(points) for points in surveys]
+    lines = [calculator.breaklines] + ([calculator.compare_breaklines] if period else [])
+    hulls = [_sampling_mask(points, constraints) for points, constraints in zip(surveys, lines)]
     interior = min(int((~hull).sum()) for hull in hulls)
 
     bias = np.zeros(3)

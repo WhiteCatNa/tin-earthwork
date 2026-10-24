@@ -447,9 +447,12 @@ def test_undo_and_delete_by_keyboard(main_window, frame):
     _make_window_receive_events(main_window, frame)
     frame.set_boundary([(0.0, 0.0), (100.0, 0.0), (100.0, 100.0), (0.0, 100.0)])
     tree = frame.tree_boundary
-    tree.focus_set()
+    # 隐藏/屏幕外的 macOS 窗口不会因 focus_set() 获得键盘焦点；
+    # 合成按键前显式获取焦点，验证下面的删除/撤销确实经过事件绑定。
+    tree.focus_force()
     tree.selection_set("1")
     main_window.update()
+    assert tree.focus_get() is tree
     tree.event_generate("<Delete>")
     main_window.update()
     assert frame.boundary == [(0.0, 0.0), (100.0, 100.0), (0.0, 100.0)]
