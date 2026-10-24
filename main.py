@@ -74,57 +74,108 @@ class MainApplication(tk.Tk):
         
     def _create_widgets(self):
         # 页头一行：左侧名称与单位，右侧工程操作（原先三行，小屏上占掉太多高度）
-        header = tk.Frame(self, bg=COLORS["accent"])
+        header = tk.Frame(self, bg=COLORS["header_bg"])
         header.pack(fill=tk.X)
-        row = tk.Frame(header, bg=COLORS["accent"])
-        row.pack(fill=tk.X, padx=16, pady=8)
-        titles = tk.Frame(row, bg=COLORS["accent"])
+        row = tk.Frame(header, bg=COLORS["header_bg"])
+        row.pack(fill=tk.X, padx=16, pady=10)
+        logo = tk.Canvas(row, width=34, height=34, bg=COLORS["header_bg"], highlightthickness=0)
+        logo.pack(side=tk.LEFT, padx=(0, 10))
+        # 图标：一小片三角网
+        logo.create_rectangle(1, 1, 33, 33, fill=COLORS["accent"], outline="")
+        mesh = ((7, 25), (14, 9), (27, 12), (26, 26), (17, 19))
+        for a, b in ((0, 1), (1, 2), (2, 3), (3, 0), (4, 0), (4, 1), (4, 2), (4, 3)):
+            logo.create_line(*mesh[a], *mesh[b], fill=COLORS["on_accent"], width=1.5)
+        titles = tk.Frame(row, bg=COLORS["header_bg"])
         titles.pack(side=tk.LEFT)
         tk.Label(
             titles,
             text=APP_NAME,
-            bg=COLORS["accent"],
-            fg=COLORS["white"],
-            font=font(15, "bold"),
+            bg=COLORS["header_bg"],
+            fg=COLORS["header_fg"],
+            font=font(14, "bold"),
             anchor=tk.W,
         ).pack(fill=tk.X)
         tk.Label(
             titles,
             text=COMPANY,
-            bg=COLORS["accent"],
+            bg=COLORS["header_bg"],
             fg=COLORS["header_sub"],
             font=font(9),
             anchor=tk.W,
         ).pack(fill=tk.X)
-        actions = tk.Frame(row, bg=COLORS["accent"])
+        actions = tk.Frame(row, bg=COLORS["header_bg"])
         actions.pack(side=tk.RIGHT)
-        ttk.Button(actions, text="打开工程", command=self._open_project).pack(side=tk.LEFT)
-        ttk.Button(actions, text="保存工程", command=self._save_project).pack(side=tk.LEFT, padx=8)
-        self.recent_btn = ttk.Menubutton(actions, text="最近工程")
+        tk.Label(
+            actions, text="项目名称", bg=COLORS["header_bg"], fg=COLORS["header_sub"], font=font(10)
+        ).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Entry(actions, textvariable=self.project_name_var, width=22, style="Header.TEntry").pack(side=tk.LEFT, padx=(0, 16))
+        ttk.Button(actions, text="打开工程", style="Header.TButton", command=self._open_project).pack(side=tk.LEFT)
+        ttk.Button(actions, text="保存工程", style="Header.TButton", command=self._save_project).pack(
+            side=tk.LEFT, padx=6)
+        self.recent_btn = ttk.Menubutton(actions, text="最近工程", style="Header.TMenubutton")
         self.recent_menu = tk.Menu(self.recent_btn, tearoff=0)
         self.recent_btn["menu"] = self.recent_menu
         self.recent_btn.pack(side=tk.LEFT)
         self._rebuild_recent_menu()
-        tk.Label(
-            actions, text="项目名称", bg=COLORS["accent"], fg=COLORS["white"], font=font(10)
-        ).pack(side=tk.LEFT, padx=(20, 6))
-        ttk.Entry(actions, textvariable=self.project_name_var, width=24).pack(side=tk.LEFT)
+        tk.Frame(self, bg=COLORS["rule"], height=1).pack(fill=tk.X)
 
-        # 底部状态栏：左侧操作反馈，右侧当前步骤和项目。
-        # 先于主内容区 pack，窗口偏矮时由主内容区收缩，状态栏不被挤掉
-        self.status_var = tk.StringVar(value=f"就绪 - 请导入测量数据文件（{SHORTCUT_LABEL}+O 打开工程）")
-        self.step_var = tk.StringVar(value="步骤 1/3：数据导入")
+        # 步骤导航：同时也是切换页面的入口（主 Notebook 不显示页签）
+        stepper = tk.Frame(self, bg=COLORS["nav_bg"])
+        stepper.pack(fill=tk.X)
+        inner = tk.Frame(stepper, bg=COLORS["nav_bg"])
+        inner.pack(fill=tk.X, padx=12, pady=6)
+
+        self.progress_steps = []
+        self._step_reached = 0
+        self._step_names = step_names = ["数据导入与检查", "计算边界设置", "计算设置与结果"]
+        for i, name in enumerate(step_names):
+            lbl = tk.Label(
+                inner,
+                text=name,
+                bg=COLORS["nav_bg"],
+                fg=COLORS["dim"],
+                font=font(11),
+                padx=12,
+                pady=5,
+                cursor="hand2",
+            )
+            lbl.pack(side=tk.LEFT)
+            lbl.bind("<Button-1>", lambda _e, index=i: self._goto_step(index))
+            self.progress_steps.append(lbl)
+            if i < len(step_names) - 1:
+                tk.Label(
+                    inner,
+                    text="›",
+                    bg=COLORS["nav_bg"],
+                    fg=COLORS["disabled"],
+                    font=font(12),
+                ).pack(side=tk.LEFT, padx=2)
+
         self.project_label_var = tk.StringVar(value="项目: 未加载")
         self.project_name_var.trace_add("write", lambda *_: self._on_project_name_changed())
+        tk.Label(
+            inner,
+            textvariable=self.project_label_var,
+            bg=COLORS["nav_bg"],
+            fg=COLORS["dim"],
+            font=font(9),
+        ).pack(side=tk.RIGHT)
+        self.step_var = tk.StringVar(value="步骤 1/3: 数据导入")
+        tk.Label(
+            inner,
+            textvariable=self.step_var,
+            bg=COLORS["nav_bg"],
+            fg=COLORS["accent"],
+            font=font(10),
+        ).pack(side=tk.RIGHT, padx=16)
+
+        tk.Frame(self, bg=COLORS["rule"], height=1).pack(fill=tk.X)
+
+        # 底部状态栏：先于主内容区 pack，窗口偏矮时由主内容区收缩，状态栏不被挤掉
+        self.status_var = tk.StringVar(value=f"就绪 - 请导入测量数据文件（{SHORTCUT_LABEL}+O 打开工程）")
         status = self.status_bar = tk.Frame(self, bg=COLORS["status_bg"])
         status.pack(fill=tk.X, side=tk.BOTTOM)
         tk.Frame(status, bg=COLORS["rule"], height=1).pack(fill=tk.X)
-        tk.Label(
-            status, textvariable=self.project_label_var, bg=COLORS["status_bg"], fg=COLORS["dim"], font=font(10)
-        ).pack(side=tk.RIGHT, padx=16)
-        tk.Label(
-            status, textvariable=self.step_var, bg=COLORS["status_bg"], fg=COLORS["accent"], font=font(10, "bold")
-        ).pack(side=tk.RIGHT)
         # width=1：反馈文字再长也不会把状态栏（进而整个窗口的布局）撑宽，放不下时截断
         self.status_label = tk.Label(
             status,
@@ -140,8 +191,9 @@ class MainApplication(tk.Tk):
         self.status_label.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
         # 主内容区 - 使用 Notebook 作为向导式界面
-        self.notebook = ttk.Notebook(self)
-        self.notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        self.notebook = ttk.Notebook(self, style="Main.TNotebook")
+        self.notebook.pack(fill=tk.BOTH, expand=True, padx=16, pady=(14, 12))
+        self.notebook.bind("<<NotebookTabChanged>>", lambda _e: self._refresh_steps())
         
         # 页面 1: 数据导入
         self.import_frame = DataImportFrame(
@@ -160,6 +212,7 @@ class MainApplication(tk.Tk):
         
         # 页面 3: 计算结果
         self.calc_frame = None  # 延迟创建
+        self._refresh_steps()
 
         self._bind_shortcuts()
         self._update_title()
@@ -227,11 +280,41 @@ class MainApplication(tk.Tk):
         if self.points:
             self.project_label_var.set(f"项目: {self.project_name}")
 
+    def _update_step_indicator(self, current_step: int):
+        """记下已走到的步骤并刷新步骤导航"""
+        self._step_reached = current_step
+        self._refresh_steps()
+
+    def _goto_step(self, index: int):
+        tabs = self.notebook.tabs()
+        if index < len(tabs) and self.notebook.tab(index, "state") != "disabled":
+            self.notebook.select(index)
+            self._refresh_steps()
+
+    def _refresh_steps(self):
+        try:
+            selected = self.notebook.index("current")
+        except (AttributeError, tk.TclError):
+            selected = 0
+        tab_count = len(self.notebook.tabs()) if hasattr(self, "notebook") else 1
+        for i, lbl in enumerate(self.progress_steps):
+            enabled = i < tab_count and (i == 0 or self.notebook.tab(i, "state") != "disabled")
+            done = i < self._step_reached
+            text = ("✓ " if done else f"{'①②③'[i]} ") + self._step_names[i]
+            if i == selected and enabled:
+                lbl.config(text=text, bg=COLORS["accent_soft"], fg=COLORS["accent"], font=font(11, "bold"))
+            elif enabled:
+                lbl.config(text=text, bg=COLORS["nav_bg"], fg=COLORS["fill"] if done else COLORS["ink"], font=font(11))
+            else:
+                lbl.config(text=text, bg=COLORS["nav_bg"], fg=COLORS["disabled"], font=font(11))
+            lbl.config(cursor="hand2" if enabled else "")
+
     def _on_points_loaded(self, points: list[SurveyPoint]):
         """数据导入完成回调"""
         self.points = points
         self.notify(f"已导入 {len(points)} 个测量点 - 请设置计算边界")
         self.step_var.set("步骤 2/3：边界设置")
+        self._update_step_indicator(1)
 
         self.boundary_frame.set_points(points)
         self._update_project_label()
