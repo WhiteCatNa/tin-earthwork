@@ -40,6 +40,7 @@ PLOT_COLORS = {
     "zero": COLORS["zero"],
     "boundary": COLORS["accent"],
     "tin": "#B4BFC6",
+    "breakline": "#6B3FA0",
     "points": COLORS["ink"],
     "selected": COLORS["cut"],
     "text_bg": COLORS["sheet"],

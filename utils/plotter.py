@@ -14,6 +14,7 @@ import numpy as np
 from typing import List, Tuple, Optional
 from core.calculator import SurveyPoint, Triangle, CalculationResult, extract_zero_contour_segments
 from core.geometry import signed_area
+from core.breaklines import Breakline
 from gui.theme import COLORS, PLOT_COLORS
 
 # 设置中文字体
@@ -90,6 +91,7 @@ class EarthworkPlotter:
         self._artist_contour_lines: list = []
         self._artist_scatter: Optional[object] = None
         self._artist_boundary: Optional[object] = None
+        self._artist_breaklines: Optional[object] = None
         self._highlight_artists: list = []
         self._result_legend = None   # 结果图的图例（图级，放在坐标轴下方）
         self._legend_handles: list = []
@@ -317,6 +319,7 @@ class EarthworkPlotter:
         self._artist_contour_lines = []
         self._artist_scatter = None
         self._artist_boundary = None
+        self._artist_breaklines = None
         self._highlight_artists = []
         self._pick_xy = None
         self._pick_tris = []
@@ -332,7 +335,8 @@ class EarthworkPlotter:
                     show_contour: bool = True,
                     show_points: bool = True,
                     show_boundary: bool = True,
-                    show_legend: bool = True):
+                    show_legend: bool = True,
+                    show_breaklines: bool = True):
         """绘制完整计算结果。
 
         result 未变时只切换 artist 可见性（毫秒级），跳过全量重建。
@@ -360,6 +364,8 @@ class EarthworkPlotter:
                     self._colorbar.ax.set_visible(show_points)
             if self._artist_boundary is not None:
                 self._artist_boundary.set_visible(show_boundary)
+            if self._artist_breaklines is not None:
+                self._artist_breaklines.set_visible(show_breaklines)
             # 图例同步
             if self._result_legend is not None:
                 self._result_legend.set_visible(show_legend)
@@ -382,6 +388,7 @@ class EarthworkPlotter:
         self._artist_contour_lines = [artists["zero"]] if artists["zero"] is not None else []
         self._artist_scatter = artists["scatter"]
         self._artist_boundary = artists["boundary"]
+        self._artist_breaklines = artists["breaklines"]
         self._pick_tris = artists["pick_tris"]
         self._pick_xy = artists["pick_xy"]
 
@@ -396,6 +403,8 @@ class EarthworkPlotter:
             self._colorbar.ax.set_visible(show_points)
         if self._artist_boundary is not None:
             self._artist_boundary.set_visible(show_boundary)
+        if self._artist_breaklines is not None:
+            self._artist_breaklines.set_visible(show_breaklines)
 
         if self.selected_triangle is not None and self.selected_triangle in self._pick_tris:
             self.highlight_triangle(self.selected_triangle)
@@ -490,13 +499,17 @@ class EarthworkPlotter:
                            backdrop=None,
                            crossings=(),
                            duplicates=(),
-                           hull=None):
+                           hull=None,
+                           breaklines: Optional[List[Breakline]] = None,
+                           drawing: Optional[List[Tuple[float, float]]] = None,
+                           title: str = '边界编辑模式 - 左键添加点，右键结束'):
         """边界编辑模式绘制。
 
         view：(xlim, ylim) 时保持这个视野，否则显示测点和边界的全图。
         backdrop：CAD 底图的线（每条是点列），画在最底层，不参与“全图”的范围。
         crossings / duplicates：交叉的边、重合的顶点，标红提示。
         hull：测点覆盖范围（凸包）；给出时画虚线，并把边界伸出覆盖范围的部分打斜线。
+        breaklines / drawing：已有特征线及当前绘制的特征线顶点。
         """
         self._remove_colorbar()
         self.ax.clear()
@@ -567,12 +580,21 @@ class EarthworkPlotter:
             self.update_boundary_line(boundary, selected, redraw=False)
             self._draw_boundary_problems(boundary, crossings, duplicates, hull)
 
+        lines = breakline_segments(breaklines or [])
+        if lines:
+            self.ax.add_collection(LineCollection(lines, colors=self.colors['breakline'], linewidths=1.8, zorder=4))
+            self.ax.plot([], [], color=self.colors['breakline'], linewidth=1.8, label='特征线')
+        if drawing:
+            self.ax.plot([p[0] for p in drawing], [p[1] for p in drawing], color=self.colors['breakline'],
+                         marker='o', markersize=5, linewidth=1.8, linestyle='--', zorder=6, label='正在绘制的特征线')
+
         # 当前正在添加的点由可复用 artist 绘制，避免鼠标移动时不断创建新对象。
 
         # datalim：坐标轴铺满绘图区，比例靠调整显示范围保持，缩放、平移时不留白边
         self.ax.set_aspect('equal', adjustable='datalim')
         self.ax.set_xlabel('X 坐标 (m)')
         self.ax.set_ylabel('Y 坐标 (m)')
+        self.ax.set_title(title)
         handles, labels = self.ax.get_legend_handles_labels()
         if labels:
             self.ax.legend()
@@ -755,6 +777,12 @@ class EarthworkPlotter:
 RASTERIZE_TRIANGLES = 5000
 
 
+def breakline_segments(lines: List[Breakline]) -> List[np.ndarray]:
+    """特征线的平面折线，供 LineCollection 绘制。"""
+    return [np.array([(x, y) for x, y, _ in line.vertices], dtype=float)
+            for line in lines if len(line.vertices) >= 2]
+
+
 def natural_label(result: CalculationResult) -> str:
     """测点散点的含义：与设计面比较时是实测高程，两期对比时是前期高程。"""
     return "前期高程" if result.is_compare else "实测高程"
@@ -790,7 +818,7 @@ def draw_result(ax, result: CalculationResult, points: List[SurveyPoint],
     # 导出 PDF/SVG 时，大量三角形按栅格嵌入，文字、边界和零线仍为矢量
     rasterize = fine and len(mesh_xy) > RASTERIZE_TRIANGLES
     artists = {"cut": None, "fill": None, "tin": None, "zero": None, "scatter": None,
-               "boundary": None, "legend": [], "pick_tris": tris, "pick_xy": mesh_xy}
+               "boundary": None, "breaklines": None, "legend": [], "pick_tris": tris, "pick_xy": mesh_xy}
 
     clip_patch = None
     if boundary:
@@ -828,6 +856,13 @@ def draw_result(ax, result: CalculationResult, points: List[SurveyPoint],
         artists["scatter"] = ax.scatter(xs, ys, c=zs, cmap='terrain', s=15 if fine else 20,
                                         edgecolors='white', linewidth=0.3 if fine else 0.5, zorder=5,
                                         rasterized=rasterize)
+
+    lines = breakline_segments(list(result.breaklines) + list(result.compare_breaklines))
+    if lines:
+        artists["breaklines"] = LineCollection(lines, colors=colors['breakline'], linewidths=1.2 if fine else 1.6,
+                                               zorder=7)
+        ax.add_collection(artists["breaklines"])
+        artists["legend"].append(Line2D([], [], color=colors['breakline'], linewidth=1.6, label='特征线'))
 
     if boundary:
         bx = [p[0] for p in boundary] + [boundary[0][0]]

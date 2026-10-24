@@ -27,7 +27,7 @@ SHORTCUT_LABEL = "⌘" if sys.platform == "darwin" else "Ctrl"
 # 工程文件中属于计算页的设置，与 CalculationFrame.apply_design_settings 的参数一一对应
 DESIGN_SETTING_KEYS = (
     "design_elevation", "use_partition", "partition", "design_mode", "design_plane",
-    "compare_points", "compare_source", "grid_enabled", "grid_spacing",
+    "compare_points", "compare_source", "grid_enabled", "grid_spacing", "compare_breaklines",
 )
 DEFAULT_WINDOW_SIZE = (1400, 900)
 MIN_WINDOW_SIZE = (1200, 800)
@@ -145,7 +145,10 @@ class MainApplication(tk.Tk):
         self.notebook.add(self.import_frame, text="  ① 数据导入与检查  ")
         
         # 页面 2: 边界设置
-        self.boundary_frame = BoundaryFrame(self.notebook, [], self._on_boundary_set, notify=self.notify)
+        self.boundary_frame = BoundaryFrame(
+            self.notebook, [], self._on_boundary_set, notify=self.notify,
+            on_breaklines_changed=self._on_breaklines_changed,
+        )
         self.notebook.add(self.boundary_frame, text="  ② 计算边界设置  ")
         self.notebook.tab(1, state='disabled')  # 初始禁用
         
@@ -242,11 +245,13 @@ class MainApplication(tk.Tk):
         transform = None
         if kind == "offset" and (dx or dy):
             transform = lambda x, y: (x + dx, y + dy)
-        elif kind == "swap" and (self.boundary or self.boundary_frame.boundary) and messagebox.askyesno(
+        elif kind == "swap" and (
+            self.boundary or self.boundary_frame.boundary or self.boundary_frame.breaklines
+        ) and messagebox.askyesno(
             "X/Y 互换",
-            "已设置的计算边界是否也交换 X/Y？\n\n"
-            "边界是在本程序里对着测点画的，选“是”；\n"
-            "边界是从 CAD 图纸导入的（已是图纸方向），选“否”。",
+            "已设置的计算边界和特征线是否也交换 X/Y？\n\n"
+            "是在本程序里对着测点画的，选“是”；\n"
+            "是从 CAD 图纸导入的（已是图纸方向），选“否”。",
         ):
             transform = lambda x, y: (y, x)
         if transform is not None:
@@ -260,6 +265,11 @@ class MainApplication(tk.Tk):
                 pass
         self.notify(f"测点已更新，共 {len(self.points)} 个")
         self.mark_dirty()
+
+    def _on_breaklines_changed(self, *_args):
+        self.mark_dirty()
+        if self.calc_frame is not None:
+            self.calc_frame.update_inputs(self.points, self.boundary)
 
     def _on_boundary_set(self, boundary: list[tuple[float, float]]):
         """边界设置完成回调"""
@@ -275,6 +285,7 @@ class MainApplication(tk.Tk):
                 project_name_getter=lambda: self.project_name,
                 notify=self.notify,
                 on_settings_changed=self.mark_dirty,
+                breaklines_getter=lambda: list(self.boundary_frame.breaklines),
             )
             self.notebook.add(self.calc_frame, text="  ③ 计算设置与结果  ")
         else:
@@ -308,6 +319,7 @@ class MainApplication(tk.Tk):
         return {
             "points": self.points,
             "boundary": list(self.boundary) or list(self.boundary_frame.boundary),
+            "breaklines": list(self.boundary_frame.breaklines),
             "project_name": self.project_name,
             **self._collect_design_settings(),
         }
@@ -330,6 +342,7 @@ class MainApplication(tk.Tk):
         self.project_name = data.get("project_name") or DEFAULT_PROJECT_NAME
         self.boundary = []
         self.boundary_frame.set_boundary([])
+        self.boundary_frame.set_breaklines(data.get("breaklines") or [])
         self.import_frame.load_points(points)
         self._on_points_loaded(points)
         settings = {key: data[key] for key in DESIGN_SETTING_KEYS if key in data}
