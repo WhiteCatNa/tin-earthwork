@@ -10,124 +10,47 @@ Pillow 现画成图片元素（ttk "image" element），不依赖第三方主题
 """
 from __future__ import annotations
 
-import os
 import platform
 import tkinter as tk
 from tkinter import ttk
-from typing import Dict, Tuple
+from typing import Tuple
 
-# 每套主题的颜色。键名是各窗口与绘图共用的语义名。
-PALETTES: Dict[str, Dict[str, str]] = {
-    # 清爽白：白色页头，蓝色强调
-    "light": {
-        "bg": "#F2F4F7",
-        "surface": "#FFFFFF",
-        "sheet": "#FFFFFF",
-        "ink": "#1D2939",
-        "dim": "#667085",
-        "rule": "#E4E7EC",
-        "border": "#D0D5DD",
-        "accent": "#2563EB",
-        "accent_hover": "#1D4ED8",
-        "accent_pressed": "#1E40AF",
-        "accent_soft": "#EAF1FF",
-        "on_accent": "#FFFFFF",
-        "cut": "#D9534A",
-        "fill": "#1D9A8A",
-        "zero": "#D49B12",
-        "tab": "#F7F8FA",
-        "control": "#FFFFFF",
-        "control_hover": "#F4F6F9",
-        "control_pressed": "#E9EDF2",
-        "field": "#FFFFFF",
-        "select_bg": "#DCE7FE",
-        "select_fg": "#1D2939",
-        "header_bg": "#FFFFFF",
-        "header_fg": "#1D2939",
-        "header_sub": "#667085",
-        "header_control": "#F2F4F7",
-        "header_control_hover": "#E4E7EC",
-        "nav_bg": "#FFFFFF",
-        "status_bg": "#FFFFFF",
-        "white": "#FFFFFF",
-        "disabled": "#98A2B3",
-        "tin": "#C3CBD5",
-    },
-    # 工程深蓝：深色页头，延续原来的藏青色
-    "navy": {
-        "bg": "#EEF1F4",
-        "surface": "#FFFFFF",
-        "sheet": "#FFFFFF",
-        "ink": "#172029",
-        "dim": "#5C6B78",
-        "rule": "#DEE3E8",
-        "border": "#C9D1D8",
-        "accent": "#24405E",
-        "accent_hover": "#2F5278",
-        "accent_pressed": "#1A3048",
-        "accent_soft": "#E6EDF5",
-        "on_accent": "#FFFFFF",
-        "cut": "#C6453C",
-        "fill": "#1F8C82",
-        "zero": "#B7830F",
-        "tab": "#F5F7F9",
-        "control": "#FFFFFF",
-        "control_hover": "#F3F5F8",
-        "control_pressed": "#E6EAEF",
-        "field": "#FFFFFF",
-        "select_bg": "#DCE6F1",
-        "select_fg": "#172029",
-        "header_bg": "#1B2B3C",
-        "header_fg": "#FFFFFF",
-        "header_sub": "#A9B7C6",
-        "header_control": "#2A3D51",
-        "header_control_hover": "#365069",
-        "nav_bg": "#FFFFFF",
-        "status_bg": "#FFFFFF",
-        "white": "#FFFFFF",
-        "disabled": "#8C9BA5",
-        "tin": "#B9C3CB",
-    },
-    # 深色
-    "dark": {
-        "bg": "#14171C",
-        "surface": "#1E232A",
-        "sheet": "#1E232A",
-        "ink": "#E4E8EE",
-        "dim": "#98A2B0",
-        "rule": "#2C333C",
-        "border": "#3A434F",
-        "accent": "#4C8DFF",
-        "accent_hover": "#6A9FFF",
-        "accent_pressed": "#3A78E6",
-        "accent_soft": "#22324D",
-        "on_accent": "#FFFFFF",
-        "cut": "#E8675E",
-        "fill": "#2FB3A3",
-        "zero": "#E0B341",
-        "tab": "#252B33",
-        "control": "#2A3039",
-        "control_hover": "#333A44",
-        "control_pressed": "#3C4450",
-        "field": "#161A1F",
-        "select_bg": "#2B4470",
-        "select_fg": "#FFFFFF",
-        "header_bg": "#101317",
-        "header_fg": "#E4E8EE",
-        "header_sub": "#8A94A3",
-        "header_control": "#232931",
-        "header_control_hover": "#2E3540",
-        "nav_bg": "#181C22",
-        "status_bg": "#101317",
-        "white": "#FFFFFF",
-        "disabled": "#5D6673",
-        "tin": "#4A5361",
-    },
+# 颜色语义名，各窗口与绘图共用
+COLORS = {
+    "bg": "#F2F4F7",
+    "surface": "#FFFFFF",
+    "sheet": "#FFFFFF",
+    "ink": "#1D2939",
+    "dim": "#667085",
+    "rule": "#E4E7EC",
+    "border": "#D0D5DD",
+    "accent": "#2563EB",
+    "accent_hover": "#1D4ED8",
+    "accent_pressed": "#1E40AF",
+    "accent_soft": "#EAF1FF",
+    "on_accent": "#FFFFFF",
+    "cut": "#D9534A",
+    "fill": "#1D9A8A",
+    "zero": "#D49B12",
+    "tab": "#F7F8FA",
+    "control": "#FFFFFF",
+    "control_hover": "#F4F6F9",
+    "control_pressed": "#E9EDF2",
+    "field": "#FFFFFF",
+    "select_bg": "#DCE7FE",
+    "select_fg": "#1D2939",
+    "header_bg": "#FFFFFF",
+    "header_fg": "#1D2939",
+    "header_sub": "#667085",
+    "header_control": "#F2F4F7",
+    "header_control_hover": "#E4E7EC",
+    "nav_bg": "#FFFFFF",
+    "status_bg": "#FFFFFF",
+    "white": "#FFFFFF",
+    "disabled": "#98A2B3",
+    "tin": "#C3CBD5",
 }
-DEFAULT_THEME = "light"
 
-# 当前主题的颜色；其它模块 import 的是同一个 dict，apply_theme 原地更新
-COLORS: Dict[str, str] = dict(PALETTES[DEFAULT_THEME])
 PLOT_COLORS = {
     "cut": COLORS["cut"],
     "fill": COLORS["fill"],
@@ -138,21 +61,6 @@ PLOT_COLORS = {
     "selected": COLORS["cut"],
     "text_bg": COLORS["sheet"],
 }
-_PLOT_KEYS = {key: value for key, value in (
-    ("cut", "cut"), ("fill", "fill"), ("zero", "zero"), ("boundary", "accent"),
-    ("tin", "tin"), ("points", "ink"), ("selected", "cut"), ("text_bg", "sheet"),
-)}
-
-
-def _sync_plot_colors() -> None:
-    for key, token in _PLOT_KEYS.items():
-        PLOT_COLORS[key] = COLORS[token]
-
-
-def theme_name() -> str:
-    name = os.environ.get("TIN_EARTHWORK_THEME", DEFAULT_THEME)
-    return name if name in PALETTES else DEFAULT_THEME
-
 
 _FONT_FAMILY = None
 
@@ -424,12 +332,8 @@ def _on_map(event) -> None:
 
 # ---------------------------------------------------------------- 主题
 
-def apply_theme(root: tk.Tk, name: str | None = None) -> ttk.Style:
-    """按 PALETTES[name] 配置 clam 主题。"""
-    name = name or theme_name()
-    COLORS.clear()
-    COLORS.update(PALETTES[name])
-    _sync_plot_colors()
+def apply_theme(root: tk.Tk) -> ttk.Style:
+    """在 clam 主题上配置圆角控件与配色。"""
     _card_styles.clear()
     c = COLORS
 
