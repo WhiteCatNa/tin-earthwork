@@ -177,9 +177,11 @@ def test_boundary_hint_hides_on_short_panel_and_returns_when_tall(app):
         frame.place(x=0, y=0, width=1400, height=450)
         app.update()
         assert not frame.info_label.winfo_manager()
+        assert not frame.list_title_label.winfo_manager()   # 再矮一些，列表标题也让出高度
         frame.place_configure(height=1000)
         app.update()
         assert frame.info_label.winfo_manager() == "grid"
+        assert frame.list_title_label.winfo_manager() == "grid"
     finally:
         frame.shutdown()
         host.destroy()

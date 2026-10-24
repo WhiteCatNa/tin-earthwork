@@ -5,16 +5,21 @@ from tkinter import ttk
 import pytest
 
 import main as app_main
+from conftest import create_main_window
 from gui.theme import COLORS
 from run_full_test import generate_test_data
 
 
 @pytest.fixture
-def app(main_window, monkeypatch):
+def app(tmp_path, monkeypatch):
+    """卡片样式在控件显示（<Map>）时才换上，Windows 上被 withdraw 的窗口不发这个事件，所以窗口要真的显示。"""
+    monkeypatch.setenv("TIN_EARTHWORK_RECENT", str(tmp_path / "recent.json"))
     for name in ("showinfo", "showwarning", "showerror"):
         monkeypatch.setattr(f"tkinter.messagebox.{name}", lambda *a, **k: "ok")
-    main_window.update()
-    return main_window
+    window = create_main_window(hidden=False)
+    window.update()
+    yield window
+    window.destroy()
 
 
 def _background(widget):

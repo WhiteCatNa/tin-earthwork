@@ -198,12 +198,12 @@ class BoundaryFrame(ttk.Frame):
 
         # 边界点列表
         self.list_title_var = tk.StringVar(value="边界点坐标:")
-        ttk.Label(ctrl_frame, textvariable=self.list_title_var, style="Title.TLabel").grid(
-            row=1, column=0, sticky="w", pady=(10, 0))
+        self.list_title_label = ttk.Label(ctrl_frame, textvariable=self.list_title_var, style="Title.TLabel")
+        self.list_title_label.grid(row=1, column=0, sticky="w", pady=(10, 0))
 
         # 边界点列表（双击改坐标）
         list_frame = ttk.Frame(ctrl_frame)
-        list_frame.grid(row=2, column=0, sticky="nsew", pady=(0, 8))
+        list_frame.grid(row=2, column=0, sticky="nsew", pady=(0, 4))
 
         self.tree_boundary = ttk.Treeview(list_frame, columns=('idx', 'id', 'x', 'y'), show='headings', height=8,
                                           selectmode='extended')
@@ -229,7 +229,7 @@ class BoundaryFrame(ttk.Frame):
 
         def row():
             frame = ttk.Frame(btn_frame)
-            frame.pack(side=tk.TOP, fill=tk.X, pady=2)
+            frame.pack(side=tk.TOP, fill=tk.X, pady=1)
             return frame
 
         def buttons(frame, specs):
@@ -266,7 +266,7 @@ class BoundaryFrame(ttk.Frame):
 
         confirm_frame = ttk.Frame(ctrl_frame)
         confirm_frame.grid(row=5, column=0, sticky="ew", pady=4)
-        ttk.Separator(confirm_frame, orient='horizontal').pack(side=tk.TOP, fill=tk.X, pady=4)
+        ttk.Separator(confirm_frame, orient='horizontal').pack(side=tk.TOP, fill=tk.X, pady=2)
         ttk.Button(confirm_frame, text="确认边界", command=self._confirm_boundary,
                   style='Accent.TButton').pack(side=tk.TOP, fill=tk.X, pady=2)
 
@@ -318,20 +318,34 @@ class BoundaryFrame(ttk.Frame):
             ):
                 widget.bind(sequence, lambda _event, handler=handler: handler() or "break")
 
-    # 坐标列表至少保留的高度（表头 + 约 4 行）
-    LIST_MIN_HEIGHT = 140
+    # 坐标列表至少保留的可见行数
+    LIST_MIN_ROWS = 4
 
     def _adapt_hint(self, _event=None):
-        """面板偏矮时隐藏操作说明，把高度留给坐标列表；变高后再显示。"""
-        shown = bool(self.info_label.winfo_manager())
-        info_height = self.info_label.winfo_reqheight() + 10
-        without_info = self.ctrl_frame.winfo_reqheight() - (info_height if shown else 0)
-        needed = without_info - self.list_frame.winfo_reqheight() + self.LIST_MIN_HEIGHT + info_height
-        if self.ctrl_frame.winfo_height() >= needed:
-            if not shown:
-                self.info_label.grid()
-        elif shown:
-            self.info_label.grid_remove()
+        """面板偏矮时先隐藏操作说明、再隐藏列表标题，把高度留给坐标列表；变高后再显示。
+
+        表头和行高随平台字体不同（Windows 上明显更高），所以按坐标列表的实际行高计算。
+        """
+        tree = self.tree_boundary
+        row_height = tree.winfo_reqheight() // max(int(tree.cget("height")), 1)
+        try:
+            row_height = int(ttk.Style(tree).lookup("Treeview", "rowheight")) or row_height
+        except (tk.TclError, ValueError):
+            pass
+        list_min = tree.winfo_reqheight() - (int(tree.cget("height")) - self.LIST_MIN_ROWS) * row_height + 2
+        # 按保留优先级排列：标题比操作说明重要；两者 grid 时都是 pady=(10, 0)
+        optional = [(self.list_title_label, self.list_title_label.winfo_reqheight() + 10),
+                    (self.info_label, self.info_label.winfo_reqheight() + 10)]
+        base = self.ctrl_frame.winfo_reqheight() - self.list_frame.winfo_reqheight()
+        base -= sum(height for widget, height in optional if widget.winfo_manager())
+        budget = self.ctrl_frame.winfo_height() - base - list_min
+        for widget, height in optional:
+            show = budget >= height
+            budget = budget - height if show else -1   # 前一项放不下，后面的也不显示
+            if show and not widget.winfo_manager():
+                widget.grid()
+            elif not show and widget.winfo_manager():
+                widget.grid_remove()
 
     def _toggle_edit_mode(self):
         self._press = None
