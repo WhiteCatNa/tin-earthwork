@@ -6,6 +6,7 @@
 
 注意：Windows 上窗口不能大于屏幕（CI 的屏幕只有 1024x768），所以断言都以窗口的实际尺寸为准。
 """
+import time
 import tkinter as tk
 
 import pytest
@@ -228,10 +229,12 @@ def test_reset_view_button_does_not_cover_result_legend(app, size):
     cf = app.calc_frame
     cf.design_elevation_var.set(50.0)
     cf.start_calculation()
-    for _ in range(3000):
+    # 计算在后台线程里跑：按时间等，不按刷新次数（CI 机器慢时 3000 次刷新可能还没算完）
+    end = time.perf_counter() + 60
+    while cf.result is None and time.perf_counter() < end:
         app.update()
-        if cf.result is not None:
-            break
+        time.sleep(0.01)
+    assert cf.result is not None, "计算 60 秒内没有完成"
     app.update()
     cf.canvas.draw()
 
