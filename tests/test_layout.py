@@ -111,8 +111,13 @@ def test_primary_buttons_visible(app, size):
     app.boundary_frame._create_auto_boundary()
     app.notebook.select(1)
     app.update()
-    for text in ("确认边界", "自动生成数据范围边界", "清空边界"):
+    for text in ("确认边界", "数据范围矩形", "沿测点外轮廓", "按点号连线", "导入边界文件", "粘贴坐标", "导出边界",
+                 "撤销", "重做", "理顺顺序", "删除选中点", "清空边界", "全图", "导入底图", "选底图线"):
         _assert_fully_inside_window(app, _find(app.boundary_frame, text), text)
+    # 坐标列表没有被几行按钮挤没：至少还能看到 4 行（行高随平台字体不同，按实际行高数）
+    tree = app.boundary_frame.tree_boundary
+    _, top, _, row_height = tree.bbox(tree.get_children()[0])
+    assert (tree.winfo_height() - top) // row_height >= 4
     assert _squeezed_controls(app.boundary_frame) == []
 
     app.boundary_frame._confirm_boundary()
