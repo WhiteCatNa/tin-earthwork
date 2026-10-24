@@ -1,6 +1,7 @@
 """
 主窗口和数据导入页面
 """
+import os
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import pandas as pd
@@ -8,6 +9,8 @@ from typing import List, Optional, Callable
 from core.calculator import SurveyPoint
 from gui.theme import COLORS
 from gui.widgets import WrappingButtonRow, fixed_request_box
+from gui.terrain_dialog import ask_dxf_options, ask_las_options
+from utils import terrain_import
 from utils.data_handler import ISSUE_NAMES, DataImporter, DataValidator
 from utils.survey_edit import (
     add_survey_point as append_survey_point,
@@ -46,7 +49,9 @@ class DataImportFrame(ttk.Frame):
         self.column_mapping = {}
         self._edit_entry = None
         self._mapping_editor = None
-        
+        self.ask_dxf_options = ask_dxf_options     # 可替换（测试中直接给出选项）
+        self.ask_las_options = ask_las_options
+
         self._create_widgets()
         
     def _create_widgets(self):
@@ -179,10 +184,12 @@ class DataImportFrame(ttk.Frame):
     def _browse_file(self):
         filepath = filedialog.askopenfilename(
             title="选择测量数据文件",
-            filetypes=[("所有支持格式", "*.xlsx *.xls *.csv *.txt *.dat"), 
+            filetypes=[("所有支持格式", "*.xlsx *.xls *.csv *.txt *.dat *.dxf *.las"),
                       ("Excel文件", "*.xlsx *.xls"),
                       ("CSV文件", "*.csv"),
-                      ("文本文件", "*.txt *.dat")]
+                      ("文本文件", "*.txt *.dat"),
+                      ("地形图（高程点、等高线）", "*.dxf"),
+                      ("LAS 点云", "*.las")]
         )
         if filepath:
             self.file_var.set(filepath)
@@ -192,6 +199,10 @@ class DataImportFrame(ttk.Frame):
         filepath = self.file_var.get()
         if not filepath:
             messagebox.showwarning("提示", "请先选择文件")
+            return
+        suffix = os.path.splitext(filepath)[1].lower()
+        if suffix in (".dxf", ".las"):
+            self._import_terrain(filepath, suffix)
             return
 
         # 禁用按钮，显示进度条
@@ -213,10 +224,56 @@ class DataImportFrame(ttk.Frame):
         import threading
         threading.Thread(target=import_worker, daemon=True).start()
 
-    def _on_import_complete(self, points, issues, raw_df):
+    def _import_terrain(self, filepath: str, suffix: str):
+        """地形图 DXF 或 LAS 点云：先读取、选择选项，再取点。"""
+        try:
+            if suffix == ".dxf":
+                data = terrain_import.scan_dxf_terrain(filepath)
+                if not data:
+                    raise ValueError("DXF 中没有找到高程点、高程注记或带标高的等高线")
+                options = self.ask_dxf_options(self, data)
+            else:
+                data = terrain_import.read_las(filepath)
+                options = self.ask_las_options(self, data)
+        except Exception as error:
+            messagebox.showerror("错误", f"导入失败: {error}")
+            return
+        if options is None:
+            return
+        try:
+            if suffix == ".dxf":
+                built = terrain_import.build_terrain_points(data, *options)
+                points = built.points
+            else:
+                built = None
+                self.config(cursor="watch")
+                self.update_idletasks()
+                points = terrain_import.cloud_points(data, *options)
+        except ValueError as error:
+            messagebox.showerror("错误", f"导入失败: {error}")
+            return
+        finally:
+            self.config(cursor="")
+        issues = DataValidator.validate_points(points)
+        self._on_import_complete(points, issues, terrain_import.points_frame(points), quiet=True)
+        message = f"导入完成，共 {len(points)} 个测量点"
+        if built is None and len(options) > 3 and options[1] == terrain_import.THIN_ADAPTIVE:
+            message += (f"\n\n保精度抽稀：保留点云中 {len(points) / max(data.count, 1):.2%} 的点，"
+                        f"每个原始点到三角网的高差不超过 {options[3]:g} m")
+        if built is not None and built.conflicts:
+            message += f"\n\n有 {built.conflicts} 处平面位置重合但高程不同的点，只保留了先读到的一个（高程点优先）。"
+        if built is not None and built.flat_ratio > 0.05:
+            message += (f"\n\n有 {built.flat_triangles} 个三角形（{built.flat_ratio:.0%}）三个顶点在同一条等高线上，"
+                        "这些“平三角形”多出现在山顶、沟底，会低估起伏。建议同时选用高程点或高程注记。")
+            messagebox.showwarning("导入完成，请注意", message)
+        else:
+            messagebox.showinfo("成功", message)
+
+    def _on_import_complete(self, points, issues, raw_df, quiet: bool = False):
         """导入完成，回主线程更新 UI"""
-        self.progress_bar.stop()
-        self.progress_bar.pack_forget()
+        if self.progress_bar is not None:
+            self.progress_bar.stop()
+            self.progress_bar.pack_forget()
         self.import_btn.config(state='normal', text="导入")
 
         self.points = points
@@ -225,7 +282,8 @@ class DataImportFrame(ttk.Frame):
         self._update_preview()
         self._update_issues(issues)
         self._update_stats()
-        self.notify(f"导入完成，共 {len(self.points)} 个测量点 - 核对检查结果后点“确认无误，进入下一步”")
+        if not quiet:
+            self.notify(f"导入完成，共 {len(self.points)} 个测量点 - 核对检查结果后点“确认无误，进入下一步”")
 
     def _on_import_error(self, error_msg):
         """导入失败，回主线程显示错误"""

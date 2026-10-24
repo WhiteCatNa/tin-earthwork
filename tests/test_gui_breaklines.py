@@ -12,15 +12,11 @@ BOUNDARY = [(0.0, 0.0), (SITE[0], 0.0), (SITE[0], SITE[1]), (0.0, SITE[1])]
 
 
 @pytest.fixture
-def app(tmp_path, monkeypatch):
-    monkeypatch.setenv("TIN_EARTHWORK_RECENT", str(tmp_path / "recent.json"))
+def app(main_window, monkeypatch):
     for name in ("showinfo", "showwarning", "showerror"):
         monkeypatch.setattr(f"tkinter.messagebox.{name}", lambda *a, **k: "ok")
     monkeypatch.setattr("tkinter.messagebox.askokcancel", lambda *a, **k: True)
-    window = app_main.MainApplication()
-    window.withdraw()
-    yield window
-    window.destroy()
+    return main_window
 
 
 def _wait(app, predicate, timeout=30.0):

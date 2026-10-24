@@ -9,7 +9,7 @@ from typing import Dict, List, Tuple, Callable, Optional
 from utils.plotter import EarthworkPlotter
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from core.breaklines import Breakline
-from core.calculator import DUPLICATE_TOLERANCE, SurveyPoint
+from core.calculator import DUPLICATE_TOLERANCE, SurveyPoint, check_holes
 from core.geometry import ring_self_intersects, signed_area
 import numpy as np
 
@@ -17,8 +17,10 @@ XY = Tuple[float, float]
 
 TARGET_BOUNDARY = "boundary"
 TARGET_BREAKLINE = "breakline"
+TARGET_HOLE = "hole"
 BOUNDARY_TITLE = "边界编辑 - 单击加点，点边插入，拖顶点，右键删点"
 BREAKLINE_TITLE = "特征线绘制 - 左键点测点添加顶点，右键结束这一条"
+HOLE_TITLE = "挖空区绘制 - 左键添加顶点，右键回退，完成后点“完成挖空区”"
 
 # 鼠标操作的手感，单位都是屏幕像素（按系统显示缩放折算），与图的缩放无关
 SNAP_PIXELS = 12          # 光标离测点（或底图顶点）这么近时吸附上去
@@ -56,17 +58,23 @@ def scroll_steps(event) -> float:
 class BoundaryFrame(ttk.Frame):
     """计算边界设置页面"""
 
-    def __init__(self, parent, points: List[SurveyPoint], on_boundary_set: Callable[[List[Tuple[float, float]]], None],
+    def __init__(self, parent, points: List[SurveyPoint], on_boundary_set: Callable[[List[XY], List[List[XY]]], None],
                  notify: Optional[Callable[[str], None]] = None,
-                 on_breaklines_changed: Optional[Callable[[List[Breakline]], None]] = None):
+                 on_breaklines_changed: Optional[Callable[[List[Breakline]], None]] = None,
+                 on_holes_changed: Optional[Callable[[List[List[XY]]], None]] = None):
         super().__init__(parent)
         self.points = points
         self.on_boundary_set = on_boundary_set
         self.on_breaklines_changed = on_breaklines_changed
+        self.on_holes_changed = on_holes_changed
         self.notify = notify or (lambda message: messagebox.showinfo("提示", message))
         self.boundary: List[Tuple[float, float]] = []
         self.breaklines: List[Breakline] = []
         self.drawing: List[XY] = []  # 正在绘制的特征线顶点
+        self.holes: List[List[XY]] = []
+        self.drawing_hole: List[XY] = []
+        self._hole_history: List[List[XY]] = []
+        self._hole_redo: List[List[XY]] = []
         self.edit_mode = True
         self.current_point: Optional[Tuple[float, float]] = None
         self._point_xy = np.empty((0, 2), dtype=float)
@@ -162,12 +170,27 @@ class BoundaryFrame(ttk.Frame):
         target_row.pack(anchor=tk.W, pady=(4, 0))
         ttk.Label(target_row, text="左键绘制：").pack(side=tk.LEFT)
         self.target_var = tk.StringVar(value=TARGET_BOUNDARY)
-        for value, text in ((TARGET_BOUNDARY, "计算边界"), (TARGET_BREAKLINE, "特征线")):
+        for value, text in ((TARGET_BOUNDARY, "计算边界"), (TARGET_BREAKLINE, "特征线"), (TARGET_HOLE, "挖空区")):
             ttk.Radiobutton(target_row, text=text, value=value, variable=self.target_var,
                             command=self._on_target_change).pack(side=tk.LEFT, padx=(0, 8))
 
+        hole_row = ttk.Frame(mode_frame)
+        hole_row.pack(fill=tk.X, pady=(4, 0))
+        self.hole_status_var = tk.StringVar(value="挖空区：无")
+        ttk.Label(hole_row, textvariable=self.hole_status_var, style="Muted.TLabel").pack(side=tk.LEFT)
+        hole_buttons = ttk.Frame(mode_frame)
+        hole_buttons.pack(fill=tk.X, pady=(2, 0))
+        hole_buttons.grid_columnconfigure((0, 1, 2), weight=1, uniform="hole_buttons")
+        for column, (text, command) in enumerate((("完成挖空区", self._finish_hole),
+                                                   ("导入挖空区", self._import_holes),
+                                                   ("清空挖空区", self._clear_holes))):
+            ttk.Button(hole_buttons, text=text, command=command).grid(
+                row=0, column=column, sticky="ew", padx=(0 if column == 0 else 2, 0 if column == 2 else 2))
+
         # 边界点列表
-        ttk.Label(ctrl_frame, text="边界点坐标:", style="Title.TLabel").grid(row=1, column=0, sticky="w", pady=(10, 0))
+        self.list_title_var = tk.StringVar(value="边界点坐标:")
+        ttk.Label(ctrl_frame, textvariable=self.list_title_var, style="Title.TLabel").grid(
+            row=1, column=0, sticky="w", pady=(10, 0))
 
         # 边界点列表（双击改坐标）
         list_frame = ttk.Frame(ctrl_frame)
@@ -260,7 +283,9 @@ class BoundaryFrame(ttk.Frame):
                     "3. 有 CAD 图：“导入底图”后沿图描，或“选底图线”直接点一条\n"
                     "4. 连线交叉时标红，可点“理顺顺序”；双击列表可改坐标\n"
                     "5. 斜线区域不在测点范围内，不计方量；确认前看状态提示\n"
-                    "6. 有沟、坎、坡时选“特征线”，点测点画线；右键结束一条")
+                    "6. 有沟、坎、坡时选“特征线”，点测点画线；右键结束一条\n"
+                    "7. 建筑物、水池等不计方量的区域：选“挖空区”逐个画，\n"
+                    "   每画完一个点“完成挖空区”")
         self.info_label = ttk.Label(ctrl_frame, text=info_text, justify=tk.LEFT, style="Hint.TLabel")
         self.info_label.grid(row=6, column=0, sticky="w", pady=(10, 0))
         self.ctrl_frame, self.list_frame = ctrl_frame, list_frame
@@ -310,6 +335,10 @@ class BoundaryFrame(ttk.Frame):
                 return
             if self.edit_mode and self.target_var.get() == TARGET_BREAKLINE:
                 self._finish_drawing()
+                return
+            if self.edit_mode and self.target_var.get() == TARGET_HOLE:
+                if self.drawing_hole:
+                    self._apply_hole(self.drawing_hole[:-1])
                 return
             # 右键：点在顶点上删这个顶点，否则删最后一点
             if self.edit_mode and self.boundary:
@@ -385,6 +414,11 @@ class BoundaryFrame(ttk.Frame):
         if self.target_var.get() == TARGET_BREAKLINE:
             self.add_drawing_vertex(event.xdata, event.ydata)
             return
+        if self.target_var.get() == TARGET_HOLE:
+            position, _ = self._snap(event.xdata, event.ydata)
+            if position not in self.drawing_hole:
+                self._apply_hole(self.drawing_hole + [position])
+            return
         vertex = self._vertex_at(event)
         if vertex is not None:
             self._select_vertex(vertex)
@@ -402,6 +436,15 @@ class BoundaryFrame(ttk.Frame):
             boundary.insert(edge + 1, position)
             self._selected = edge + 1
         self._apply_boundary(boundary)
+
+    def _on_canvas_click(self, event):
+        """单击入口；真实鼠标通过按下/松开处理，程序调用也可添加/回退顶点。"""
+        if not self.edit_mode or event.inaxes != self.plotter.ax:
+            return
+        if event.button == 1:
+            self._click(event)
+        elif event.button == 3:
+            self._on_canvas_press(event)
 
     def _on_canvas_scroll(self, event):
         if event.inaxes != self.plotter.ax or event.xdata is None or event.ydata is None:
@@ -436,6 +479,10 @@ class BoundaryFrame(ttk.Frame):
             return
         position, point_index = self._snap(event.xdata, event.ydata)
         self._show_coordinates(position, point_index)
+        if self.target_var.get() == TARGET_HOLE:
+            self.current_point = position if self.edit_mode else None
+            self.plotter.update_boundary_preview(self.drawing_hole, self.current_point)
+            return
         if not self.edit_mode:
             return
         if self._vertex_at(event) is not None:
@@ -550,22 +597,31 @@ class BoundaryFrame(ttk.Frame):
             crossings=crossings, duplicates=duplicates,
             hull=self._hull if uncovered > 0 else None,
             breaklines=self.breaklines, drawing=self.drawing,
-            title=BREAKLINE_TITLE if self.target_var.get() == TARGET_BREAKLINE else BOUNDARY_TITLE,
+            holes=self.holes, drawing_hole=self.drawing_hole,
+            title={TARGET_BREAKLINE: BREAKLINE_TITLE, TARGET_HOLE: HOLE_TITLE}.get(
+                self.target_var.get(), BOUNDARY_TITLE),
         )
         self._refresh_point_labels()
         self._update_boundary_status()
         self._update_breakline_status()
+        self._update_hole_status()
 
     # ------------------------------------------------------------------
     # 特征线
     # ------------------------------------------------------------------
 
+    def _target(self) -> List[XY]:
+        return self.drawing_hole if self.target_var.get() == TARGET_HOLE else self.boundary
+
     def _on_target_change(self):
         self._press = None
+        self._selected = None
+        self.list_title_var.set("挖空区顶点坐标:" if self.target_var.get() == TARGET_HOLE else "边界点坐标:")
         self.current_point = None
         if self._pick_mode:
             self._set_pick_mode(False)
         self._refresh_plot()
+        self._update_boundary_list()
 
     def _update_breakline_status(self, message: Optional[str] = None):
         if not hasattr(self, "breakline_status_var"):
@@ -677,6 +733,104 @@ class BoundaryFrame(ttk.Frame):
             messagebox.showinfo("成功", message)
         return True
 
+    def _update_hole_status(self):
+        if not hasattr(self, "hole_status_var"):
+            return
+        text = f"挖空区：{len(self.holes)} 个" if self.holes else "挖空区：无"
+        if self.drawing_hole:
+            text += f"；正在绘制的有 {len(self.drawing_hole)} 个点"
+        self.hole_status_var.set(text)
+
+    def _finish_hole(self) -> bool:
+        """把正在绘制的挖空区加入列表；无效时提示并保留，便于修改。"""
+        if len(self.drawing_hole) < 3:
+            messagebox.showwarning("提示", "挖空区至少需要 3 个点。先在“绘制”中选“挖空区”，再在图上逐点点击。")
+            return False
+        try:
+            check_holes(self.boundary, self.holes + [list(self.drawing_hole)])
+        except ValueError as error:
+            messagebox.showwarning("挖空区无效", str(error).replace(f"第 {len(self.holes) + 1} 个挖空区", "这个挖空区"))
+            return False
+        self.holes.append(list(self.drawing_hole))
+        self.drawing_hole = []
+        self._hole_history.clear()
+        self._hole_redo.clear()
+        self.current_point = None
+        self._selected = None
+        self._notify_holes()
+        self._refresh_plot()
+        self._update_boundary_list()
+        return True
+
+    def _import_holes(self):
+        filepath = filedialog.askopenfilename(
+            title="导入挖空区",
+            filetypes=[("DXF图形", "*.dxf"), ("CSV文件", "*.csv"), ("文本文件", "*.txt"), ("所有文件", "*.*")],
+        )
+        if filepath:
+            self.load_holes_file(filepath)
+
+    def load_holes_file(self, filepath: str) -> bool:
+        """DXF 取边界以内的全部闭合多段线；CSV/TXT 为一个挖空区（前两列为 X、Y）。"""
+        try:
+            if filepath.lower().endswith(".dxf"):
+                from utils.dxf_io import import_holes_from_dxf
+                holes = import_holes_from_dxf(filepath, self.boundary or None)
+            else:
+                holes = [read_xy_file(filepath)]
+            check_holes(self.boundary, self.holes + holes)
+        except Exception as error:
+            messagebox.showerror("导入失败", str(error))
+            return False
+        self.holes += holes
+        self._notify_holes()
+        self._refresh_plot()
+        messagebox.showinfo("成功", f"导入挖空区 {len(holes)} 个")
+        return True
+
+    def _clear_holes(self):
+        if (self.holes or self.drawing_hole) and not messagebox.askyesno("清空挖空区", "删除全部挖空区？"):
+            return
+        self.holes = []
+        self.drawing_hole = []
+        self._hole_history.clear()
+        self._hole_redo.clear()
+        self.current_point = None
+        self._selected = None
+        self._notify_holes()
+        self._refresh_plot()
+        self._update_boundary_list()
+
+    def set_holes(self, holes: List[List[Tuple[float, float]]]):
+        """外部设置挖空区（打开工程）。"""
+        self.holes = [list(hole) for hole in holes or []]
+        self.drawing_hole = []
+        self._hole_history.clear()
+        self._hole_redo.clear()
+        self.current_point = None
+        self._press = None
+        self._selected = None
+        self._refresh_plot()
+        self._update_boundary_list()
+
+    def _notify_holes(self):
+        if self.on_holes_changed is not None:
+            self.on_holes_changed([list(hole) for hole in self.holes])
+
+    def _apply_hole(self, ring, remember: bool = True):
+        """修改正在绘制的挖空区；不改动计算边界或已完成的挖空区。"""
+        ring = [(float(x), float(y)) for x, y in ring]
+        if remember and ring != self.drawing_hole:
+            self._hole_history.append(list(self.drawing_hole))
+            del self._hole_history[:-HISTORY_LIMIT]
+            self._hole_redo.clear()
+        self.drawing_hole = ring
+        self.current_point = None
+        if self._selected is not None and self._selected >= len(ring):
+            self._selected = None
+        self._refresh_plot()
+        self._update_boundary_list()
+
     def _find_problems(self):
         """当前边界的问题：交叉的边、重合的点、落在测点范围以外的面积。"""
         from core.boundary_check import covered_area, duplicate_vertices, find_crossings
@@ -756,17 +910,18 @@ class BoundaryFrame(ttk.Frame):
     def _update_boundary_list(self):
         self._ensure_point_cache()
         self.tree_boundary.delete(*self.tree_boundary.get_children())
-        for i, (x, y) in enumerate(self.boundary, 1):
+        for i, (x, y) in enumerate(self._target(), 1):
             self.tree_boundary.insert('', 'end', iid=str(i - 1),
                                       values=(i, self._point_id_at.get((x, y), ""), f"{x:.3f}", f"{y:.3f}"))
-        if self._selected is not None and self._selected < len(self.boundary):
+        if self._selected is not None and self._selected < len(self._target()):
             self.tree_boundary.selection_set(str(self._selected))
             self.tree_boundary.see(str(self._selected))
 
     def _select_vertex(self, index: Optional[int]):
         """选中一个边界顶点：图上圈出，列表里同步选中。"""
         self._selected = index
-        self.plotter.update_boundary_line(self.boundary, index)
+        if self.target_var.get() != TARGET_HOLE:
+            self.plotter.update_boundary_line(self.boundary, index)
         if index is None:
             self.tree_boundary.selection_remove(*self.tree_boundary.selection())
         else:
@@ -778,7 +933,8 @@ class BoundaryFrame(ttk.Frame):
         index = int(selection[0]) if selection else None
         if index != self._selected:
             self._selected = index
-            self.plotter.update_boundary_line(self.boundary, index)
+            if self.target_var.get() != TARGET_HOLE:
+                self.plotter.update_boundary_line(self.boundary, index)
 
     def _escape(self):
         """Esc：退出选底图线，取消选中和“下一点”预览。"""
@@ -819,7 +975,11 @@ class BoundaryFrame(ttk.Frame):
     def _remove_vertices(self, indices):
         doomed = set(indices)
         self._selected = None
-        self._apply_boundary([point for index, point in enumerate(self.boundary) if index not in doomed])
+        ring = [point for index, point in enumerate(self._target()) if index not in doomed]
+        if self.target_var.get() == TARGET_HOLE:
+            self._apply_hole(ring)
+        else:
+            self._apply_boundary(ring)
 
     def set_points(self, points: List[SurveyPoint]):
         """更新测点（使吸附坐标缓存失效）并重绘。"""
@@ -841,6 +1001,12 @@ class BoundaryFrame(ttk.Frame):
         self.boundary = [func(x, y) for x, y in self.boundary]
         self._history = [[func(x, y) for x, y in previous] for previous in self._history]
         self._redo = [[func(x, y) for x, y in previous] for previous in self._redo]
+        self.holes = [[func(x, y) for x, y in hole] for hole in self.holes]
+        self.drawing_hole = [func(x, y) for x, y in self.drawing_hole]
+        self._hole_history = [[func(x, y) for x, y in ring] for ring in self._hole_history]
+        self._hole_redo = [[func(x, y) for x, y in ring] for ring in self._hole_redo]
+        if self.holes:
+            self._notify_holes()
         self.drawing = [func(x, y) for x, y in self.drawing]
         if self.breaklines:
             self.breaklines = [Breakline([(*func(x, y), z) for x, y, z in line.vertices], name=line.name)
@@ -918,6 +1084,13 @@ class BoundaryFrame(ttk.Frame):
 
     def _undo_last_point(self):
         """撤销上一步修改（加点、移动、删点、导入、生成都算一步）。"""
+        if self.target_var.get() == TARGET_HOLE:
+            if self._hole_history:
+                self._hole_redo.append(list(self.drawing_hole))
+                self._apply_hole(self._hole_history.pop(), remember=False)
+            elif self.drawing_hole:
+                self._apply_hole(self.drawing_hole[:-1])
+            return
         if not self._history:
             return
         self._redo.append(list(self.boundary))
@@ -925,6 +1098,11 @@ class BoundaryFrame(ttk.Frame):
 
     def _redo_last(self):
         """重做刚撤销的那一步。"""
+        if self.target_var.get() == TARGET_HOLE:
+            if self._hole_redo:
+                self._hole_history.append(list(self.drawing_hole))
+                self._apply_hole(self._hole_redo.pop(), remember=False)
+            return
         if not self._redo:
             return
         self._history.append(list(self.boundary))
@@ -957,7 +1135,8 @@ class BoundaryFrame(ttk.Frame):
         if not row:
             return
         index = int(row)
-        x, y = self.boundary[index]
+        target = self._target()
+        x, y = target[index]
         answer = simpledialog.askstring(
             "修改边界点", f"第 {index + 1} 点的新坐标（X, Y），或填一个测点点号：",
             initialvalue=f"{x:.3f}, {y:.3f}", parent=self,
@@ -978,13 +1157,16 @@ class BoundaryFrame(ttk.Frame):
         except ValueError:
             messagebox.showwarning("修改边界点", f"没看懂“{answer}”：请填“X, Y”两个数，或一个测点点号")
             return
-        if position in self.boundary and self.boundary.index(position) != index:
+        if position in target and target.index(position) != index:
             messagebox.showwarning("修改边界点", "这个位置已经有边界点了")
             return
-        boundary = list(self.boundary)
+        boundary = list(target)
         boundary[index] = position
         self._selected = index
-        self._apply_boundary(boundary)
+        if self.target_var.get() == TARGET_HOLE:
+            self._apply_hole(boundary)
+        else:
+            self._apply_boundary(boundary)
 
     def _paste_coordinates(self):
         """把剪贴板里的坐标（如从 Excel 复制的点号、X、Y 几列）作为边界。"""
@@ -1179,7 +1361,10 @@ class BoundaryFrame(ttk.Frame):
 
     def _clear_boundary(self):
         self._selected = None
-        self._apply_boundary([])
+        if self.target_var.get() == TARGET_HOLE:
+            self._apply_hole([])
+        else:
+            self._apply_boundary([])
 
     def _delete_selected(self):
         selection = self.tree_boundary.selection()
@@ -1199,8 +1384,15 @@ class BoundaryFrame(ttk.Frame):
             "可在数据导入页点击“X/Y 互换”。\n\n仍要使用这个边界吗？",
         ):
             return
+        if self.drawing_hole and not self._finish_hole():
+            return
+        try:
+            check_holes(self.boundary, self.holes)
+        except ValueError as error:
+            messagebox.showwarning("挖空区无效", f"{error}\n\n可“清空挖空区”后重新绘制。")
+            return
         self._update_boundary_list()
-        self.on_boundary_set(list(self.boundary))
+        self.on_boundary_set(list(self.boundary), [list(hole) for hole in self.holes])
 
     def set_boundary(self, boundary: List[Tuple[float, float]]):
         """外部设置边界"""
@@ -1239,3 +1431,9 @@ def ask_layers(parent, layers: dict) -> Optional[List[str]]:
     dialog.grab_set()
     parent.wait_window(dialog)
     return chosen or None
+
+
+def read_xy_file(filepath: str) -> List[XY]:
+    """读取 CSV/TXT 中的多边形顶点，兼容表头、点号与说明行。"""
+    from utils.boundary_io import read_boundary_points
+    return read_boundary_points(filepath).points
