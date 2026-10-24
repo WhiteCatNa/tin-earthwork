@@ -14,10 +14,12 @@ import numpy as np
 class BoundaryFrame(ttk.Frame):
     """计算边界设置页面"""
     
-    def __init__(self, parent, points: List[SurveyPoint], on_boundary_set: Callable[[List[Tuple[float, float]]], None]):
+    def __init__(self, parent, points: List[SurveyPoint], on_boundary_set: Callable[[List[Tuple[float, float]]], None],
+                 notify: Optional[Callable[[str], None]] = None):
         super().__init__(parent)
         self.points = points
         self.on_boundary_set = on_boundary_set
+        self.notify = notify or (lambda message: messagebox.showinfo("提示", message))
         self.boundary: List[Tuple[float, float]] = []
         self.edit_mode = True
         self.current_point: Optional[Tuple[float, float]] = None
@@ -293,7 +295,7 @@ class BoundaryFrame(ttk.Frame):
             self.current_point = None
             self._refresh_plot()
             self._update_boundary_list()
-            messagebox.showinfo("成功", f"导入边界点 {len(self.boundary)} 个")
+            self.notify(f"已导入边界点 {len(self.boundary)} 个，检查无误后点“确认边界”")
         except Exception as error:
             messagebox.showerror("错误", f"导入失败: {error}")
             
@@ -325,7 +327,6 @@ class BoundaryFrame(ttk.Frame):
             return
         self._update_boundary_list()
         self.on_boundary_set(list(self.boundary))
-        messagebox.showinfo("成功", f"边界已设置，共 {len(self.boundary)} 个点")
 
     def set_boundary(self, boundary: List[Tuple[float, float]]):
         """外部设置边界"""
