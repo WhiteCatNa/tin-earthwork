@@ -722,13 +722,13 @@ class CalculationFrame(ttk.Frame):
         # 选项卡1：图形显示（显示开关放在图上方，左栏留给计算设置）
         self.plot_frame = ttk.Frame(self.notebook)
         self.notebook.add(self.plot_frame, text="计算结果图")
-        toggles = ttk.Frame(self.plot_frame)
+        # 小屏上一行放不下六个开关，自动折行，避免最后几个被挤窄
+        toggles = WrappingButtonRow(self.plot_frame, gap=10)
         toggles.pack(fill=tk.X, padx=4, pady=(4, 0))
         for text, variable in (("TIN网格", self.show_tin_var), ("零填挖线", self.show_contour_var),
                                ("等高线", self.show_levels_var), ("测量点", self.show_points_var),
                                ("计算边界", self.show_boundary_var), ("特征线", self.show_breaklines_var)):
-            ttk.Checkbutton(toggles, text=text, variable=variable, command=self._refresh_plot).pack(
-                side=tk.LEFT, padx=(0, 10))
+            toggles.add(text, self._refresh_plot, widget=ttk.Checkbutton, variable=variable)
 
         self.plotter = EarthworkPlotter(figsize=(10, 7))
         tools = WrappingButtonRow(self.plot_frame)
