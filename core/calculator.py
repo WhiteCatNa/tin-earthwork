@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 from scipy.spatial import Delaunay, QhullError
 
+from core import parallel
 from core.overlay import clip_convex, overlay_triangulations
 from core.surface import PlaneDesign, TinSurface
 from core.geometry import (
@@ -134,8 +135,8 @@ def _signed_areas(tri_xy: np.ndarray) -> np.ndarray:
     return ((p1[:, 0] - p0[:, 0]) * (p2[:, 1] - p0[:, 1]) - (p2[:, 0] - p0[:, 0]) * (p1[:, 1] - p0[:, 1])) / 2
 
 
-def _triangle_planes(tri_xy: np.ndarray, tri_z: np.ndarray) -> List[Tuple[float, float, float]]:
-    """每个三角形上 z = a·x + b·y + c 的系数；退化三角形取三点平均高程。"""
+def _triangle_planes(tri_xy: np.ndarray, tri_z: np.ndarray) -> np.ndarray:
+    """每个三角形上 z = a·x + b·y + c 的系数 (n, 3)；退化三角形取三点平均高程。"""
     x0, y0 = tri_xy[:, 0, 0], tri_xy[:, 0, 1]
     x1, y1 = tri_xy[:, 1, 0] - x0, tri_xy[:, 1, 1] - y0
     x2, y2 = tri_xy[:, 2, 0] - x0, tri_xy[:, 2, 1] - y0
@@ -146,7 +147,32 @@ def _triangle_planes(tri_xy: np.ndarray, tri_z: np.ndarray) -> List[Tuple[float,
     a = np.where(good, (z1 * y2 - z2 * y1) / safe, 0.0)
     b = np.where(good, (z2 * x1 - z1 * x2) / safe, 0.0)
     c = np.where(good, z0 - a * x0 - b * y0, tri_z.mean(axis=1))
-    return list(zip(a.tolist(), b.tolist(), c.tolist()))
+    return np.column_stack([a, b, c]).reshape(-1, 3)
+
+
+def _fan_triangles(index: np.ndarray, sizes: np.ndarray) -> np.ndarray:
+    """把首尾相接存放的多边形（顶点序号 index，各自顶点数 sizes）扇形剖分成三角形。
+
+    先去掉多边形内相邻重复的顶点和与起点重复的终点；三角形顺序为逐个多边形、逐个扇形。
+    """
+    cell = np.repeat(np.arange(len(sizes)), sizes)
+    keep = np.ones(len(index), dtype=bool)
+    keep[1:] = (index[1:] != index[:-1]) | (cell[1:] != cell[:-1])
+    index, cell = index[keep], cell[keep]
+
+    counts = np.bincount(cell, minlength=len(sizes))
+    ends = np.cumsum(counts) - 1
+    starts = ends - counts + 1
+    closed = (counts >= 2) & (index[starts.clip(0, max(len(index) - 1, 0))] == index[ends.clip(0)])
+    keep = np.ones(len(index), dtype=bool)
+    keep[ends[closed]] = False
+    index, cell = index[keep], cell[keep]
+
+    counts = np.bincount(cell, minlength=len(sizes))
+    starts = np.cumsum(counts) - counts
+    position = np.arange(len(index)) - starts[cell]
+    middle = np.nonzero((position >= 1) & (position <= counts[cell] - 2))[0]
+    return np.column_stack([index[starts[cell[middle]]], index[middle], index[middle + 1]]).astype(np.int64).reshape(-1, 3)
 
 
 def format_id_list(ids: List[str]) -> str:
@@ -155,6 +181,135 @@ def format_id_list(ids: List[str]) -> str:
     if len(ids) > MAX_LISTED:
         text += f" 等共 {len(ids)} 个"
     return text
+
+
+def _to_global(polygon, origin: XY) -> List[XY]:
+    ox, oy = origin
+    return [(float(x) + ox, float(y) + oy) for x, y in polygon]
+
+
+def _triangle_volume(points: Sequence[XY], dz: List[float], region: Optional[np.ndarray],
+                     origin: XY, eps: float, ring: Optional[np.ndarray]) -> tuple:
+    """单个三角形在边界内部分的挖填方。
+
+    points 为三个顶点的全局坐标，dz 为顶点高差，region 为被边界裁剪后的区域（局部坐标，未裁剪为 None）。
+    返回 (面积, 净体积, 挖方, 填方, 挖方面积, 填方面积, 平均高差, 是否混合, 挖方多边形, 填方多边形, 零线段)。
+    """
+    (x0, y0), (x1, y1), (x2, y2) = points
+    ox, oy = origin
+    vertices = [(x0 - ox, y0 - oy), (x1 - ox, y1 - oy), (x2 - ox, y2 - oy)]
+    clipped = region is not None
+    cut_volume = fill_volume = cut_area = fill_area = 0.0
+    cut_polygon: List[XY] = []
+    fill_polygon: List[XY] = []
+
+    if clipped:
+        plane = linear_plane(*vertices, *dz, eps=eps * eps)
+        polygon = [(float(x), float(y)) for x, y in region]
+        if plane is None:
+            values = [sum(dz) / 3] * len(polygon)
+        else:
+            a, b, c = plane
+            values = [a * x + b * y + c for x, y in polygon]
+    else:
+        polygon, values = vertices, dz
+
+    has_cut = any(v > 0 for v in values)
+    has_fill = any(v < 0 for v in values)
+
+    if not (has_cut and has_fill):
+        if clipped:
+            area, volume = polygon_integral(polygon, values)
+        else:
+            area = abs((x0 * (y1 - y2) + x1 * (y2 - y0) + x2 * (y0 - y1)) / 2)
+            volume = area * sum(dz) / 3
+        if volume > 0:
+            cut_volume, cut_area = volume, area
+        elif volume < 0:
+            fill_volume, fill_area = -volume, area
+        if clipped:
+            target = cut_polygon if volume > 0 else fill_polygon
+            target.extend(_to_global(polygon, origin))
+        average = volume / area if area else 0.0
+        return (area, volume, cut_volume, fill_volume, cut_area, fill_area, average, False,
+                cut_polygon, fill_polygon, [])
+
+    cut_poly, cut_values = clip_by_sign(polygon, values, positive=True)
+    fill_poly, fill_values = clip_by_sign(polygon, values, positive=False)
+    cut_area, cut = polygon_integral(cut_poly, cut_values)
+    fill_area, fill = polygon_integral(fill_poly, fill_values)
+    cut_volume = max(cut, 0.0)
+    fill_volume = max(-fill, 0.0)
+    volume = cut_volume - fill_volume
+    area = cut_area + fill_area
+    average = volume / area if area else 0.0
+
+    zero_segments: List[Tuple[XY, XY]] = []
+    zero = zero_crossing_points(vertices, dz)
+    if len(zero) == 2:
+        if clipped:
+            segments = clip_segment_to_ring(zero[0], zero[1], ring)
+        else:
+            segments = [(zero[0], zero[1])]
+        zero_segments = [tuple(_to_global(segment, origin)) for segment in segments]
+    return (area, volume, cut_volume, fill_volume, cut_area, fill_area, average, True,
+            _to_global(cut_poly, origin), _to_global(fill_poly, origin), zero_segments)
+
+
+def _clip_task(task) -> List[Tuple[bool, Optional[np.ndarray]]]:
+    """跨边界三角形按边界裁剪：[(是否落在边界外, 边界内区域；整个在边界内时为 None)]。"""
+    ring, triangles, area_tol = task
+    clips: List[Tuple[bool, Optional[np.ndarray]]] = []
+    for triangle in triangles:
+        region = clip_ring_to_triangle(ring, triangle)
+        region_area = abs(signed_area(region))
+        full_area = abs(signed_area(triangle))
+        if region_area <= area_tol:
+            clips.append((True, None))
+        elif full_area - region_area > area_tol + full_area * 1e-9:
+            clips.append((False, region))
+        else:
+            clips.append((False, None))
+    return clips
+
+
+def _volume_batch(xy: np.ndarray, dz: np.ndarray, regions: List[Optional[np.ndarray]], context) -> list:
+    origin, eps, ring = context
+    return [
+        _triangle_volume(points, values, region, origin, eps, ring)
+        for points, values, region in zip(xy.tolist(), dz.tolist(), regions)
+    ]
+
+
+def _volume_task(task) -> tuple:
+    """子进程任务：一批三角形的方量，打包成数组传回（浮点值不变，传输比逐个元组快得多）。"""
+    results = _volume_batch(*task)
+    scalars = np.array([values[:7] for values in results], dtype=float).reshape(-1, 7)
+    mixed = np.fromiter((values[7] for values in results), dtype=bool, count=len(results))
+    counts = np.array([(len(values[8]), len(values[9]), len(values[10])) for values in results],
+                      dtype=np.int64).reshape(-1, 3)
+    flat: List[XY] = []
+    for values in results:
+        flat.extend(values[8])
+        flat.extend(values[9])
+        for segment in values[10]:
+            flat.extend(segment)
+    return scalars, mixed, counts, np.array(flat, dtype=float).reshape(-1, 2)
+
+
+def _unpack_volumes(packed: tuple):
+    """_volume_task 结果还原为与 _triangle_volume 相同的元组。"""
+    scalars, mixed, counts, flat = packed
+    points = [tuple(point) for point in flat.tolist()]
+    pos = 0
+    for row, is_mixed, (cut_count, fill_count, segment_count) in zip(scalars.tolist(), mixed.tolist(), counts.tolist()):
+        cut = points[pos:pos + cut_count]
+        pos += cut_count
+        fill = points[pos:pos + fill_count]
+        pos += fill_count
+        segments = [(points[pos + 2 * k], points[pos + 2 * k + 1]) for k in range(segment_count)]
+        pos += 2 * segment_count
+        yield (*row, is_mixed, cut, fill, segments)
 
 
 class TINEarthworkCalculator:
@@ -319,6 +474,7 @@ class TINEarthworkCalculator:
             raise ValueError("计算边界无效：顶点共线，围不成面积")
         return ring - np.asarray(self._origin)
 
+    @parallel.gc_paused()
     def build_tin(self) -> List[Triangle]:
         """构建三角网，并按计算边界把三角形分为 边界内 / 跨边界 / 边界外。
 
@@ -334,6 +490,7 @@ class TINEarthworkCalculator:
             vertex_points, local, simplices = self._triangulate_design()
         return self._classify(vertex_points, local, simplices)
 
+    @parallel.gc_paused()
     def build_from_mesh(self, vertex_points: List[SurveyPoint], simplices: np.ndarray) -> List[Triangle]:
         """用给定的三角剖分（如方格网）代替 Delaunay，其余计算完全相同。"""
         self.warnings = []
@@ -382,17 +539,17 @@ class TINEarthworkCalculator:
         extent = float(max(np.ptp(local_a[unique_a], axis=0).max(), np.ptp(local_b[unique_b], axis=0).max())) or 1.0
         area_tol = (extent * 1e-9) * extent * 1e-3
         cells = overlay_triangulations(tri_a, tri_b, area_tol)
-        if not cells:
+        if not cells.count:
             raise ValueError(
                 "前期和后期测量的范围没有重叠，无法对比。请检查两期坐标是否同一坐标系、X/Y 方向是否一致。"
             )
         planes_a = _triangle_planes(tri_a, np.array([before[i].z for i in unique_a])[tin_a.simplices])
         planes_b = _triangle_planes(tri_b, np.array([after[i].z for i in unique_b])[tin_b.simplices])
 
-        # 所有交集多边形的顶点摊平后按坐标去重（批量处理，避免逐点 Python 调用）
-        sizes = np.fromiter((len(polygon) for polygon, _, _ in cells), dtype=np.int64, count=len(cells))
-        flat = np.array([point for polygon, _, _ in cells for point in polygon], dtype=float)
-        cell_of = np.repeat(np.arange(len(cells)), sizes)
+        # 所有交集多边形的顶点按坐标去重（批量处理，避免逐点 Python 调用）
+        sizes = cells.sizes
+        flat = cells.points
+        cell_of = np.repeat(np.arange(cells.count), sizes)
         key_tol = extent * 1e-9
         keys = np.round(flat / key_tol).astype(np.int64)
         _, first, inverse = np.unique(keys, axis=0, return_index=True, return_inverse=True)
@@ -400,23 +557,12 @@ class TINEarthworkCalculator:
         vertex_xy = flat[first]
         # 每个顶点的两期高程取自它首次出现的那个交集多边形（其内两期地面都是线性的）
         owner = cell_of[first]
-        pa = np.array([planes_a[cells[i][1]] for i in owner]).reshape(-1, 3)
-        pb = np.array([planes_b[cells[i][2]] for i in owner]).reshape(-1, 3)
+        pa = planes_a[cells.tri_a[owner]]
+        pb = planes_b[cells.tri_b[owner]]
         z_before = pa[:, 0] * vertex_xy[:, 0] + pa[:, 1] * vertex_xy[:, 1] + pa[:, 2]
         z_after = pb[:, 0] * vertex_xy[:, 0] + pb[:, 1] * vertex_xy[:, 1] + pb[:, 2]
 
-        simplices: List[Tuple[int, int, int]] = []
-        start = 0
-        for size in sizes.tolist():
-            ring: List[int] = []
-            for index in inverse[start:start + size].tolist():
-                if not ring or ring[-1] != index:
-                    ring.append(index)
-            start += size
-            if len(ring) >= 2 and ring[0] == ring[-1]:
-                ring.pop()
-            simplices.extend((ring[0], ring[i], ring[i + 1]) for i in range(1, len(ring) - 1))
-        simplices_array = np.array(simplices, dtype=np.int64).reshape(-1, 3)
+        simplices_array = _fan_triangles(inverse, sizes)
         areas = np.abs(_signed_areas(vertex_xy[simplices_array])) if len(simplices_array) else np.zeros(0)
         simplices_array = simplices_array[areas > area_tol]
 
@@ -458,26 +604,35 @@ class TINEarthworkCalculator:
             clear = np.nonzero(~touching)[0]
             outside[clear] = ~points_in_ring(tri_xy[clear].mean(axis=1), self._ring)
             area_tol = self._eps * extent * 1e-3
-            for index in np.nonzero(touching)[0]:
-                region = clip_ring_to_triangle(self._ring, tri_xy[index])
-                region_area = abs(signed_area(region))
-                full_area = abs(signed_area(tri_xy[index]))
-                if region_area <= area_tol:
+            indices = np.nonzero(touching)[0]
+            if parallel.use_processes(len(indices), parallel.MIN_PARALLEL_CLIPS):
+                tasks = [(self._ring, tri_xy[indices[rows.start:rows.stop]], area_tol)
+                         for rows in parallel.process_chunks(len(indices))]
+                clips = [item for part in parallel.process_map(_clip_task, tasks) for item in part]
+            else:
+                clips = _clip_task((self._ring, tri_xy[indices], area_tol))
+            for index, (is_outside, region) in zip(indices.tolist(), clips):
+                if is_outside:
                     outside[index] = True
-                elif full_area - region_area > area_tol + full_area * 1e-9:
-                    self._regions[int(index)] = region
+                elif region is not None:
+                    self._regions[index] = region
+
+        # 水平投影面积按全局坐标批量计算，公式与 _triangle_area 相同（逐元素运算，结果一致）
+        global_xy = np.array([(p.x, p.y) for p in vertex_points], dtype=float).reshape(-1, 2)[simplices]
+        (x0, y0), (x1, y1), (x2, y2) = global_xy[:, 0].T, global_xy[:, 1].T, global_xy[:, 2].T
+        areas = np.abs((x0 * (y1 - y2) + x1 * (y2 - y0) + x2 * (y0 - y1)) / 2).tolist()
 
         self.triangles = []
-        for i, (v0, v1, v2) in enumerate(simplices):
-            tri = Triangle(
+        regions = self._regions
+        for i, ((v0, v1, v2), is_outside, area) in enumerate(zip(simplices.tolist(), outside.tolist(), areas)):
+            self.triangles.append(Triangle(
                 id=i,
-                vertex_ids=(int(v0), int(v1), int(v2)),
+                vertex_ids=(v0, v1, v2),
                 vertex_points=(vertex_points[v0], vertex_points[v1], vertex_points[v2]),
-                is_boundary=bool(outside[i]),
-                is_clipped=i in self._regions,
-            )
-            tri.area = self._triangle_area(tri.vertex_points)
-            self.triangles.append(tri)
+                area=area,
+                is_boundary=is_outside,
+                is_clipped=i in regions,
+            ))
         return self.triangles
 
     def _triangle_area(self, points: Tuple[SurveyPoint, SurveyPoint, SurveyPoint]) -> float:
@@ -491,69 +646,50 @@ class TINEarthworkCalculator:
     # 方量
     # ------------------------------------------------------------------
 
-    def _to_global(self, polygon) -> List[XY]:
-        ox, oy = self._origin
-        return [(float(x) + ox, float(y) + oy) for x, y in polygon]
+    def _triangle_results(self, triangles: List[Triangle]) -> list:
+        """每个三角形的计算结果，顺序与 triangles 相同。
 
-    def _calculate_triangle(self, tri: Triangle):
-        """计算单个三角形在边界内部分的挖填方。"""
-        p0, p1, p2 = tri.vertex_points
-        ox, oy = self._origin
-        vertices = [(p0.x - ox, p0.y - oy), (p1.x - ox, p1.y - oy), (p2.x - ox, p2.y - oy)]
-        dz = [p0.delta_z, p1.delta_z, p2.delta_z]
+        未被裁剪、全挖或全填的三角形（通常占绝大多数）用 numpy 批量计算，逐元素运算顺序与
+        _triangle_volume 相同，结果一致，返回 7 项标量；其余逐个计算，量大时分块交给进程池，
+        返回 _triangle_volume 的完整元组。
+        """
+        if not triangles:
+            return []
+        points = {id(p): p for tri in triangles for p in tri.vertex_points}
+        slot = {key: i for i, key in enumerate(points)}
+        vertices = np.array([slot[id(p)] for tri in triangles for p in tri.vertex_points], dtype=np.int64).reshape(-1, 3)
+        xy = np.array([(p.x, p.y) for p in points.values()], dtype=float).reshape(-1, 2)[vertices]
+        dz = np.array([p.delta_z for p in points.values()], dtype=float)[vertices]
+        clipped = np.fromiter((tri.is_clipped for tri in triangles), dtype=bool, count=len(triangles))
+        simple = ~clipped & ~((dz > 0).any(axis=1) & (dz < 0).any(axis=1))
 
-        if tri.is_clipped:
-            region = self._regions[tri.id]
-            plane = linear_plane(*vertices, *dz, eps=self._eps * self._eps)
-            polygon = [(float(x), float(y)) for x, y in region]
-            if plane is None:
-                values = [sum(dz) / 3] * len(polygon)
+        (x0, y0), (x1, y1), (x2, y2) = xy[:, 0].T, xy[:, 1].T, xy[:, 2].T
+        area = np.abs((x0 * (y1 - y2) + x1 * (y2 - y0) + x2 * (y0 - y1)) / 2)
+        # 求和用内置 sum（Python 3.12 起为补偿求和，与逐元素相加末位可能不同）
+        volume = area * np.array([sum(row) for row in dz.tolist()], dtype=float).reshape(-1) / 3
+        cut, fill = volume > 0, volume < 0
+        average = np.divide(volume, area, out=np.zeros_like(volume), where=area != 0)
+        results: list = np.column_stack([
+            area, volume, np.where(cut, volume, 0.0), np.where(fill, -volume, 0.0),
+            np.where(cut, area, 0.0), np.where(fill, area, 0.0), average,
+        ]).tolist()
+
+        others = np.nonzero(~simple)[0]
+        if len(others):
+            xy, dz = xy[others], dz[others]
+            regions = [self._regions.get(triangles[i].id) if clipped[i] else None for i in others.tolist()]
+            context = (self._origin, self._eps, self._ring)
+            if parallel.use_processes(len(others)):
+                tasks = [(xy[rows.start:rows.stop], dz[rows.start:rows.stop], regions[rows.start:rows.stop], context)
+                         for rows in parallel.process_chunks(len(others))]
+                values = (v for part in parallel.process_map(_volume_task, tasks) for v in _unpack_volumes(part))
             else:
-                a, b, c = plane
-                values = [a * x + b * y + c for x, y in polygon]
-        else:
-            polygon, values = vertices, dz
+                values = _volume_batch(xy, dz, regions, context)
+            for i, item in zip(others.tolist(), values):
+                results[i] = item
+        return results
 
-        has_cut = any(v > 0 for v in values)
-        has_fill = any(v < 0 for v in values)
-
-        if not (has_cut and has_fill):
-            if tri.is_clipped:
-                tri.area, tri.volume = polygon_integral(polygon, values)
-            else:
-                tri.area = self._triangle_area(tri.vertex_points)
-                tri.volume = tri.area * sum(dz) / 3
-            if tri.volume > 0:
-                tri.cut_volume, tri.cut_area = tri.volume, tri.area
-            elif tri.volume < 0:
-                tri.fill_volume, tri.fill_area = -tri.volume, tri.area
-            if tri.is_clipped:
-                target = tri.cut_polygon if tri.volume > 0 else tri.fill_polygon
-                target.extend(self._to_global(polygon))
-            tri.avg_delta_z = tri.volume / tri.area if tri.area else 0.0
-            return
-
-        tri.is_mixed = True
-        cut_poly, cut_values = clip_by_sign(polygon, values, positive=True)
-        fill_poly, fill_values = clip_by_sign(polygon, values, positive=False)
-        tri.cut_area, cut = polygon_integral(cut_poly, cut_values)
-        tri.fill_area, fill = polygon_integral(fill_poly, fill_values)
-        tri.cut_volume = max(cut, 0.0)
-        tri.fill_volume = max(-fill, 0.0)
-        tri.volume = tri.cut_volume - tri.fill_volume
-        tri.area = tri.cut_area + tri.fill_area
-        tri.avg_delta_z = tri.volume / tri.area if tri.area else 0.0
-        tri.cut_polygon = self._to_global(cut_poly)
-        tri.fill_polygon = self._to_global(fill_poly)
-
-        zero = zero_crossing_points(vertices, dz)
-        if len(zero) == 2:
-            if tri.is_clipped:
-                segments = clip_segment_to_ring(zero[0], zero[1], self._ring)
-            else:
-                segments = [(zero[0], zero[1])]
-            tri.zero_segments = [tuple(self._to_global(segment)) for segment in segments]
-
+    @parallel.gc_paused()
     def calculate_volumes(self) -> CalculationResult:
         """计算挖填方量"""
         if not self.triangles:
@@ -563,14 +699,23 @@ class TINEarthworkCalculator:
         result.boundary_points = self.boundary_polygon
         result.boundary_area = self._boundary_area
 
+        active: List[Triangle] = []
         for tri in self.triangles:
             tri.volume = tri.cut_volume = tri.fill_volume = 0.0
             tri.cut_area = tri.fill_area = tri.avg_delta_z = 0.0
             tri.is_mixed = False
             tri.cut_polygon, tri.fill_polygon, tri.zero_segments = [], [], []
-            if tri.is_boundary:
-                continue
-            self._calculate_triangle(tri)
+            if not tri.is_boundary:
+                active.append(tri)
+
+        # 逐个三角形的计算互不依赖，量大时分块多进程；汇总仍按原顺序累加，结果与串行逐位一致
+        for tri, values in zip(active, self._triangle_results(active)):
+            if len(values) == 7:
+                (tri.area, tri.volume, tri.cut_volume, tri.fill_volume, tri.cut_area, tri.fill_area,
+                 tri.avg_delta_z) = values
+            else:
+                (tri.area, tri.volume, tri.cut_volume, tri.fill_volume, tri.cut_area, tri.fill_area,
+                 tri.avg_delta_z, tri.is_mixed, tri.cut_polygon, tri.fill_polygon, tri.zero_segments) = values
             result.total_cut += tri.cut_volume
             result.total_fill += tri.fill_volume
             result.computed_area += tri.area

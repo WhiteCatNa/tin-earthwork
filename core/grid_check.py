@@ -13,6 +13,7 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 
+from core import parallel
 from core.calculator import CalculationResult, SurveyPoint, TINEarthworkCalculator
 from core.overlay import clip_convex
 
@@ -112,6 +113,7 @@ def grid_region(calculator: TINEarthworkCalculator) -> List[XY]:
     return clip_convex(boundary, coverage)
 
 
+@parallel.gc_paused()
 def run_grid_check(calculator: TINEarthworkCalculator, tin: CalculationResult, spacing: float) -> GridCheckResult:
     """在 TIN 法计算完成后运行方格网校核（calculator 须已构网）。"""
     spacing = float(spacing)

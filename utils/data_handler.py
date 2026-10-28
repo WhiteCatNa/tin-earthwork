@@ -15,6 +15,7 @@ from openpyxl.cell import WriteOnlyCell
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
+from core import parallel
 from core.calculator import CalculationResult, SurveyPoint, chain_segments, extract_zero_contour_segments
 from utils.dxf_io import read_text_with_encodings
 from utils.fileio import atomic_write_text
@@ -198,7 +199,17 @@ class DataImporter:
         z_column = mapping.get("z")
         design_column = mapping.get("design_z")
 
-        for row_number, (index, row) in enumerate(df.iterrows(), start=1):
+        # 按列位置取 df.values 的行，取到的值与 iterrows() 完全相同，但快一个数量级；
+        # 列名重复或映射到不存在的列时仍用 iterrows()，保持原有的逐行报错行为
+        columns = [id_column, x_column, y_column, z_column, design_column]
+        positions = [df.columns.get_loc(c) if c is not None and c in df.columns else c for c in columns]
+        if all(p is None or isinstance(p, int) for p in positions):
+            id_column, x_column, y_column, z_column, design_column = positions
+            rows = iter(df.values)
+        else:
+            rows = (row for _, row in df.iterrows())
+
+        for row_number, row in enumerate(rows, start=1):
             try:
                 if x_column is None or y_column is None or z_column is None:
                     raise KeyError("缺少 X/Y/Z 列映射")
@@ -230,6 +241,7 @@ class DataImporter:
         return points, format_errors
     
     @staticmethod
+    @parallel.gc_paused()
     def import_file(filepath: str) -> Tuple[List[SurveyPoint], Dict[str, Any], pd.DataFrame]:
         """导入文件，返回(点列表, 验证结果, 原始DataFrame)"""
         path = Path(filepath)
@@ -338,6 +350,7 @@ class DataImporter:
         return pd.DataFrame(rows)
 
     @staticmethod
+    @parallel.gc_paused()
     def import_survey_text(
         filepath: str, cass: bool = False
     ) -> Tuple[List[SurveyPoint], List[str], pd.DataFrame]:
