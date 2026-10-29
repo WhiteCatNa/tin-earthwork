@@ -1,6 +1,13 @@
 """
 TIN 土方自动算量系统 - 主程序入口
 """
+import multiprocessing
+
+if __name__ == "__main__":
+    # 打包程序（PyInstaller）里多进程计算的子进程会重新启动本程序，须最先处理，
+    # 避免子进程导入界面库、再开一个窗口
+    multiprocessing.freeze_support()
+
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 import sys
@@ -16,6 +23,7 @@ from gui.data_import_frame import DataImportFrame
 from gui.boundary_frame import BoundaryFrame
 from gui.calculation_frame import DEFAULT_PROJECT_NAME, CalculationFrame
 from gui.theme import COLORS, apply_theme, font
+from core import parallel
 from core.calculator import SurveyPoint
 from utils.data_handler import load_project, save_project
 from utils.recent_projects import forget_recent, load_recent, remember_recent
@@ -560,6 +568,7 @@ class MainApplication(tk.Tk):
             if self.calc_frame is not None:
                 self.calc_frame.shutdown()
             self.boundary_frame.shutdown()
+            parallel.shutdown()
             self.destroy()
 
 
