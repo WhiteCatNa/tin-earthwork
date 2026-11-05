@@ -7,9 +7,11 @@
 """
 import math
 from collections import defaultdict
-from typing import List, Sequence, Tuple
+from typing import List, NamedTuple, Sequence, Tuple
 
 import numpy as np
+
+from core import parallel
 
 XY = Tuple[float, float]
 
@@ -59,35 +61,33 @@ def _polygon_area(poly: Sequence[XY]) -> float:
     return total / 2
 
 
-def overlay_triangulations(
-    tri_a: np.ndarray, tri_b: np.ndarray, area_tol: float
-) -> List[Tuple[List[XY], int, int]]:
-    """返回 [(交集多边形, 前期三角形序号, 后期三角形序号)]，面积不大于 area_tol 的碎片丢弃。"""
-    tri_a = np.asarray(tri_a, dtype=float).reshape(-1, 3, 2)
-    tri_b = np.asarray(tri_b, dtype=float).reshape(-1, 3, 2)
-    if not len(tri_a) or not len(tri_b):
-        return []
+class _TriangleIndex:
+    """后期三角形的均匀网格索引，按包围盒查询候选。"""
 
-    b_min = tri_b.min(axis=1)
-    b_max = tri_b.max(axis=1)
-    size = np.median(np.maximum(b_max - b_min, 0).max(axis=1))
-    cell = float(size) if size > 0 else 1.0
+    def __init__(self, tri_b: np.ndarray):
+        b_min = tri_b.min(axis=1)
+        b_max = tri_b.max(axis=1)
+        size = np.median(np.maximum(b_max - b_min, 0).max(axis=1))
+        self.cell = float(size) if size > 0 else 1.0
+        self.buckets = defaultdict(list)
+        lo = np.floor(b_min / self.cell).astype(np.int64)
+        hi = np.floor(b_max / self.cell).astype(np.int64)
+        for index in range(len(tri_b)):
+            for i in range(lo[index, 0], hi[index, 0] + 1):
+                for j in range(lo[index, 1], hi[index, 1] + 1):
+                    self.buckets[(i, j)].append(index)
+        self.clip_b = [_ccw([tuple(p) for p in tri.tolist()]) for tri in tri_b]
+        self.b_min = b_min.tolist()
+        self.b_max = b_max.tolist()
 
-    # 均匀网格索引后期三角形，按包围盒查询候选
-    buckets = defaultdict(list)
-    lo = np.floor(b_min / cell).astype(np.int64)
-    hi = np.floor(b_max / cell).astype(np.int64)
-    for index in range(len(tri_b)):
-        for i in range(lo[index, 0], hi[index, 0] + 1):
-            for j in range(lo[index, 1], hi[index, 1] + 1):
-                buckets[(i, j)].append(index)
 
-    clip_b = [_ccw([tuple(p) for p in tri.tolist()]) for tri in tri_b]
-    b_min_list = b_min.tolist()
-    b_max_list = b_max.tolist()
+def _overlay_range(tri_a: np.ndarray, rows: range, index: _TriangleIndex,
+                   area_tol: float) -> List[Tuple[List[XY], int, int]]:
+    cell, buckets, clip_b = index.cell, index.buckets, index.clip_b
+    b_min_list, b_max_list = index.b_min, index.b_max
     cells: List[Tuple[List[XY], int, int]] = []
-    for ia, triangle in enumerate(tri_a):
-        subject = _ccw([tuple(p) for p in triangle.tolist()])
+    for ia in rows:
+        subject = _ccw([tuple(p) for p in tri_a[ia].tolist()])
         xs = [p[0] for p in subject]
         ys = [p[1] for p in subject]
         axmin, axmax, aymin, aymax = min(xs), max(xs), min(ys), max(ys)
@@ -103,3 +103,55 @@ def overlay_triangulations(
             if len(polygon) >= 3 and _polygon_area(polygon) > area_tol:
                 cells.append((polygon, ia, ib))
     return cells
+
+
+class OverlayCells(NamedTuple):
+    """叠加结果，按 (前期三角形序号, 后期三角形序号) 排序。
+
+    第 k 个交集多边形的顶点是 points[offsets[k]:offsets[k] + sizes[k]]。
+    """
+    points: np.ndarray   # (顶点总数, 2)
+    sizes: np.ndarray    # 每个多边形的顶点数
+    tri_a: np.ndarray    # 所在前期三角形序号
+    tri_b: np.ndarray    # 所在后期三角形序号
+
+    @property
+    def count(self) -> int:
+        return len(self.sizes)
+
+
+def _pack(cells: List[Tuple[List[XY], int, int]]) -> OverlayCells:
+    """多边形列表转为紧凑数组（浮点值不变），便于进程间传输和批量处理。"""
+    count = len(cells)
+    return OverlayCells(
+        points=np.array([point for polygon, _, _ in cells for point in polygon], dtype=float).reshape(-1, 2),
+        sizes=np.fromiter((len(polygon) for polygon, _, _ in cells), dtype=np.int64, count=count),
+        tri_a=np.fromiter((ia for _, ia, _ in cells), dtype=np.int64, count=count),
+        tri_b=np.fromiter((ib for _, _, ib in cells), dtype=np.int64, count=count),
+    )
+
+
+def _overlay_task(task) -> OverlayCells:
+    """子进程任务：前期三角形的一个连续区段与全部后期三角形求交。"""
+    tri_a, offset, tri_b, area_tol = task
+    cells = _pack(_overlay_range(tri_a, range(len(tri_a)), _TriangleIndex(tri_b), area_tol))
+    return cells._replace(tri_a=cells.tri_a + offset)
+
+
+def overlay_triangulations(tri_a: np.ndarray, tri_b: np.ndarray, area_tol: float) -> OverlayCells:
+    """前期、后期三角网求交，面积不大于 area_tol 的碎片丢弃。
+
+    三角形多时按前期三角形分段多进程计算，拼接后与串行结果逐位一致。
+    """
+    tri_a = np.asarray(tri_a, dtype=float).reshape(-1, 3, 2)
+    tri_b = np.asarray(tri_b, dtype=float).reshape(-1, 3, 2)
+    if not len(tri_a) or not len(tri_b):
+        return _pack([])
+
+    if parallel.use_processes(len(tri_a) + len(tri_b)):
+        # 每个进程只分一段：每段都要重建后期三角形索引
+        tasks = [(tri_a[rows.start:rows.stop], rows.start, tri_b, area_tol)
+                 for rows in parallel.chunk_bounds(len(tri_a), parallel.worker_count())]
+        parts = parallel.process_map(_overlay_task, tasks)
+        return OverlayCells(*(np.concatenate(column) for column in zip(*parts)))
+    return _pack(_overlay_range(tri_a, range(len(tri_a)), _TriangleIndex(tri_b), area_tol))
