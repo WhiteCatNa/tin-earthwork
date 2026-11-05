@@ -5,7 +5,8 @@ from dataclasses import dataclass
 from typing import Dict
 
 import numpy as np
-from scipy.spatial import ConvexHull, Delaunay, cKDTree
+from matplotlib.tri import TrapezoidMapTriFinder, Triangulation
+from scipy.spatial import ConvexHull, cKDTree
 
 
 @dataclass
@@ -45,30 +46,46 @@ class PlaneDesign:
 
 
 class TinSurface:
-    """由 Delaunay 三角网定义的分片线性曲面（局部坐标），可在任意位置插值。
+    """由三角网定义的分片线性曲面（局部坐标），可在任意位置插值。
 
-    values 中每个数组与 delaunay.points 一一对应；网外位置返回 NaN。
+    三角网可以是普通 Delaunay，也可以是带特征线的约束三角网；points 中可以有未参与构网的点。
+    values 中每个数组与 points 一一对应；网外位置返回 NaN。
     """
 
-    def __init__(self, delaunay: Delaunay, values: Dict[str, np.ndarray]):
-        self.delaunay = delaunay
+    def __init__(self, points: np.ndarray, simplices: np.ndarray, values: Dict[str, np.ndarray]):
+        self.points = np.asarray(points, dtype=float).reshape(-1, 2)
+        self.simplices = np.asarray(simplices, dtype=np.int64).reshape(-1, 3)
         self.values = {key: np.asarray(value, dtype=float) for key, value in values.items()}
+        self._finder = None
 
     @property
     def triangles_xy(self) -> np.ndarray:
-        return self.delaunay.points[self.delaunay.simplices]
+        return self.points[self.simplices]
+
+    def find_triangle(self, xy: np.ndarray) -> np.ndarray:
+        """每个位置所在三角形的序号，网外为 −1。对任意（非 Delaunay）三角网同样有效。"""
+        if self._finder is None:
+            triangulation = Triangulation(self.points[:, 0], self.points[:, 1], self.simplices)
+            self._finder = TrapezoidMapTriFinder(triangulation)
+        xy = np.asarray(xy, dtype=float).reshape(-1, 2)
+        return np.asarray(self._finder(xy[:, 0], xy[:, 1]), dtype=np.int64)
 
     def _evaluate(self, xy: np.ndarray, simplex: np.ndarray, key: str) -> np.ndarray:
         """按给定三角形的平面求值；点在三角形外时即为该平面的线性外推。"""
-        transform = self.delaunay.transform[simplex]
-        delta = xy - transform[:, 2]
-        bary = np.einsum("ijk,ik->ij", transform[:, :2], delta)
-        weights = np.column_stack([bary, 1 - bary.sum(axis=1)])
-        return np.einsum("ij,ij->i", weights, self.values[key][self.delaunay.simplices[simplex]])
+        corners = self.triangles_xy[simplex]
+        v0 = corners[:, 0]
+        e1 = corners[:, 1] - v0
+        e2 = corners[:, 2] - v0
+        d = xy - v0
+        det = e1[:, 0] * e2[:, 1] - e1[:, 1] * e2[:, 0]
+        l1 = (d[:, 0] * e2[:, 1] - d[:, 1] * e2[:, 0]) / det
+        l2 = (e1[:, 0] * d[:, 1] - e1[:, 1] * d[:, 0]) / det
+        weights = np.column_stack([1 - l1 - l2, l1, l2])
+        return np.einsum("ij,ij->i", weights, self.values[key][self.simplices[simplex]])
 
     def interpolate(self, xy: np.ndarray, key: str) -> np.ndarray:
         xy = np.asarray(xy, dtype=float).reshape(-1, 2)
-        simplex = self.delaunay.find_simplex(xy)
+        simplex = self.find_triangle(xy)
         result = np.full(len(xy), np.nan)
         inside = simplex >= 0
         if inside.any():
@@ -89,7 +106,7 @@ class TinSurface:
         outside = np.nonzero(np.isnan(result))[0]
         if not len(outside):
             return result
-        points = self.delaunay.points
+        points = self.points
         values = self.values[key]
         count = min(self.EXTRAPOLATION_NEIGHBORS, len(points))
         _, neighbors = cKDTree(points).query(xy[outside], k=count)
@@ -103,4 +120,5 @@ class TinSurface:
 
     def hull(self) -> np.ndarray:
         """三角网范围（凸包），逆时针顶点。"""
-        return self.delaunay.points[ConvexHull(self.delaunay.points).vertices]
+        used = self.points[np.unique(self.simplices)]
+        return used[ConvexHull(used).vertices]

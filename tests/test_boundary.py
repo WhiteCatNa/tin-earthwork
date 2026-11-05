@@ -1,6 +1,11 @@
+from types import SimpleNamespace
+
+import pytest
+
+import gui.boundary_frame as boundary_module
 from core.calculator import SurveyPoint
 from core.geometry import segments_cross
-from gui.boundary_frame import BoundaryFrame
+from gui.boundary_frame import BoundaryFrame, scroll_steps
 
 
 def test_boundary_segment_intersection():
@@ -26,3 +31,17 @@ def test_boundary_validity_and_overlap_checks():
     assert frame._overlaps_points()
     frame.boundary = [(100, 100), (110, 100), (110, 110)]
     assert not frame._overlaps_points()
+
+
+def test_scroll_steps_are_normalised_per_platform(monkeypatch):
+    # Windows：matplotlib 给的 step 每格就是 1
+    monkeypatch.setattr(boundary_module.sys, "platform", "win32")
+    assert scroll_steps(SimpleNamespace(step=1.0, button="up")) == 1.0
+    assert scroll_steps(SimpleNamespace(step=-10.0, button="down")) == -boundary_module.MAX_SCROLL_STEPS
+    # Linux：step 为 0 时看 button
+    assert scroll_steps(SimpleNamespace(step=0, button="down")) == -1.0
+    # macOS：Tk 每格 delta 是 1，matplotlib 除以 120 后只剩 0.0083，要换算回来
+    monkeypatch.setattr(boundary_module.sys, "platform", "darwin")
+    assert scroll_steps(SimpleNamespace(step=1 / 120, button="up")) == pytest.approx(boundary_module.MAC_SCROLL_UNIT)
+    assert scroll_steps(SimpleNamespace(step=-4 / 120, button="down")) == pytest.approx(-4 * boundary_module.MAC_SCROLL_UNIT)
+    assert scroll_steps(SimpleNamespace(step=40 / 120, button="up")) == boundary_module.MAX_SCROLL_STEPS

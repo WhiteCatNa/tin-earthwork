@@ -221,7 +221,7 @@ def test_exports_are_created_and_readable(tmp_path):
     assert exporter.export_summary_excel(result, excel_path, points)
     assert exporter.export_triangles_csv(result, csv_path)
     workbook = openpyxl.load_workbook(excel_path)
-    assert workbook.sheetnames == ["土方量汇总表", "三角形计算明细", "异常数据检查"]
+    assert workbook.sheetnames == ["土方量汇总表", "三角形计算明细", "异常数据检查"]   # 没设边界：没有“计算边界”表
     assert workbook["土方量汇总表"]["A1"].value == "测试项目"
     assert not pd.read_csv(csv_path, encoding="utf-8-sig").empty
     assert "总挖方量" in exporter.generate_report_text(result, len(points))
@@ -334,3 +334,33 @@ def test_project_file_is_written_atomically(tmp_path, monkeypatch):
         pass
     assert path.read_text(encoding="utf-8") == original
     assert [p.name for p in tmp_path.iterdir()] == ["job.tinproj.json"]
+
+
+def test_numeric_point_ids_stay_whole_numbers(tmp_path):
+    # 曾经的问题：点号列是整数、坐标列是小数时，点号被读成 “7.0”
+    csv_path = tmp_path / "ids.csv"
+    csv_path.write_text("点号,X,Y,高程\n7,1.5,2.5,10\n8,11.5,2.5,10.5\n9,11.5,9.5,10\n", encoding="utf-8")
+    assert [point.id for point in DataImporter.import_file(str(csv_path))[0]] == ["7", "8", "9"]
+
+    xlsx_path = tmp_path / "ids.xlsx"
+    pd.DataFrame(
+        {"点号": [7, None, 9], "X": [1.5, 11.5, 11.5], "Y": [2.5, 2.5, 9.5], "高程": [10, 10.5, 10]}
+    ).to_excel(xlsx_path, index=False)
+    assert [point.id for point in DataImporter.import_file(str(xlsx_path))[0]] == ["7", "P2", "9"]
+
+
+def test_csv_without_header_keeps_its_first_point(tmp_path):
+    # 曾经的问题：没有表头的 CSV 交给 pandas 读，第一个测点被当成表头悄悄丢掉
+    path = tmp_path / "noheader.csv"
+    path.write_text("1,1.5,2.5,10\n2,11.5,2.5,10.5\n3,11.5,9.5,10\n4,1.5,9.5,10.2\n", encoding="utf-8")
+    points, issues, frame = DataImporter.import_file(str(path))
+    assert [(p.id, p.x, p.y, p.z) for p in points] == [
+        ("1", 1.5, 2.5, 10.0), ("2", 11.5, 2.5, 10.5), ("3", 11.5, 9.5, 10.0), ("4", 1.5, 9.5, 10.2)
+    ]
+    assert issues["format_errors"] == [] and len(frame) == 4
+
+    # 有表头的 CSV 照旧按列名认，列的先后无所谓
+    named = tmp_path / "header.csv"
+    named.write_text("高程,Y,X,点号\n10,2.5,1.5,A\n10.5,2.5,11.5,B\n10,9.5,11.5,C\n", encoding="gbk")
+    points, _, _ = DataImporter.import_file(str(named))
+    assert [(p.id, p.x, p.y, p.z) for p in points] == [("A", 1.5, 2.5, 10.0), ("B", 11.5, 2.5, 10.5), ("C", 11.5, 9.5, 10.0)]

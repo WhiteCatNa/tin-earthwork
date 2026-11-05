@@ -262,3 +262,42 @@ def test_recalculating_with_new_design_resets_mixed_state():
     assert not triangle.is_mixed
     assert triangle.zero_segments == [] and triangle.cut_polygon == []
     assert result.mixed_triangle_count == 0
+
+
+def test_balanced_design_elevation_on_planar_terrain_is_area_weighted_mean():
+    """平面地形在正方形边界内的平衡高程 = 边界形心处的地面高程。"""
+    points = _grid_points(lambda x, y: 50 + 0.02 * x - 0.01 * y, step=7.0, jitter=2.0, seed=5)
+    calculator = TINEarthworkCalculator(0.0)
+    calculator.add_points(points)
+    calculator.set_boundary([(10, 20), (90, 20), (90, 60), (10, 60)])
+    level = calculator.balanced_design_elevation()
+    assert math.isclose(level, 50 + 0.02 * 50 - 0.01 * 40, rel_tol=1e-12)
+
+
+def test_balanced_design_elevation_makes_net_volume_zero_on_rough_terrain():
+    rng = np.random.default_rng(7)
+    points = _grid_points(lambda x, y: 10 + rng.normal(0, 1.5), step=10.0, jitter=3.0, seed=7)
+    boundary = [(23.3, 17.1), (81.7, 21.9), (83.2, 62.4), (52.5, 48.8), (47.5, 88.8), (21.4, 71.2)]
+    calculator = TINEarthworkCalculator(3.0)
+    calculator.add_points(points)
+    calculator.set_boundary(boundary)
+    level = calculator.balanced_design_elevation()
+    result = calculator.run_full_calculation(level)
+    assert result.total_cut > 100 and result.total_fill > 100
+    assert abs(result.net_volume) < 1e-9 * result.total_cut
+
+
+def test_balanced_design_elevation_without_coverage_raises():
+    calculator = TINEarthworkCalculator(0.0)
+    calculator.add_points(_grid_points(lambda x, y: 5.0, size=10.0, step=5.0))
+    calculator.set_boundary([(100, 100), (110, 100), (110, 110)])
+    with pytest.raises(ValueError, match="无法求挖填平衡高程"):
+        calculator.balanced_design_elevation()
+
+
+def test_balanced_design_elevation_is_refused_in_compare_mode():
+    calculator = TINEarthworkCalculator(10)
+    calculator.add_points([SurveyPoint("A", 0, 0, 11), SurveyPoint("B", 10, 0, 11), SurveyPoint("C", 0, 10, 11)])
+    calculator.set_compare_points([SurveyPoint("Q1", 0, 0, 9), SurveyPoint("Q2", 10, 0, 9), SurveyPoint("Q3", 0, 10, 9)])
+    with pytest.raises(ValueError, match="两期对比"):
+        calculator.balanced_design_elevation()

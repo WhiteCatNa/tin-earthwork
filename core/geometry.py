@@ -296,8 +296,8 @@ def triangles_touching_ring(triangles: np.ndarray, ring: np.ndarray, eps: float)
     return touched
 
 
-def clip_segment_to_ring(start: XY, end: XY, ring: np.ndarray) -> List[Tuple[XY, XY]]:
-    """把线段裁剪到多边形内部，返回位于多边形内的子线段。"""
+def clip_segment_to_ring(start: XY, end: XY, ring: np.ndarray, inside: bool = True) -> List[Tuple[XY, XY]]:
+    """把线段裁剪到多边形内部，返回位于多边形内的子线段；inside=False 时返回位于多边形外的部分。"""
     p = np.asarray(start, dtype=float)
     q = np.asarray(end, dtype=float)
     direction = q - p
@@ -311,13 +311,13 @@ def clip_segment_to_ring(start: XY, end: XY, ring: np.ndarray) -> List[Tuple[XY,
     if valid.any():
         t = (diff[valid, 0] * edge[valid, 1] - diff[valid, 1] * edge[valid, 0]) / denom[valid]
         u = (diff[valid, 0] * direction[1] - diff[valid, 1] * direction[0]) / denom[valid]
-        inside = (t > 0) & (t < 1) & (u >= 0) & (u <= 1)
-        params.extend(t[inside].tolist())
+        hits = (t > 0) & (t < 1) & (u >= 0) & (u <= 1)
+        params.extend(t[hits].tolist())
     params = sorted(set(params))
     mids = np.array([p + direction * (t0 + t1) / 2 for t0, t1 in zip(params, params[1:])])
     if not len(mids):
         return []
-    keep = points_in_ring(mids, ring)
+    keep = points_in_ring(mids, ring) == inside
     pieces: List[Tuple[XY, XY]] = []
     for (t0, t1), inside_piece in zip(zip(params, params[1:]), keep):
         if not inside_piece:
@@ -330,3 +330,28 @@ def clip_segment_to_ring(start: XY, end: XY, ring: np.ndarray) -> List[Tuple[XY,
         else:
             pieces.append(piece)
     return pieces
+
+
+def rings_cross(a: np.ndarray, b: np.ndarray) -> bool:
+    """两个闭合多边形是否有边严格相交（仅端点接触不算）。"""
+    a_start, a_end = a, np.roll(a, -1, axis=0)
+    b_start, b_end = b, np.roll(b, -1, axis=0)
+    for p, q in zip(a_start, a_end):
+        crossing = (_orientation(p, q, b_start) * _orientation(p, q, b_end) < 0) & (
+            _orientation(b_start, b_end, p) * _orientation(b_start, b_end, q) < 0
+        )
+        if crossing.any():
+            return True
+    return False
+
+
+def ring_inside_ring(inner: np.ndarray, outer: np.ndarray) -> bool:
+    """inner 是否整个位于 outer 之内（顶点都在内、边不相交）。"""
+    return bool(points_in_ring(inner, outer).all()) and not rings_cross(inner, outer)
+
+
+def rings_overlap(a: np.ndarray, b: np.ndarray) -> bool:
+    """两个多边形是否有重叠部分（边相交，或一个的顶点在另一个之内）。"""
+    if rings_cross(a, b):
+        return True
+    return bool(points_in_ring(a, b).any() or points_in_ring(b, a).any())

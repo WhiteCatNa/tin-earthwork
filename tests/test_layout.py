@@ -6,11 +6,13 @@
 
 注意：Windows 上窗口不能大于屏幕（CI 的屏幕只有 1024x768），所以断言都以窗口的实际尺寸为准。
 """
+import time
 import tkinter as tk
 
 import pytest
 
 import main as app_main
+from conftest import create_main_window
 from run_full_test import generate_test_data
 
 
@@ -19,7 +21,7 @@ def app(tmp_path, monkeypatch):
     monkeypatch.setenv("TIN_EARTHWORK_RECENT", str(tmp_path / "recent.json"))
     for name in ("showinfo", "showwarning", "showerror"):
         monkeypatch.setattr(f"tkinter.messagebox.{name}", lambda *a, **k: "ok")
-    window = app_main.MainApplication()
+    window = create_main_window(hidden=False)
     window.minsize(1, 1)
     window.geometry("{}x{}".format(*app_main.DEFAULT_WINDOW_SIZE))
     yield window
@@ -110,8 +112,13 @@ def test_primary_buttons_visible(app, size):
     app.boundary_frame._create_auto_boundary()
     app.notebook.select(1)
     app.update()
-    for text in ("确认边界", "自动生成数据范围边界", "清空边界"):
+    for text in ("确认边界", "数据范围矩形", "沿测点外轮廓", "按点号连线", "导入边界文件", "粘贴坐标", "导出边界",
+                 "撤销", "重做", "理顺顺序", "删除选中点", "清空边界", "全图", "导入底图", "选底图线"):
         _assert_fully_inside_window(app, _find(app.boundary_frame, text), text)
+    # 坐标列表没有被几行按钮挤没：至少还能看到 4 行（行高随平台字体不同，按实际行高数）
+    tree = app.boundary_frame.tree_boundary
+    _, top, _, row_height = tree.bbox(tree.get_children()[0])
+    assert (tree.winfo_height() - top) // row_height >= 4
     assert _squeezed_controls(app.boundary_frame) == []
 
     app.boundary_frame._confirm_boundary()
@@ -119,6 +126,7 @@ def test_primary_buttons_visible(app, size):
     cf = app.calc_frame
     _assert_fully_inside_window(app, cf.calculate_button, "开始计算")
     _assert_fully_inside_window(app, cf.progress, "进度条")
+    _assert_fully_inside_window(app, cf.balance_button, "挖填平衡")
     assert len(cf._export_buttons) == 6
     for button in cf._export_buttons:
         _assert_fully_inside_window(app, button, button.cget("text"))
@@ -141,7 +149,9 @@ def test_partition_editor_reappears_right_below_its_checkbox(app):
 
 
 def test_calc_settings_scroll_instead_of_hiding_on_small_window(app):
-    app.geometry("{}x{}".format(*LAPTOP_WINDOW))
+    # 步骤条并入状态栏后，1366x768 屏幕的窗口已能完整放下斜面 + 分区的设置项；
+    # 用再矮 100 px 的窗口验证“放不下时滚动、开始计算仍可见”
+    app.geometry("{}x{}".format(LAPTOP_WINDOW[0], LAPTOP_WINDOW[1] - 100))
     app.import_frame.load_points(generate_test_data()[:50])
     app.import_frame._confirm_points()
     app.boundary_frame._create_auto_boundary()
@@ -168,9 +178,11 @@ def test_boundary_hint_hides_on_short_panel_and_returns_when_tall(app):
         frame.place(x=0, y=0, width=1400, height=450)
         app.update()
         assert not frame.info_label.winfo_manager()
+        assert not frame.list_title_label.winfo_manager()   # 再矮一些，列表标题也让出高度
         frame.place_configure(height=1000)
         app.update()
         assert frame.info_label.winfo_manager() == "grid"
+        assert frame.list_title_label.winfo_manager() == "grid"
     finally:
         frame.shutdown()
         host.destroy()
@@ -204,3 +216,37 @@ def test_tables_do_not_grow_and_squeeze_neighbour_panel(app):
         app.update()
     assert _squeezed_controls(frame) == []
     _assert_fully_inside_window(app, _find(frame, "确认无误，进入下一步"), "确认无误，进入下一步")
+
+
+@pytest.mark.parametrize("size", WINDOW_SIZES, ids=["default", "1366x768", "1024x768"])
+def test_reset_view_button_does_not_cover_result_legend(app, size):
+    """结果图左下角浮着“重置视图”按钮，图例在图下方一行：窗口再窄两者也不能叠在一起。"""
+    app.geometry("{}x{}".format(*size))
+    app.import_frame.load_points(generate_test_data())
+    app.import_frame._confirm_points()
+    app.boundary_frame._create_auto_boundary()
+    app.boundary_frame._confirm_boundary()
+    cf = app.calc_frame
+    cf.design_elevation_var.set(50.0)
+    cf.start_calculation()
+    # 计算在后台线程里跑：按时间等，不按刷新次数（CI 机器慢时 3000 次刷新可能还没算完）
+    end = time.perf_counter() + 60
+    while cf.result is None and time.perf_counter() < end:
+        app.update()
+        time.sleep(0.01)
+    assert cf.result is not None, "计算 60 秒内没有完成"
+    app.update()
+    cf.canvas.draw()
+
+    widget = cf.canvas.get_tk_widget()
+    button = _find(widget, "重置视图")
+    canvas = cf.plotter.fig.canvas
+    ratio = getattr(canvas, "device_pixel_ratio", 1) or 1
+    box = cf.plotter._result_legend.get_window_extent(canvas.get_renderer())
+    height = widget.winfo_height()
+    # matplotlib 像素原点在左下、按设备像素计；Tk 原点在左上、按逻辑像素计
+    legend = (box.x0 / ratio, height - box.y1 / ratio, box.x1 / ratio, height - box.y0 / ratio)
+    left, top = button.winfo_x(), button.winfo_y()
+    right, bottom = left + button.winfo_width(), top + button.winfo_height()
+    apart = right <= legend[0] or left >= legend[2] or bottom <= legend[1] or top >= legend[3]
+    assert apart, f"按钮 {left}-{right}×{top}-{bottom} 与图例 {legend} 重叠"
