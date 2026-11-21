@@ -530,6 +530,93 @@ bool CassApp::solve_balance_h0() {
     }
 }
 
+bool CassApp::solve_best_fit_plane_action() {
+    if (project_.points.size() < 3) {
+        status_text_ = "测点少于 3 个，无法求解最小二乘最优斜面";
+        return false;
+    }
+    try {
+        push_undo_snapshot();
+        TINEarthworkCalculator calc(project_.settings.design_elevation);
+        configure_calculator(calc);
+        auto res = solve_best_fit_plane(calc, project_.settings.soil_factors);
+        project_.settings.design_mode = DesignMode::Plane;
+        project_.settings.design_plane = res.plane;
+        std::ostringstream oss;
+        oss << "最优斜面求解完成：基准(" << format_num(res.plane.x0, 2) << "," << format_num(res.plane.y0, 2)
+            << ") H0=" << format_num(res.plane.h0, 4) << "m，坡度 X=" << format_num(res.plane.slope_x, 3)
+            << "% Y=" << format_num(res.plane.slope_y, 3) << "%";
+        log_cmd("命令: _FITPLANE -> " + oss.str());
+        return run_calculation();
+    } catch (const std::exception& e) {
+        status_text_ = std::string("求解最优斜面失败: ") + e.what();
+        log_cmd("错误: " + status_text_);
+        return false;
+    }
+}
+
+bool CassApp::solve_balance_plane_action() {
+    if (project_.points.size() < 3) {
+        status_text_ = "测点少于 3 个，无法求解保坡平衡斜面";
+        return false;
+    }
+    try {
+        push_undo_snapshot();
+        TINEarthworkCalculator calc(project_.settings.design_elevation);
+        configure_calculator(calc);
+        const auto& pl = project_.settings.design_plane;
+        auto res = solve_balance_plane(calc, pl.x0, pl.y0, pl.slope_x, pl.slope_y, project_.settings.soil_factors);
+        project_.settings.design_mode = DesignMode::Plane;
+        project_.settings.design_plane = res.plane;
+        std::ostringstream oss;
+        oss << "保坡平衡斜面 H0=" << format_num(res.plane.h0, 4)
+            << "m（X=" << format_num(res.plane.slope_x, 3) << "% Y=" << format_num(res.plane.slope_y, 3) << "%）";
+        log_cmd("命令: _BALPLANE -> " + oss.str());
+        return run_calculation();
+    } catch (const std::exception& e) {
+        status_text_ = std::string("保坡平衡斜面求解失败: ") + e.what();
+        log_cmd("错误: " + status_text_);
+        return false;
+    }
+}
+
+bool CassApp::run_sections_action(double spacing, double azimuth_deg) {
+    if (project_.points.size() < 3) {
+        status_text_ = "测点少于 3 个，无法执行平行断面法";
+        return false;
+    }
+    try {
+        if (!result_) {
+            if (!run_calculation()) return false;
+        }
+        TINEarthworkCalculator calc(project_.settings.design_elevation);
+        configure_calculator(calc);
+        calc.build_tin();
+        SectionMethodResult sec = run_sections(calc, spacing, azimuth_deg, 180);
+        section_spacing_ = spacing;
+        section_azimuth_ = azimuth_deg;
+        selected_section_idx_ = sec.stations.empty() ? -1 : static_cast<int>(sec.stations.size() / 2);
+        if (selected_section_idx_ >= 0) {
+            const auto& st = sec.stations[selected_section_idx_];
+            profile_line_ = Segment{st.start, st.end};
+            profile_result_ = st.profile;
+        }
+        std::ostringstream oss;
+        oss << "平行断面法完成（" << sec.stations.size() << " 条断面，间距 "
+            << format_num(spacing, 1) << " m）：挖方 " << format_num(sec.total_cut, 2)
+            << " m³ | 填方 " << format_num(sec.total_fill, 2) << " m³";
+        result_->sections = std::move(sec);
+        canvas_.layers.sections = true;
+        status_text_ = oss.str();
+        log_cmd("命令: _SECTIONS -> " + oss.str());
+        return true;
+    } catch (const std::exception& e) {
+        status_text_ = std::string("平行断面法执行失败: ") + e.what();
+        log_cmd("错误: " + status_text_);
+        return false;
+    }
+}
+
 bool CassApp::generate_quick_profile(bool horizontal) {
     if (project_.points.size() < 3) {
         status_text_ = "测点不足，无法生成纵断面";
@@ -684,6 +771,13 @@ void CassApp::execute_command(const std::string& raw_cmd) {
         run_calculation();
     } else if (up == "BALANCE" || up == "_BALANCE" || up == "H0") {
         solve_balance_h0();
+    } else if (up == "FITPLANE" || up == "_FITPLANE") {
+        solve_best_fit_plane_action();
+    } else if (up == "BALPLANE" || up == "_BALPLANE") {
+        solve_balance_plane_action();
+    } else if (up == "SECTIONS" || up == "_SECTIONS") {
+        run_sections_action(section_spacing_, section_azimuth_);
+        set_inspector_tab(3);
     } else if (up == "GRID" || up == "_GRID") {
         enable_grid_check(!project_.settings.grid_enabled, project_.settings.grid_spacing);
         run_calculation();
@@ -919,6 +1013,24 @@ void CassApp::action_export_cass_dat() {
     }
 }
 
+void CassApp::action_export_sections_csv() {
+    if (!result_ || !result_->sections || result_->sections->stations.empty()) {
+        status_text_ = "请先执行平行断面法批量算量";
+        return;
+    }
+    static const wchar_t filter[] = L"CSV 文件 (*.csv)\0*.csv\0\0";
+    if (auto p = save_file_dialog(L"导出平行断面法汇总表 (CSV)", filter, L"csv", project_.project_name + "_断面法.csv")) {
+        try {
+            export_sections_csv(*result_->sections, *p);
+            status_text_ = "已导出平行断面法表: " + *p;
+            log_cmd("命令: EXP_SEC -> " + status_text_);
+        } catch (const std::exception& e) {
+            status_text_ = std::string("导出断面表失败: ") + e.what();
+            log_cmd("错误: " + status_text_);
+        }
+    }
+}
+
 void CassApp::render() {
     // 全局快捷键处理
     if (!ImGui::GetIO().WantTextInput) {
@@ -1062,6 +1174,7 @@ void CassApp::render_menu_bar() {
         if (ImGui::MenuItem("导出方量汇总表 (CSV)...")) action_export_summary_csv();
         if (ImGui::MenuItem("导出逐三角形明细 (CSV)...")) action_export_detail_csv();
         if (ImGui::MenuItem("导出工程计算报告 (TXT)...")) action_export_report_txt();
+        if (ImGui::MenuItem("导出平行断面汇总表 (CSV)...")) action_export_sections_csv();
         if (ImGui::MenuItem("导出南方CASS 坐标点文件 (.dat)...")) action_export_cass_dat();
         ImGui::EndMenu();
     }
@@ -1340,6 +1453,7 @@ void CassApp::render_layer_strip() {
     ImGui::SameLine(); ImGui::Checkbox("挖空", &canvas_.layers.holes);
     ImGui::SameLine(); ImGui::Checkbox("特征线", &canvas_.layers.breaklines);
     ImGui::SameLine(); ImGui::Checkbox("断面", &canvas_.layers.profile);
+    ImGui::SameLine(); ImGui::Checkbox("断面网", &canvas_.layers.sections);
     ImGui::SameLine(); ImGui::Checkbox("捕捉", &canvas_.osnap_enabled);
 
     ImGui::EndChild();
@@ -1452,6 +1566,13 @@ void CassApp::render_tab_params() {
         ImGui::InputDouble("基准高程 H0", &pl.h0, 0.5, 2.0, "%.3f");
         ImGui::InputDouble("X 方向坡度(%)", &pl.slope_x, 0.1, 1.0, "%.3f");
         ImGui::InputDouble("Y 方向坡度(%)", &pl.slope_y, 0.1, 1.0, "%.3f");
+        if (colored_button("最小二乘最优斜面", rgba(0x2B, 0x4E, 0x7A), rgba(0x36, 0x62, 0x99), rgba(0x21, 0x3D, 0x60), ImVec2(162.0f, 0))) {
+            solve_best_fit_plane_action();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("保坡求平衡H0", ImVec2(-1, 0))) {
+            solve_balance_plane_action();
+        }
     } else {
         ImGui::Text("对比期测点数: %zu 个", project_.compare_points.size());
         if (ImGui::Button("导入对比期测点...", ImVec2(-1, 0))) action_import_compare();
@@ -1666,10 +1787,10 @@ void CassApp::render_tab_summary() {
 }
 
 void CassApp::render_tab_profile() {
-    draw_section_bar("纵断面剖切控制");
-    if (ImGui::Button("水平中线断面", ImVec2(110.0f, 0))) generate_quick_profile(true);
+    draw_section_bar("单线纵断面剖切");
+    if (ImGui::Button("水平中线", ImVec2(96.0f, 0))) generate_quick_profile(true);
     ImGui::SameLine();
-    if (ImGui::Button("垂直中线断面", ImVec2(110.0f, 0))) generate_quick_profile(false);
+    if (ImGui::Button("垂直中线", ImVec2(96.0f, 0))) generate_quick_profile(false);
     ImGui::SameLine();
     if (colored_button("图上拾取", rgba(0x2B, 0x4E, 0x7A), rgba(0x36, 0x62, 0x99), rgba(0x21, 0x3D, 0x60), ImVec2(-1, 0))) {
         canvas_.clear_draft();
@@ -1677,20 +1798,72 @@ void CassApp::render_tab_profile() {
         status_text_ = "请在画布上依次左键点击断面起点与终点";
     }
 
+    ImGui::Spacing();
+    draw_section_bar("平行横断面法批量算量");
+    ImGui::SetNextItemWidth(100.0f);
+    ImGui::InputDouble("间距(m)##sec_sp", &section_spacing_, 5.0, 10.0, "%.1f");
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(85.0f);
+    ImGui::InputDouble("方位(°)##sec_az", &section_azimuth_, 15.0, 45.0, "%.0f");
+    if (colored_button("执行断面法算量", rgba(0x16, 0x7A, 0x55), rgba(0x1D, 0x99, 0x6B), rgba(0x12, 0x63, 0x45), ImVec2(170.0f, 0))) {
+        run_sections_action(std::max(1.0, section_spacing_), section_azimuth_);
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("导出断面表 CSV", ImVec2(-1, 0))) {
+        action_export_sections_csv();
+    }
+
+    if (result_ && result_->sections && !result_->sections->stations.empty()) {
+        const auto& sec = *result_->sections;
+        double cut_diff = (std::abs(result_->total_cut) > 1e-6)
+            ? ((sec.total_cut - result_->total_cut) / result_->total_cut * 100.0) : 0.0;
+        ImGui::TextColored(rgba(0xD8, 0xB4, 0xFE),
+                           "断面法 (%zu条): 挖 %s / 填 %s m³ (挖偏差 %+.2f%%)",
+                           sec.stations.size(),
+                           format_num(sec.total_cut, 1).c_str(),
+                           format_num(sec.total_fill, 1).c_str(),
+                           cut_diff);
+
+        ImGuiTableFlags tf = ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
+                             ImGuiTableFlags_ScrollY | ImGuiTableFlags_SizingStretchProp;
+        if (ImGui::BeginTable("##sec_stations", 4, tf, ImVec2(0, 118.0f))) {
+            ImGui::TableSetupScrollFreeze(0, 1);
+            ImGui::TableSetupColumn("桩号", ImGuiTableColumnFlags_WidthFixed, 68.0f);
+            ImGui::TableSetupColumn("挖面积", ImGuiTableColumnFlags_WidthStretch);
+            ImGui::TableSetupColumn("填面积", ImGuiTableColumnFlags_WidthStretch);
+            ImGui::TableSetupColumn("段挖方", ImGuiTableColumnFlags_WidthStretch);
+            ImGui::TableHeadersRow();
+            for (int i = 0; i < static_cast<int>(sec.stations.size()); ++i) {
+                const auto& st = sec.stations[i];
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0);
+                std::string lbl = st.name + "##sec" + std::to_string(i);
+                if (ImGui::Selectable(lbl.c_str(), selected_section_idx_ == i, ImGuiSelectableFlags_SpanAllColumns)) {
+                    selected_section_idx_ = i;
+                    profile_line_ = Segment{st.start, st.end};
+                    profile_result_ = st.profile;
+                }
+                ImGui::TableSetColumnIndex(1); ImGui::TextColored(rgba(0xF4, 0x83, 0x74), "%.2f", st.cut_area);
+                ImGui::TableSetColumnIndex(2); ImGui::TextColored(rgba(0x63, 0xB8, 0xFF), "%.2f", st.fill_area);
+                ImGui::TableSetColumnIndex(3); ImGui::Text("%.1f", st.seg_cut_vol);
+            }
+            ImGui::EndTable();
+        }
+    }
+
     if (profile_result_) {
         ImGui::Spacing();
-        ImGui::Text("断面长度: %s m  |  最大挖深: %s m  |  最大填高: %s m",
-                    format_num(profile_result_->length, 2).c_str(),
+        ImGui::Text("长 %s m | 挖深 %s m | 填高 %s m | 挖/填面积 %s / %s m²",
+                    format_num(profile_result_->length, 1).c_str(),
                     format_num(profile_result_->max_cut_depth, 2).c_str(),
-                    format_num(profile_result_->max_fill_depth, 2).c_str());
-        ImGui::Text("断面挖方面积: %s m2  |  填方面积: %s m2",
+                    format_num(profile_result_->max_fill_depth, 2).c_str(),
                     format_num(profile_result_->cut_area, 2).c_str(),
                     format_num(profile_result_->fill_area, 2).c_str());
     }
 
     ImGui::Spacing();
     const ProfileResult* prof_ptr = profile_result_ ? &(*profile_result_) : nullptr;
-    float rem_h = std::max(240.0f, ImGui::GetContentRegionAvail().y - 6.0f);
+    float rem_h = std::max(210.0f, ImGui::GetContentRegionAvail().y - 4.0f);
     render_profile_chart(prof_ptr, canvas_.dark_mode, rem_h);
 }
 

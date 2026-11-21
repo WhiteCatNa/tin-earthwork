@@ -612,6 +612,17 @@ void CadCanvas::render(const ProjectData& project,
         }
     }
 
+    // 10a. 平行断面法桩号线
+    if (result && layers.sections && result->sections.has_value()) {
+        ImU32 sec_col = dark_mode ? col32(0xC0, 0x84, 0xFC, 185) : col32(0x7E, 0x22, 0xCE, 195);
+        for (const auto& st : result->sections->stations) {
+            ImVec2 sa = world_to_screen(st.start.x, st.start.y, view_origin, view_size);
+            ImVec2 sb = world_to_screen(st.end.x, st.end.y, view_origin, view_size);
+            draw_dashed_line(dl, sa, sb, sec_col, 1.3f, 6.0f, 4.0f);
+            dl->AddText(ImVec2(sa.x + 3.0f, sa.y - 14.0f), sec_col, st.name.c_str());
+        }
+    }
+
     // 10. 剖面线 A——A'
     if (layers.profile && profile_line.has_value()) {
         ImVec2 a = world_to_screen(profile_line->first.x, profile_line->first.y, view_origin, view_size);

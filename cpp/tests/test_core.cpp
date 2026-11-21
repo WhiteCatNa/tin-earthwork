@@ -364,6 +364,72 @@ int main(int argc, char** argv) {
         check_true(dxf_content.find("EOF") != std::string::npos, "DXF contains EOF");
     });
 
+    // 13. 最小二乘最优斜面精确还原倾斜平面
+    run_test("13_best_fit_plane_exact_recovery", []() {
+        auto pts = make_grid_points(6, 6, 10.0, [](double x, double y) {
+            return 12.0 + 0.04 * x - 0.03 * y;
+        });
+        tin::TINEarthworkCalculator calc(0.0);
+        calc.add_points(pts);
+        auto res = tin::solve_best_fit_plane(calc, tin::SoilFactors{1.0, 1.0});
+        check_near(res.plane.slope_x, 4.0, 1e-6, "recovered slope_x (%)");
+        check_near(res.plane.slope_y, -3.0, 1e-6, "recovered slope_y (%)");
+        check_near(res.cut_volume, 0.0, 1e-4, "exact plane zero cut");
+        check_near(res.fill_volume, 0.0, 1e-4, "exact plane zero fill");
+    });
+
+    // 14. 固定坡度平衡斜面求解（默认系数与压实系数 Ks'）
+    run_test("14_balance_plane_fixed_slope", []() {
+        auto pts = make_grid_points(6, 6, 10.0, [](double x, double y) {
+            return 25.0 + 0.06 * x - 0.02 * y + 0.002 * (x - 25.0) * (x - 25.0);
+        });
+        tin::TINEarthworkCalculator calc(0.0);
+        calc.add_points(pts);
+
+        auto r1 = tin::solve_balance_plane(calc, 25.0, 25.0, 2.0, -1.0, tin::SoilFactors{1.0, 1.0});
+        check_near(r1.plane.slope_x, 2.0, 1e-9, "preserved slope_x");
+        check_near(r1.plane.slope_y, -1.0, 1e-9, "preserved slope_y");
+        check_near(r1.net_volume, 0.0, 1e-5, "balanced plane net == 0");
+
+        tin::SoilFactors sf{1.25, 0.90};
+        auto r2 = tin::solve_balance_plane(calc, 25.0, 25.0, 2.0, -1.0, sf);
+        check_near(r2.cut_volume - r2.fill_volume / sf.compact, 0.0, 1e-4, "soil factor plane balance");
+    });
+
+    // 15. 平行横断面法（解析验证 + 真实数据与 CSV 导出）
+    run_test("15_parallel_sections_method_analytical_and_real", [&]() {
+        auto pts = make_grid_points(6, 5, 10.0, [](double x, double) {
+            return 10.0 + 0.08 * x;
+        });
+        tin::TINEarthworkCalculator calc(12.0);
+        calc.add_points(pts);
+        calc.build_tin();
+        auto sec = tin::run_sections(calc, 5.0, 0.0, 160);
+        check_true(sec.stations.size() == 11, "expected 11 stations across 50m @ 5m");
+        check_near(sec.total_cut, 1000.0, 5.0, "sections analytical cut");
+        check_near(sec.total_fill, 1000.0, 5.0, "sections analytical fill");
+
+        std::string xlsx = find_test_xlsx(argc, argv);
+        if (!xlsx.empty()) {
+            auto imp = tin::import_points_file(xlsx);
+            tin::TINEarthworkCalculator rc(50.0);
+            rc.add_points(imp.points);
+            rc.build_tin();
+            auto rsec = tin::run_sections(rc, 20.0, 0.0, 180);
+            check_true(rsec.stations.size() >= 10, "real dataset stations >= 10");
+            check_true(rsec.total_cut > 1000.0 && rsec.total_fill > 1000.0, "real sections positive cut/fill");
+
+            auto tmp = std::filesystem::temp_directory_path() / L"tin_earthwork_cpp_tests";
+            std::filesystem::create_directories(tmp);
+            std::string sec_csv = tin::wide_to_utf8((tmp / L"sections.csv").wstring());
+            tin::export_sections_csv(rsec, sec_csv);
+            check_true(std::filesystem::file_size(tin::utf8_to_wide(sec_csv)) > 200, "sections csv non-empty");
+            std::cout << std::fixed << std::setprecision(2)
+                      << "  [SECTIONS test_data_1000.xlsx @20m] stations=" << rsec.stations.size()
+                      << " cut=" << rsec.total_cut << " fill=" << rsec.total_fill << "\n";
+        }
+    });
+
     std::cout << "=== Summary: PASSED " << g_passed << " / " << (g_passed + g_failed) << " ===\n";
     return g_failed == 0 ? 0 : 1;
 }

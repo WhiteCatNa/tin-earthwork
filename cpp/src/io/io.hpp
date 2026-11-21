@@ -36,6 +36,7 @@ void export_report_txt(const CalculationResult& result, int point_count,
 void export_dxf_r12(const CalculationResult& result, const std::string& utf8_path);
 void export_cass_dat(const std::vector<SurveyPoint>& points, const std::string& utf8_path,
                      const std::string& code = "");
+void export_sections_csv(const SectionMethodResult& sections, const std::string& utf8_path);
 
 // 高清 PNG 保存（用于成果图导出与实机截图）
 void save_rgba_png(const std::uint8_t* rgba, int width, int height, const std::string& utf8_path);

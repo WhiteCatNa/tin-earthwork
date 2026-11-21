@@ -1165,6 +1165,27 @@ void export_cass_dat(const std::vector<SurveyPoint>& points, const std::string& 
     write_utf8_text(utf8_path, os.str(), false);
 }
 
+void export_sections_csv(const SectionMethodResult& sections, const std::string& utf8_path) {
+    if (sections.stations.empty()) throw std::runtime_error("没有可导出的平行断面数据");
+    std::ostringstream os;
+    os << std::fixed << std::setprecision(3);
+    os << "桩号,里程(m),有效宽度(m),挖方面积(m²),填方面积(m²),最大挖深(m),最大填高(m),段间挖方(m³),段间填方(m³)\n";
+    for (const auto& st : sections.stations) {
+        os << st.name << ","
+           << st.offset << ","
+           << st.valid_width << ","
+           << st.cut_area << ","
+           << st.fill_area << ","
+           << st.max_cut << ","
+           << st.max_fill << ","
+           << st.seg_cut_vol << ","
+           << st.seg_fill_vol << "\n";
+    }
+    os << "合计," << sections.total_length << ",,,,,,"
+       << sections.total_cut << "," << sections.total_fill << "\n";
+    write_utf8_text(utf8_path, os.str(), true);
+}
+
 void save_rgba_png(const std::uint8_t* rgba, int width, int height, const std::string& utf8_path) {
     size_t png_len = 0;
     void* png_buf = tdefl_write_image_to_png_file_in_memory_ex(

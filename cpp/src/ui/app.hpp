@@ -42,6 +42,9 @@ public:
 
     bool run_calculation();
     bool solve_balance_h0();
+    bool solve_best_fit_plane_action();
+    bool solve_balance_plane_action();
+    bool run_sections_action(double spacing = 20.0, double azimuth_deg = 0.0);
     bool generate_quick_profile(bool horizontal = true);
 
     void set_inspector_tab(int idx);
@@ -102,6 +105,7 @@ private:
     void action_export_report_txt();
     void action_export_dxf();
     void action_export_cass_dat();
+    void action_export_sections_csv();
 
     HWND hwnd_ = nullptr;
     ThemeFonts fonts_;
@@ -140,6 +144,9 @@ private:
     char point_filter_buf_[64]{};
     int tri_filter_mode_ = 0; // 0=全部 1=挖方 2=填方 3=挖填混合 4=边界裁剪
     int compare_invert_ = 0;
+    double section_spacing_ = 20.0;
+    double section_azimuth_ = 0.0;
+    int selected_section_idx_ = -1;
 
     struct EditSnapshot {
         std::vector<XY> boundary;

@@ -337,6 +337,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
             app.zoom_extents();
             save_shot("cass_01_main_dark.png");
 
+            app.run_sections_action(25.0, 0.0);
             app.set_inspector_tab(3);
             save_shot("cass_02_profile.png");
 

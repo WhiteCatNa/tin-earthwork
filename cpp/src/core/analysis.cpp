@@ -450,11 +450,35 @@ ProfileResult sample_profile(
     out.delta_z.resize(count);
 
     double nan = std::numeric_limits<double>::quiet_NaN();
+    std::vector<XY> bound_norm;
+    if (calculator.boundary().size() >= 3) {
+        bound_norm = normalize_ring(calculator.boundary());
+    }
+    std::vector<std::vector<XY>> holes_norm;
+    for (const auto& h : calculator.holes()) {
+        if (h.size() >= 3) holes_norm.push_back(normalize_ring(h));
+    }
+
     for (int i = 0; i < count; ++i) {
         double t = static_cast<double>(i) / static_cast<double>(count - 1);
         double x = start.x + t * dx;
         double y = start.y + t * dy;
         out.distances[i] = t * length;
+
+        bool allowed = true;
+        if (!bound_norm.empty() && !point_in_ring({x, y}, bound_norm)) allowed = false;
+        if (allowed) {
+            for (const auto& hr : holes_norm) {
+                if (point_in_ring({x, y}, hr)) { allowed = false; break; }
+            }
+        }
+        if (!allowed) {
+            out.natural_z[i] = nan;
+            out.design_z[i] = nan;
+            out.delta_z[i] = nan;
+            continue;
+        }
+
         auto [nat, des, _] = calculator.sample_surface(x, y, false);
         out.natural_z[i] = nat;
         out.design_z[i] = des;
@@ -485,6 +509,320 @@ ProfileResult sample_profile(
         }
     }
     return out;
+}
+
+PlaneBalanceResult solve_balance_plane(
+    const TINEarthworkCalculator& calculator,
+    double x0, double y0, double slope_x, double slope_y,
+    const SoilFactors& factors) {
+
+    if (calculator.is_compare()) {
+        throw std::runtime_error("两期对比模式没有设计面，不能求平衡斜面");
+    }
+    if (calculator.points().size() < 3) {
+        throw std::runtime_error("至少需要 3 个测量点才能求解平衡斜面");
+    }
+
+    std::vector<SurveyPoint> clean;
+    clean.reserve(calculator.points().size());
+    double res_min = 1e30, res_max = -1e30, res_sum = 0.0;
+    for (const auto& p : calculator.points()) {
+        if (!std::isfinite(p.z)) {
+            throw std::runtime_error("测点高程包含非数字值，无法求解平衡斜面");
+        }
+        clean.push_back(SurveyPoint{p.id, p.x, p.y, p.z, 0.0, 0.0, false});
+        double tilted = (slope_x / 100.0) * (p.x - x0) + (slope_y / 100.0) * (p.y - y0);
+        double diff = p.z - tilted;
+        res_min = std::min(res_min, diff);
+        res_max = std::max(res_max, diff);
+        res_sum += diff;
+    }
+    double h_init = res_sum / static_cast<double>(clean.size());
+
+    TINEarthworkCalculator probe(h_init);
+    probe.add_points(clean);
+    probe.set_breaklines(calculator.breaklines());
+    probe.set_boundary(calculator.boundary());
+    probe.set_holes(calculator.holes(), true);
+    if (calculator.max_edge_length() > 0.0) {
+        probe.set_max_edge_length(calculator.max_edge_length());
+    }
+    probe.set_design_plane(PlaneDesign{x0, y0, h_init, slope_x, slope_y});
+    probe.build_tin();
+
+    double h_bal = h_init;
+    if (std::abs(factors.compact - 1.0) < 1e-12) {
+        auto ref = probe.calculate_volumes();
+        if (ref.computed_area <= 0.0) {
+            throw std::runtime_error("计算范围内有效面积为 0，无法求解平衡斜面");
+        }
+        h_bal = h_init + ref.net_volume / ref.computed_area;
+    } else {
+        auto gap = [&](double h) {
+            probe.set_design_plane(PlaneDesign{x0, y0, h, slope_x, slope_y});
+            auto r = probe.calculate_volumes();
+            if (r.computed_area <= 0.0) {
+                throw std::runtime_error("计算范围内有效面积为 0，无法求解平衡斜面");
+            }
+            return r.total_cut - r.total_fill / factors.compact;
+        };
+        double lo = res_min - 2.0, hi = res_max + 2.0;
+        double glo = gap(lo), ghi = gap(hi);
+        if (glo < 0.0 || ghi > 0.0) {
+            throw std::runtime_error("无法在当前坡度下求得挖填平衡基准高程");
+        }
+        for (int iter = 0; iter < 80 && (hi - lo) > 1e-10; ++iter) {
+            double mid = 0.5 * (lo + hi);
+            double gmid = gap(mid);
+            if (std::abs(gmid) < 1e-9) {
+                lo = hi = mid;
+                break;
+            }
+            if (gmid > 0.0) lo = mid;
+            else hi = mid;
+        }
+        h_bal = 0.5 * (lo + hi);
+    }
+
+    PlaneDesign final_plane{x0, y0, h_bal, slope_x, slope_y};
+    probe.set_design_plane(final_plane);
+    auto final_res = probe.calculate_volumes();
+
+    return PlaneBalanceResult{
+        final_plane,
+        final_res.total_cut,
+        final_res.total_fill,
+        final_res.net_volume,
+        final_res.computed_area
+    };
+}
+
+PlaneBalanceResult solve_best_fit_plane(
+    const TINEarthworkCalculator& calculator,
+    const SoilFactors& factors) {
+
+    if (calculator.is_compare()) {
+        throw std::runtime_error("两期对比模式不支持求解最小二乘最优斜面");
+    }
+    if (calculator.points().size() < 3) {
+        throw std::runtime_error("至少需要 3 个测量点才能求解最优斜面");
+    }
+
+    // 先构建计算域 TIN，在每个有效三角形上用三边中点 3 点二阶高斯积分求精确面积加权最小二乘平面
+    TINEarthworkCalculator probe(0.0);
+    std::vector<SurveyPoint> clean;
+    clean.reserve(calculator.points().size());
+    for (const auto& p : calculator.points()) {
+        clean.push_back(SurveyPoint{p.id, p.x, p.y, p.z, 0.0, 0.0, false});
+    }
+    probe.add_points(clean);
+    probe.set_breaklines(calculator.breaklines());
+    probe.set_boundary(calculator.boundary());
+    probe.set_holes(calculator.holes(), true);
+    if (calculator.max_edge_length() > 0.0) {
+        probe.set_max_edge_length(calculator.max_edge_length());
+    }
+    auto res = probe.run_full_calculation();
+    if (res.computed_area <= 0.0) {
+        throw std::runtime_error("计算范围内有效面积为 0，无法求解最优斜面");
+    }
+
+    // 先求面积重心 (x0, y0)
+    double sum_a = 0.0, sum_ax = 0.0, sum_ay = 0.0;
+    for (const auto& t : res.triangles) {
+        if (t.is_boundary || t.area <= 0.0) continue;
+        double cx = (t.p0.x + t.p1.x + t.p2.x) / 3.0;
+        double cy = (t.p0.y + t.p1.y + t.p2.y) / 3.0;
+        sum_a += t.area;
+        sum_ax += t.area * cx;
+        sum_ay += t.area * cy;
+    }
+    double x0 = sum_ax / sum_a;
+    double y0 = sum_ay / sum_a;
+
+    // 3x3 法方程 (以重心平移消除大坐标条件数退化)
+    double M[3][3] = {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}};
+    double rhs[3] = {0, 0, 0};
+    for (const auto& t : res.triangles) {
+        if (t.is_boundary || t.area <= 0.0) continue;
+        double w = t.area / 3.0;
+        const double mx[3] = {
+            0.5 * (t.p0.x + t.p1.x) - x0,
+            0.5 * (t.p1.x + t.p2.x) - x0,
+            0.5 * (t.p2.x + t.p0.x) - x0
+        };
+        const double my[3] = {
+            0.5 * (t.p0.y + t.p1.y) - y0,
+            0.5 * (t.p1.y + t.p2.y) - y0,
+            0.5 * (t.p2.y + t.p0.y) - y0
+        };
+        const double mz[3] = {
+            0.5 * (t.p0.z + t.p1.z),
+            0.5 * (t.p1.z + t.p2.z),
+            0.5 * (t.p2.z + t.p0.z)
+        };
+        for (int k = 0; k < 3; ++k) {
+            double phi[3] = {1.0, mx[k], my[k]};
+            for (int r = 0; r < 3; ++r) {
+                rhs[r] += w * phi[r] * mz[k];
+                for (int c = 0; c < 3; ++c) {
+                    M[r][c] += w * phi[r] * phi[c];
+                }
+            }
+        }
+    }
+
+    // 列主元高斯消元求解 3x3 线性方程
+    double A[3][4];
+    for (int r = 0; r < 3; ++r) {
+        for (int c = 0; c < 3; ++c) A[r][c] = M[r][c];
+        A[r][3] = rhs[r];
+    }
+    for (int col = 0; col < 3; ++col) {
+        int piv = col;
+        for (int r = col + 1; r < 3; ++r) {
+            if (std::abs(A[r][col]) > std::abs(A[piv][col])) piv = r;
+        }
+        if (std::abs(A[piv][col]) < 1e-18) {
+            // 退化共线测区，回退平场平衡
+            return solve_balance_plane(calculator, x0, y0, 0.0, 0.0, factors);
+        }
+        if (piv != col) {
+            for (int c = col; c < 4; ++c) std::swap(A[col][c], A[piv][c]);
+        }
+        for (int r = col + 1; r < 3; ++r) {
+            double f = A[r][col] / A[col][col];
+            for (int c = col; c < 4; ++c) A[r][c] -= f * A[col][c];
+        }
+    }
+    double sol[3] = {0, 0, 0};
+    for (int r = 2; r >= 0; --r) {
+        double s = A[r][3];
+        for (int c = r + 1; c < 3; ++c) s -= A[r][c] * sol[c];
+        sol[r] = s / A[r][r];
+    }
+
+    double slope_x_pct = sol[1] * 100.0;
+    double slope_y_pct = sol[2] * 100.0;
+    return solve_balance_plane(calculator, x0, y0, slope_x_pct, slope_y_pct, factors);
+}
+
+SectionMethodResult run_sections(
+    TINEarthworkCalculator& calculator,
+    double spacing,
+    double azimuth_deg,
+    int samples_per_section) {
+
+    if (!std::isfinite(spacing) || spacing <= 0.0) {
+        throw std::runtime_error("断面间距必须大于 0");
+    }
+    if (!calculator.has_tin()) {
+        calculator.build_tin();
+    }
+
+    auto region = calculator.boundary().size() >= 3
+                      ? normalize_ring(calculator.boundary())
+                      : calculator.coverage_polygon();
+    if (region.size() < 3) {
+        throw std::runtime_error("无法确定有效测区范围，无法切分平行断面");
+    }
+
+    constexpr double kPi = 3.14159265358979323846;
+    double rad = azimuth_deg * kPi / 180.0;
+    double ux = std::cos(rad), uy = std::sin(rad);   // 推进方向（里程轴）
+    double vx = -uy, vy = ux;                        // 断面横向轴
+
+    double s_min = 1e30, s_max = -1e30;
+    double t_min = 1e30, t_max = -1e30;
+    for (const auto& p : region) {
+        double s = p.x * ux + p.y * uy;
+        double t = p.x * vx + p.y * vy;
+        s_min = std::min(s_min, s);
+        s_max = std::max(s_max, s);
+        t_min = std::min(t_min, t);
+        t_max = std::max(t_max, t);
+    }
+
+    double span_s = s_max - s_min;
+    double span_t = t_max - t_min;
+    if (span_s <= 1e-6 || span_t <= 1e-6) {
+        throw std::runtime_error("测区尺寸退化，无法生成有效横断面");
+    }
+
+    // 构造桩号序列：起点、按 spacing 递增、终点
+    std::vector<double> offsets;
+    int max_steps = static_cast<int>(std::floor(span_s / spacing));
+    if (max_steps > 500) {
+        throw std::runtime_error("断面数量超过 500 条，请增大断面间距");
+    }
+    for (int k = 0; k <= max_steps; ++k) {
+        offsets.push_back(k * spacing);
+    }
+    if (offsets.empty() || (span_s - offsets.back()) > 1e-3) {
+        offsets.push_back(span_s);
+    }
+
+    auto fmt_station = [](double off) {
+        int km = static_cast<int>(std::floor(off / 1000.0));
+        double rem = off - km * 1000.0;
+        std::ostringstream oss;
+        oss << "K" << km << "+" << std::setw(3) << std::setfill('0')
+            << static_cast<int>(std::floor(rem + 1e-6));
+        double frac = rem - std::floor(rem + 1e-6);
+        if (std::abs(frac) > 0.05) {
+            oss << "." << static_cast<int>(std::llround(frac * 10.0));
+        }
+        return oss.str();
+    };
+
+    SectionMethodResult res;
+    res.spacing = spacing;
+    res.azimuth_deg = azimuth_deg;
+    res.total_length = span_s;
+
+    double shrink_t = std::min(1e-5, span_t * 1e-5);
+    for (double off : offsets) {
+        double s = s_min + off;
+        // 避免首尾刚好落在凸包边外 1e-9 浮点误差处，向内微缩 1e-5
+        if (off <= 1e-9) s += std::min(1e-5, span_s * 1e-5);
+        else if (std::abs(off - span_s) <= 1e-9) s -= std::min(1e-5, span_s * 1e-5);
+
+        XY p_start{s * ux + (t_min + shrink_t) * vx, s * uy + (t_min + shrink_t) * vy};
+        XY p_end{s * ux + (t_max - shrink_t) * vx, s * uy + (t_max - shrink_t) * vy};
+
+        ProfileResult prof = sample_profile(calculator, p_start, p_end, samples_per_section);
+        double valid_w = 0.0;
+        for (size_t i = 0; i + 1 < prof.delta_z.size(); ++i) {
+            if (std::isfinite(prof.delta_z[i]) && std::isfinite(prof.delta_z[i + 1])) {
+                valid_w += (prof.distances[i + 1] - prof.distances[i]);
+            }
+        }
+
+        SectionStation st;
+        st.name = fmt_station(off);
+        st.offset = off;
+        st.start = p_start;
+        st.end = p_end;
+        st.cut_area = prof.cut_area;
+        st.fill_area = prof.fill_area;
+        st.valid_width = valid_w;
+        st.max_cut = prof.max_cut_depth;
+        st.max_fill = prof.max_fill_depth;
+        st.profile = std::move(prof);
+        res.stations.push_back(std::move(st));
+    }
+
+    // 平均断面法累加各段土方工程量
+    for (size_t i = 1; i < res.stations.size(); ++i) {
+        double ds = res.stations[i].offset - res.stations[i - 1].offset;
+        double vc = 0.5 * (res.stations[i - 1].cut_area + res.stations[i].cut_area) * ds;
+        double vf = 0.5 * (res.stations[i - 1].fill_area + res.stations[i].fill_area) * ds;
+        res.stations[i].seg_cut_vol = vc;
+        res.stations[i].seg_fill_vol = vf;
+        res.total_cut += vc;
+        res.total_fill += vf;
+    }
+    return res;
 }
 
 } // namespace tin

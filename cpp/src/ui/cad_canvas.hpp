@@ -28,6 +28,7 @@ struct LayerVisibility {
     bool holes = true;
     bool breaklines = true;
     bool profile = true;
+    bool sections = true;
 };
 
 struct CadCanvasCallbacks {

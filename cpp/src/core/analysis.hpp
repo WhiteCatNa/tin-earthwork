@@ -11,6 +11,24 @@ BalanceResult solve_balance_elevation(
     const TINEarthworkCalculator& calculator,
     const SoilFactors& factors = SoilFactors{});
 
+// 保持指定 X/Y 排水坡度，求解挖填平衡斜面基准高程 H0
+PlaneBalanceResult solve_balance_plane(
+    const TINEarthworkCalculator& calculator,
+    double x0, double y0, double slope_x, double slope_y,
+    const SoilFactors& factors = SoilFactors{});
+
+// 面积加权最小二乘最优斜面（最小化总挖填量，并自动调平至挖填平衡）
+PlaneBalanceResult solve_best_fit_plane(
+    const TINEarthworkCalculator& calculator,
+    const SoilFactors& factors = SoilFactors{});
+
+// 平行横断面法批量土方计算（平均断面法，支持任意推进方位角）
+SectionMethodResult run_sections(
+    TINEarthworkCalculator& calculator,
+    double spacing = 20.0,
+    double azimuth_deg = 0.0,
+    int samples_per_section = 180);
+
 // 方格网自动建议边长（控制格数 <= 2500）
 double suggest_grid_spacing(double width, double height);
 

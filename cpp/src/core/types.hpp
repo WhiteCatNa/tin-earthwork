@@ -174,6 +174,40 @@ struct ProfileResult {
     bool is_compare = false;
 };
 
+struct PlaneBalanceResult {
+    PlaneDesign plane;
+    double cut_volume = 0.0;
+    double fill_volume = 0.0;
+    double net_volume = 0.0;
+    double computed_area = 0.0;
+};
+
+struct SectionStation {
+    std::string name;     // 桩号，如 K0+000, K0+020
+    double offset = 0.0;  // 沿推进方向里程 (m)
+    XY start;
+    XY end;
+    double cut_area = 0.0;
+    double fill_area = 0.0;
+    double valid_width = 0.0;
+    double max_cut = 0.0;
+    double max_fill = 0.0;
+    double seg_cut_vol = 0.0;  // 与上一断面间的平均断面挖方 (m³)
+    double seg_fill_vol = 0.0; // 与上一断面间的平均断面填方 (m³)
+    ProfileResult profile;
+};
+
+struct SectionMethodResult {
+    double spacing = 20.0;
+    double azimuth_deg = 0.0;
+    std::vector<SectionStation> stations;
+    double total_cut = 0.0;
+    double total_fill = 0.0;
+    double total_length = 0.0;
+
+    double net_volume() const { return total_cut - total_fill; }
+};
+
 struct ValidationIssues {
     std::vector<std::string> missing_values;
     std::vector<std::string> duplicate_coords;
@@ -233,6 +267,7 @@ struct CalculationResult {
     std::vector<std::string> warnings;
     std::optional<GridCheckResult> grid_check;
     std::optional<ContourSet> contours;
+    std::optional<SectionMethodResult> sections;
     SoilBalance soil_balance;
 
     bool uniform_design() const { return std::abs(design_max - design_min) < 1e-9; }
