@@ -1,0 +1,142 @@
+#pragma once
+
+#include "core/analysis.hpp"
+#include "core/calculator.hpp"
+#include "core/types.hpp"
+#include "ui/cad_canvas.hpp"
+#include "ui/theme.hpp"
+
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+
+#include <optional>
+#include <string>
+#include <vector>
+
+namespace tin::ui {
+
+// 南方CASS 10/11 风格全功能 TIN 土方算量桌面工作站主控类
+class CassApp {
+public:
+    CassApp(HWND hwnd, const ThemeFonts& fonts);
+
+    // 每帧渲染（覆盖全窗口工作区：菜单栏 + 工具栏 + 左侧屏幕菜单 + 中央CAD视口 + 右侧属性页 + 命令行 + 状态栏）
+    void render();
+
+    // 数据与工程控制（同时供交互界面与 --demo / CLI 自动化调用）
+    bool load_points_from_path(const std::string& utf8_path);
+    bool load_compare_from_path(const std::string& utf8_path);
+    bool load_project_from_path(const std::string& utf8_path);
+    bool save_project_to_path(const std::string& utf8_path);
+
+    void generate_rect_boundary(double margin = 0.0);
+    void generate_auto_outline();
+    void clear_boundary();
+    void enable_grid_check(bool enabled, double spacing = 15.0);
+    void enable_contours(bool enabled, double interval = 0.0);
+    void set_design_elevation(double elev);
+
+    bool run_calculation();
+    bool solve_balance_h0();
+    bool generate_quick_profile(bool horizontal = true);
+
+    void set_inspector_tab(int idx);
+    void set_dark_mode(bool dark);
+    void set_selected_triangle(int tri_id);
+    int first_mixed_triangle_id() const;
+    void zoom_extents();
+
+    const CalculationResult* result() const { return result_ ? &(*result_) : nullptr; }
+    const ProjectData& project() const { return project_; }
+    double min_z() const { return min_nat_z_; }
+    double max_z() const { return max_nat_z_; }
+    double avg_z() const { return avg_nat_z_; }
+
+    // CAD 控制台输出
+    void log_cmd(const std::string& line);
+    void execute_command(const std::string& raw_cmd);
+
+private:
+    void render_menu_bar();
+    void render_quick_toolbar();
+    void render_left_screen_menu(float width, float height);
+    void render_center_viewport(float width, float height);
+    void render_kpi_strip();
+    void render_layer_strip();
+    void render_right_inspector(float width, float height);
+    void render_tab_params();
+    void render_tab_points();
+    void render_tab_summary();
+    void render_tab_profile();
+    void render_tab_boundary();
+    void render_command_console(float height);
+    void render_status_bar(float height);
+    void render_modals();
+
+    void configure_calculator(TINEarthworkCalculator& calc) const;
+    void update_point_stats();
+    void sync_project_name_buffer();
+    void handle_draft_committed(const std::vector<XY>& pts, CadToolMode tool);
+    void handle_profile_picked(const XY& a, const XY& b);
+
+    // 原生 Windows UTF-16 文件对话框
+    std::optional<std::string> open_file_dialog(const wchar_t* title, const wchar_t* filter) const;
+    std::optional<std::string> save_file_dialog(const wchar_t* title, const wchar_t* filter,
+                                                const wchar_t* default_ext,
+                                                const std::string& default_name) const;
+
+    // 交互文件动作
+    void action_open_project();
+    void action_save_project(bool save_as = false);
+    void action_import_points();
+    void action_import_compare();
+    void action_import_boundary();
+    void action_import_breaklines_dxf();
+    void action_export_summary_csv();
+    void action_export_detail_csv();
+    void action_export_report_txt();
+    void action_export_dxf();
+    void action_export_cass_dat();
+
+    HWND hwnd_ = nullptr;
+    ThemeFonts fonts_;
+
+    ProjectData project_;
+    ValidationIssues issues_;
+    std::optional<CalculationResult> result_;
+    std::optional<ProfileResult> profile_result_;
+    std::optional<Segment> profile_line_;
+    std::optional<BalanceResult> last_balance_;
+    std::optional<std::string> current_project_path_;
+
+    CadCanvas canvas_;
+    int selected_tri_id_ = -1;
+    int pending_tab_ = -1;
+    bool show_screen_menu_ = true;
+    bool show_kpi_strip_ = true;
+    bool show_about_modal_ = false;
+    bool show_help_modal_ = false;
+    bool focus_cmd_input_ = false;
+
+    double min_nat_z_ = 0.0;
+    double max_nat_z_ = 0.0;
+    double avg_nat_z_ = 0.0;
+    double min_x_ = 0.0;
+    double max_x_ = 0.0;
+    double min_y_ = 0.0;
+    double max_y_ = 0.0;
+
+    std::string status_text_;
+    std::vector<std::string> console_lines_;
+    std::vector<std::string> cmd_history_;
+    int history_pos_ = -1;
+    char cmd_buf_[512]{};
+    char proj_name_buf_[256]{};
+    char point_filter_buf_[64]{};
+    int tri_filter_mode_ = 0; // 0=全部 1=挖方 2=填方 3=挖填混合 4=边界裁剪
+    int compare_invert_ = 0;
+};
+
+} // namespace tin::ui

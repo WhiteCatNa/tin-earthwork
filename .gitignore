@@ -27,3 +27,6 @@ dist/
 .idea/
 .vscode/
 *.swp
+
+# C++ 构建目录
+cpp/build/
