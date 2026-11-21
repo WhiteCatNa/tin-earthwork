@@ -215,7 +215,9 @@ void CadCanvas::render(const ProjectData& project,
                        const CalculationResult* result,
                        const std::optional<Segment>& profile_line,
                        int& selected_tri_id,
-                       const CadCanvasCallbacks& callbacks) {
+                       const CadCanvasCallbacks& callbacks,
+                       const HaulPlanResult* haul,
+                       const SlopeGradingResult* slope) {
 
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
     ImGui::BeginChild("CadViewportHost", ImVec2(-1, -1), true,
@@ -614,12 +616,64 @@ void CadCanvas::render(const ProjectData& project,
 
     // 10a. 平行断面法桩号线
     if (result && layers.sections && result->sections.has_value()) {
-        ImU32 sec_col = dark_mode ? col32(0xC0, 0x84, 0xFC, 185) : col32(0x7E, 0x22, 0xCE, 195);
+        ImU32 sec_col = dark_mode ? col32(0xC0, 0x84, 0xFC, 195) : col32(0x7E, 0x22, 0xCE, 200);
+        ImU32 badge_bg = dark_mode ? col32(0x0E, 0x13, 0x1C, 215) : col32(0xFF, 0xFF, 0xFF, 225);
         for (const auto& st : result->sections->stations) {
             ImVec2 sa = world_to_screen(st.start.x, st.start.y, view_origin, view_size);
             ImVec2 sb = world_to_screen(st.end.x, st.end.y, view_origin, view_size);
             draw_dashed_line(dl, sa, sb, sec_col, 1.3f, 6.0f, 4.0f);
-            dl->AddText(ImVec2(sa.x + 3.0f, sa.y - 14.0f), sec_col, st.name.c_str());
+            ImVec2 tsz = ImGui::CalcTextSize(st.name.c_str());
+            ImVec2 tp(sa.x - tsz.x * 0.5f, sa.y + 6.0f);
+            dl->AddRectFilled(ImVec2(tp.x - 3.0f, tp.y - 1.0f), ImVec2(tp.x + tsz.x + 3.0f, tp.y + tsz.y + 1.0f), badge_bg, 2.0f);
+            dl->AddText(tp, sec_col, st.name.c_str());
+        }
+    }
+
+    // 10b. 场地放坡坡脚/坡顶线与 CASS 示坡线
+    if (layers.slope && slope && slope->daylight_ring.size() >= 3) {
+        ImU32 sl_col = dark_mode ? col32(0x4A, 0xDE, 0x80, 225) : col32(0x15, 0x80, 0x3D, 230);
+        for (size_t i = 0; i < slope->daylight_ring.size(); ++i) {
+            const auto& a_w = slope->daylight_ring[i];
+            const auto& b_w = slope->daylight_ring[(i + 1) % slope->daylight_ring.size()];
+            dl->AddLine(world_to_screen(a_w.x, a_w.y, view_origin, view_size),
+                        world_to_screen(b_w.x, b_w.y, view_origin, view_size), sl_col, 2.0f);
+        }
+        for (const auto& tk : slope->slope_ticks) {
+            dl->AddLine(world_to_screen(tk.first.x, tk.first.y, view_origin, view_size),
+                        world_to_screen(tk.second.x, tk.second.y, view_origin, view_size), sl_col, 1.2f);
+        }
+    }
+
+    // 10c. 土方调配流向箭头与方量注记
+    if (layers.haul && haul && !haul->flows.empty()) {
+        ImU32 arr_col = dark_mode ? col32(0xFB, 0xBF, 0x24, 235) : col32(0xD9, 0x77, 0x06, 235);
+        ImU32 tag_bg = dark_mode ? col32(0x12, 0x17, 0x20, 225) : col32(0xFF, 0xFB, 0xEB, 235);
+        double max_vol = haul->flows.front().volume;
+        size_t draw_cnt = std::min<size_t>(haul->flows.size(), 16);
+        for (size_t i = 0; i < draw_cnt; ++i) {
+            const auto& fl = haul->flows[i];
+            ImVec2 p0 = world_to_screen(fl.from_xy.x, fl.from_xy.y, view_origin, view_size);
+            ImVec2 p1 = world_to_screen(fl.to_xy.x, fl.to_xy.y, view_origin, view_size);
+            float dx = p1.x - p0.x, dy = p1.y - p0.y;
+            float len = std::hypot(dx, dy);
+            if (len < 12.0f) continue;
+            float thick = 1.8f + 2.6f * static_cast<float>(fl.volume / std::max(max_vol, 1.0));
+            dl->AddLine(p0, p1, arr_col, thick);
+            dl->AddCircleFilled(p0, 4.0f, col32(0xF8, 0x71, 0x71, 240));
+            float ux = dx / len, uy = dy / len;
+            ImVec2 tip = p1;
+            ImVec2 left{tip.x - ux * 11.0f - uy * 5.0f, tip.y - uy * 11.0f + ux * 5.0f};
+            ImVec2 right{tip.x - ux * 11.0f + uy * 5.0f, tip.y - uy * 11.0f - ux * 5.0f};
+            dl->AddTriangleFilled(tip, left, right, arr_col);
+            if (i < 8) {
+                char buf[48];
+                std::snprintf(buf, sizeof(buf), "%.0fm³/%.0fm", fl.volume, fl.distance);
+                ImVec2 ts = ImGui::CalcTextSize(buf);
+                ImVec2 mid{0.5f * (p0.x + p1.x) - ts.x * 0.5f, 0.5f * (p0.y + p1.y) - ts.y * 0.5f};
+                dl->AddRectFilled(ImVec2(mid.x - 3, mid.y - 1), ImVec2(mid.x + ts.x + 3, mid.y + ts.y + 1), tag_bg, 2.0f);
+                dl->AddRect(ImVec2(mid.x - 3, mid.y - 1), ImVec2(mid.x + ts.x + 3, mid.y + ts.y + 1), arr_col, 2.0f);
+                dl->AddText(mid, arr_col, buf);
+            }
         }
     }
 

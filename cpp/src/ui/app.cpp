@@ -617,6 +617,98 @@ bool CassApp::run_sections_action(double spacing, double azimuth_deg) {
     }
 }
 
+bool CassApp::compute_strata_action() {
+    if (!result_) {
+        if (!run_calculation()) return false;
+    }
+    std::vector<double> bounds;
+    std::string raw(strata_bounds_buf_);
+    for (char& ch : raw) {
+        if (ch == ',' || ch == ';' || ch == ' ') ch = ' ';
+    }
+    std::istringstream iss(raw);
+    double v = 0.0;
+    while (iss >> v) bounds.push_back(v);
+    if (bounds.empty()) {
+        bounds = (strata_mode_idx_ == 1) ? std::vector<double>{0.2, 0.4}
+                                         : std::vector<double>{avg_nat_z_};
+    }
+    try {
+        StrataMode mode = (strata_mode_idx_ == 0) ? StrataMode::ByElevation : StrataMode::ByDepth;
+        strata_result_ = compute_strata_volumes(*result_, mode, bounds);
+        std::ostringstream oss;
+        oss << "分层土方统计完成（" << strata_result_->layers.size() << " 层，总挖 "
+            << format_num(strata_result_->total_cut, 2) << " m³ / 总填 "
+            << format_num(strata_result_->total_fill, 2) << " m³）";
+        status_text_ = oss.str();
+        log_cmd("命令: _STRATA -> " + oss.str());
+        return true;
+    } catch (const std::exception& e) {
+        status_text_ = std::string("分层土方计算失败: ") + e.what();
+        log_cmd("错误: " + status_text_);
+        return false;
+    }
+}
+
+bool CassApp::compute_haul_action() {
+    if (!result_) {
+        if (!run_calculation()) return false;
+    }
+    try {
+        haul_result_ = compute_haul_plan(*result_, haul_cols_, haul_rows_);
+        canvas_.layers.haul = true;
+        std::ostringstream oss;
+        oss << "土方调配优化完成（" << haul_result_->zones.size() << " 区，"
+            << haul_result_->flows.size() << " 条流向）：场内调配 "
+            << format_num(haul_result_->cross_zone_hauled, 1) << " m³，平均运距 "
+            << format_num(haul_result_->avg_haul_distance, 1) << " m，估算造价 "
+            << format_num(haul_result_->estimated_cost / 10000.0, 2) << " 万元";
+        status_text_ = oss.str();
+        log_cmd("命令: _HAUL -> " + oss.str());
+        return true;
+    } catch (const std::exception& e) {
+        status_text_ = std::string("土方调配计算失败: ") + e.what();
+        log_cmd("错误: " + status_text_);
+        return false;
+    }
+}
+
+bool CassApp::compute_slope_action() {
+    if (project_.points.size() < 3) {
+        status_text_ = "测点不足，无法进行场地放坡设计";
+        return false;
+    }
+    try {
+        if (!result_) {
+            if (!run_calculation()) return false;
+        }
+        TINEarthworkCalculator calc(project_.settings.design_elevation);
+        configure_calculator(calc);
+        calc.build_tin();
+        slope_result_ = compute_slope_grading(calc, slope_cut_ratio_, slope_fill_ratio_, 4.0);
+        canvas_.layers.slope = true;
+        std::ostringstream oss;
+        oss << "场地周边放坡完成（挖 1:" << format_num(slope_cut_ratio_, 1)
+            << " / 填 1:" << format_num(slope_fill_ratio_, 1)
+            << "）：边坡挖方 " << format_num(slope_result_->slope_cut_volume, 1)
+            << " m³，填方 " << format_num(slope_result_->slope_fill_volume, 1)
+            << " m³，最大坡宽 " << format_num(slope_result_->max_slope_width, 2) << " m";
+        status_text_ = oss.str();
+        log_cmd("命令: _SLOPE -> " + oss.str());
+        return true;
+    } catch (const std::exception& e) {
+        status_text_ = std::string("场地放坡计算失败: ") + e.what();
+        log_cmd("错误: " + status_text_);
+        return false;
+    }
+}
+
+void CassApp::set_3d_view(bool enabled) {
+    show_3d_view_ = enabled;
+    viewport_3d_.dark_mode = canvas_.dark_mode;
+    status_text_ = enabled ? "已切换至 3D 实景地形与设计面透视视口" : "已返回 2D CAD 平面视口";
+}
+
 bool CassApp::generate_quick_profile(bool horizontal) {
     if (project_.points.size() < 3) {
         status_text_ = "测点不足，无法生成纵断面";
@@ -719,11 +811,12 @@ void CassApp::handle_draft_committed(const std::vector<XY>& pts, CadToolMode too
 }
 
 void CassApp::set_inspector_tab(int idx) {
-    pending_tab_ = std::clamp(idx, 0, 4);
+    pending_tab_ = std::clamp(idx, 0, 5);
 }
 
 void CassApp::set_dark_mode(bool dark) {
     canvas_.dark_mode = dark;
+    viewport_3d_.dark_mode = dark;
     status_text_ = dark ? "已切换至 CAD 深色模型空间 (#0B0E14)" : "已切换至 CAD 白底出图布局 (#F8FAFC)";
 }
 
@@ -778,6 +871,19 @@ void CassApp::execute_command(const std::string& raw_cmd) {
     } else if (up == "SECTIONS" || up == "_SECTIONS") {
         run_sections_action(section_spacing_, section_azimuth_);
         set_inspector_tab(3);
+    } else if (up == "STRATA" || up == "_STRATA") {
+        compute_strata_action();
+        set_inspector_tab(5);
+    } else if (up == "HAUL" || up == "_HAUL") {
+        compute_haul_action();
+        set_inspector_tab(5);
+    } else if (up == "SLOPE" || up == "_SLOPE") {
+        compute_slope_action();
+        set_inspector_tab(5);
+    } else if (up == "3D") {
+        set_3d_view(true);
+    } else if (up == "2D") {
+        set_3d_view(false);
     } else if (up == "GRID" || up == "_GRID") {
         enable_grid_check(!project_.settings.grid_enabled, project_.settings.grid_spacing);
         run_calculation();
@@ -1266,6 +1372,16 @@ void CassApp::render_quick_toolbar() {
     ImGui::SameLine();
     if (ImGui::Button("ZE全图")) zoom_extents();
     ImGui::SameLine();
+    if (show_3d_view_) {
+        if (colored_button("2D平面", rgba(0x23, 0x5C, 0x9F), rgba(0x2E, 0x73, 0xC4), rgba(0x1C, 0x4B, 0x82))) {
+            set_3d_view(false);
+        }
+    } else {
+        if (colored_button("3D地形", rgba(0x4C, 0x2F, 0x7A), rgba(0x63, 0x3E, 0x9E), rgba(0x3B, 0x24, 0x60))) {
+            set_3d_view(true);
+        }
+    }
+    ImGui::SameLine();
     if (ImGui::Button(canvas_.dark_mode ? "白底布局" : "黑底模型")) {
         set_dark_mode(!canvas_.dark_mode);
     }
@@ -1454,6 +1570,8 @@ void CassApp::render_layer_strip() {
     ImGui::SameLine(); ImGui::Checkbox("特征线", &canvas_.layers.breaklines);
     ImGui::SameLine(); ImGui::Checkbox("断面", &canvas_.layers.profile);
     ImGui::SameLine(); ImGui::Checkbox("断面网", &canvas_.layers.sections);
+    ImGui::SameLine(); ImGui::Checkbox("调配", &canvas_.layers.haul);
+    ImGui::SameLine(); ImGui::Checkbox("放坡", &canvas_.layers.slope);
     ImGui::SameLine(); ImGui::Checkbox("捕捉", &canvas_.osnap_enabled);
 
     ImGui::EndChild();
@@ -1492,7 +1610,14 @@ void CassApp::render_center_viewport(float width, float height) {
     };
 
     const CalculationResult* res_ptr = result_ ? &(*result_) : nullptr;
-    canvas_.render(project_, res_ptr, profile_line_, selected_tri_id_, callbacks);
+    if (show_3d_view_) {
+        viewport_3d_.dark_mode = canvas_.dark_mode;
+        viewport_3d_.render(project_, res_ptr);
+    } else {
+        const HaulPlanResult* haul_ptr = haul_result_ ? &(*haul_result_) : nullptr;
+        const SlopeGradingResult* slope_ptr = slope_result_ ? &(*slope_result_) : nullptr;
+        canvas_.render(project_, res_ptr, profile_line_, selected_tri_id_, callbacks, haul_ptr, slope_ptr);
+    }
 
     ImGui::EndChild();
 }
@@ -1506,24 +1631,28 @@ void CassApp::render_right_inspector(float width, float height) {
             return (pending_tab_ == idx) ? ImGuiTabItemFlags_SetSelected : ImGuiTabItemFlags_None;
         };
 
-        if (ImGui::BeginTabItem("算量参数", nullptr, tab_flags(0))) {
+        if (ImGui::BeginTabItem("参数", nullptr, tab_flags(0))) {
             render_tab_params();
             ImGui::EndTabItem();
         }
-        if (ImGui::BeginTabItem("测点检查", nullptr, tab_flags(1))) {
+        if (ImGui::BeginTabItem("测点", nullptr, tab_flags(1))) {
             render_tab_points();
             ImGui::EndTabItem();
         }
-        if (ImGui::BeginTabItem("汇总明细", nullptr, tab_flags(2))) {
+        if (ImGui::BeginTabItem("汇总", nullptr, tab_flags(2))) {
             render_tab_summary();
             ImGui::EndTabItem();
         }
-        if (ImGui::BeginTabItem("纵断面图", nullptr, tab_flags(3))) {
+        if (ImGui::BeginTabItem("断面", nullptr, tab_flags(3))) {
             render_tab_profile();
             ImGui::EndTabItem();
         }
-        if (ImGui::BeginTabItem("边界特征", nullptr, tab_flags(4))) {
+        if (ImGui::BeginTabItem("边界", nullptr, tab_flags(4))) {
             render_tab_boundary();
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("专题", nullptr, tab_flags(5))) {
+            render_tab_engineering();
             ImGui::EndTabItem();
         }
         pending_tab_ = -1;

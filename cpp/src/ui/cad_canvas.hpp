@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/engineering.hpp"
 #include "core/types.hpp"
 #include "imgui.h"
 #include <functional>
@@ -29,6 +30,8 @@ struct LayerVisibility {
     bool breaklines = true;
     bool profile = true;
     bool sections = true;
+    bool haul = true;
+    bool slope = true;
 };
 
 struct CadCanvasCallbacks {
@@ -55,7 +58,9 @@ public:
                 const CalculationResult* result,
                 const std::optional<Segment>& profile_line,
                 int& selected_tri_id,
-                const CadCanvasCallbacks& callbacks);
+                const CadCanvasCallbacks& callbacks,
+                const HaulPlanResult* haul = nullptr,
+                const SlopeGradingResult* slope = nullptr);
 
     // 交互绘制草稿控制
     void clear_draft();

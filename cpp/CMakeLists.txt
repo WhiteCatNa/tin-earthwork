@@ -11,6 +11,7 @@ add_library(tin_earthwork_core STATIC
     src/core/delaunay.cpp
     src/core/calculator.cpp
     src/core/analysis.cpp
+    src/core/engineering.cpp
     src/io/io.cpp
     third_party/miniz/miniz.c
 )
@@ -58,6 +59,7 @@ add_executable(tin_earthwork_cass WIN32
     src/main.cpp
     src/ui/theme.cpp
     src/ui/cad_canvas.cpp
+    src/ui/viewport_3d.cpp
     src/ui/app.cpp
     ${IMGUI_SOURCES}
 )

@@ -2,9 +2,11 @@
 
 #include "core/analysis.hpp"
 #include "core/calculator.hpp"
+#include "core/engineering.hpp"
 #include "core/types.hpp"
 #include "ui/cad_canvas.hpp"
 #include "ui/theme.hpp"
+#include "ui/viewport_3d.hpp"
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -45,6 +47,10 @@ public:
     bool solve_best_fit_plane_action();
     bool solve_balance_plane_action();
     bool run_sections_action(double spacing = 20.0, double azimuth_deg = 0.0);
+    bool compute_strata_action();
+    bool compute_haul_action();
+    bool compute_slope_action();
+    void set_3d_view(bool enabled);
     bool generate_quick_profile(bool horizontal = true);
 
     void set_inspector_tab(int idx);
@@ -76,6 +82,7 @@ private:
     void render_tab_summary();
     void render_tab_profile();
     void render_tab_boundary();
+    void render_tab_engineering();
     void render_command_console(float height);
     void render_status_bar(float height);
     void render_modals();
@@ -116,9 +123,14 @@ private:
     std::optional<ProfileResult> profile_result_;
     std::optional<Segment> profile_line_;
     std::optional<BalanceResult> last_balance_;
+    std::optional<StrataResult> strata_result_;
+    std::optional<HaulPlanResult> haul_result_;
+    std::optional<SlopeGradingResult> slope_result_;
     std::optional<std::string> current_project_path_;
 
     CadCanvas canvas_;
+    Viewport3D viewport_3d_;
+    bool show_3d_view_ = false;
     int selected_tri_id_ = -1;
     int pending_tab_ = -1;
     bool show_screen_menu_ = true;
@@ -147,6 +159,13 @@ private:
     double section_spacing_ = 20.0;
     double section_azimuth_ = 0.0;
     int selected_section_idx_ = -1;
+
+    int strata_mode_idx_ = 1; // 0=标高分层 1=深度分层
+    char strata_bounds_buf_[128] = "0.2, 0.4";
+    int haul_cols_ = 4;
+    int haul_rows_ = 3;
+    double slope_cut_ratio_ = 1.0;
+    double slope_fill_ratio_ = 1.5;
 
     struct EditSnapshot {
         std::vector<XY> boundary;
