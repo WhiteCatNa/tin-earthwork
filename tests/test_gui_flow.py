@@ -4,19 +4,14 @@ import time
 import pytest
 
 from core.calculator import SurveyPoint
-import main as app_main
 
 
 @pytest.fixture
-def app(tmp_path, monkeypatch):
-    monkeypatch.setenv("TIN_EARTHWORK_RECENT", str(tmp_path / "recent.json"))
+def app(main_window, monkeypatch):
     for name in ("showinfo", "showwarning", "showerror"):
         monkeypatch.setattr(f"tkinter.messagebox.{name}", lambda *a, **k: "ok")
     monkeypatch.setattr("tkinter.messagebox.askokcancel", lambda *a, **k: True)
-    window = app_main.MainApplication()
-    window.withdraw()
-    yield window
-    window.destroy()
+    return main_window
 
 
 def _wait(app, predicate, timeout=30.0):
@@ -138,3 +133,66 @@ def test_save_project_names_project_after_file(app, tmp_path, monkeypatch):
     app._save_project()
     assert app.project_name == "五号地块"
     assert target.exists()
+
+
+def test_balance_button_sets_elevation_and_zero_net(app):
+    cf = _load(app, _square_points())
+    cf.design_elevation_var.set(10.0)
+    cf._balance_elevation()
+    _wait(app, lambda: cf.result is not None)
+    level = cf.design_elevation_value()
+    assert 14.8 < level < 15.5
+    assert abs(cf.result.net_volume) <= 0.0005 * cf.result.computed_area + 1e-9
+    assert cf.result.uniform_design and abs(cf.result.design_min - level) < 1e-12
+    _, value_label, _, _ = cf._cards["cut"]
+    assert value_label.cget("text").endswith("m³") and value_label.cget("text") != "—"
+
+
+def test_balance_is_refused_with_partition_elevations(app, monkeypatch):
+    warnings = []
+    monkeypatch.setattr("tkinter.messagebox.showwarning", lambda title, msg, **k: warnings.append(msg))
+    cf = _load(app, _square_points())
+    cf.use_partition_var.set(True)
+    cf.partition_data = {"A": 15.3}
+    cf._balance_elevation()
+    assert cf._worker_thread is None and cf.result is None
+    assert "统一设计高程" in warnings[0]
+
+
+def test_result_cards_go_stale_when_inputs_change(app):
+    cf = _load(app, _square_points())
+    cf.design_elevation_var.set(15.0)
+    cf.start_calculation()
+    _wait(app, lambda: cf.result is not None)
+    app.boundary_frame.set_boundary([(0, 0), (5, 0), (5, 5), (0, 5)])
+    app.boundary_frame._confirm_boundary()
+    assert cf.result is None
+    assert cf._cards["net"][1].cget("text") == "需重新计算"
+
+
+def test_success_feedback_goes_to_status_bar_not_popup(app, monkeypatch):
+    popups = []
+    monkeypatch.setattr("tkinter.messagebox.showinfo", lambda *a, **k: popups.append(a))
+    cf = _load(app, _square_points())
+    cf.design_elevation_var.set(15.0)
+    cf.start_calculation()
+    _wait(app, lambda: cf.result is not None)
+    assert popups == []
+    assert "计算完成" in app.status_var.get()
+
+
+def test_title_marks_unsaved_changes_and_save_clears_it(app, tmp_path):
+    assert not app.title().startswith("*")
+    _load(app, _square_points())
+    assert app.title().startswith("* ")
+    app.save_project_to(str(tmp_path / "a.tinproj.json"))
+    assert not app.title().startswith("*")
+    app.project_name = "改名后"
+    assert app.title().startswith("* 改名后")
+
+
+def test_closing_with_unsaved_changes_can_be_cancelled(app, monkeypatch):
+    _load(app, _square_points())
+    monkeypatch.setattr("tkinter.messagebox.askyesnocancel", lambda *a, **k: None)
+    app._on_closing()
+    assert not app._closing and app.winfo_exists()

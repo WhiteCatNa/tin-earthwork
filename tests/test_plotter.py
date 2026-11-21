@@ -101,6 +101,28 @@ def test_standalone_figure_does_not_leak_pyplot_figures():
     assert "试验段" in figure.axes[0].get_title()
 
 
+def test_result_legend_sits_below_axis_label_even_on_short_figure():
+    """回归：图例用固定偏移放在图下方时，图较矮会和 X 轴标题叠在一起。"""
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+
+    plotter = EarthworkPlotter(figsize=(9, 3.2))
+    FigureCanvasAgg(plotter.fig)
+    result, points = _mixed_result()
+    plotter.plot_result(result, points)
+    plotter.fig.canvas.draw()
+    renderer = plotter.fig.canvas.get_renderer()
+    legend_box = plotter._result_legend.get_window_extent(renderer)
+    label_box = plotter.ax.xaxis.label.get_window_extent(renderer)
+    assert legend_box.y1 <= label_box.y0 + 1
+    assert legend_box.y0 >= 0
+
+    # 切回测点图时图例要清掉，再画结果时不能叠出两个
+    plotter.plot_points_only(points)
+    assert plotter._result_legend is None and plotter.fig.legends == []
+    plotter.plot_result(result, points)
+    assert len(plotter.fig.legends) == 1
+
+
 def _navigable_plotter():
     from matplotlib.backends.backend_agg import FigureCanvasAgg
 
@@ -206,3 +228,54 @@ def test_double_click_resets_view():
     event = MouseEvent("button_press_event", canvas, px, py, button=MouseButton.LEFT, dblclick=True)
     canvas.callbacks.process("button_press_event", event)
     assert np.allclose(ax.get_xlim(), home_x)
+
+
+def _legend_rows(legend, renderer):
+    return len({round(text.get_window_extent(renderer).y0) for text in legend.texts})
+
+
+def test_result_legend_wraps_to_leave_room_for_corner_button():
+    """回归：Windows 字体较宽时，最窄窗口里一行图例会伸到左下角“重置视图”按钮底下。"""
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+
+    result, points = _mixed_result()
+    narrow = EarthworkPlotter(figsize=(5.1, 3), dpi=100)
+    FigureCanvasAgg(narrow.fig)
+    narrow.bind_canvas(narrow.fig.canvas, enable_hover=False)
+    narrow.legend_left_reserve = 131
+    narrow.plot_result(result, points)
+    narrow.fig.canvas.draw()
+    renderer = narrow.fig.canvas.get_renderer()
+    box = narrow._result_legend.get_window_extent(renderer)
+    assert box.x0 >= 131
+    assert box.x1 <= narrow.fig.bbox.width + 1
+    assert _legend_rows(narrow._result_legend, renderer) >= 2
+
+    wide = EarthworkPlotter(figsize=(10, 4), dpi=100)
+    FigureCanvasAgg(wide.fig)
+    wide.bind_canvas(wide.fig.canvas, enable_hover=False)
+    wide.legend_left_reserve = 131
+    wide.plot_result(result, points)
+    wide.fig.canvas.draw()
+    assert _legend_rows(wide._result_legend, wide.fig.canvas.get_renderer()) == 1
+
+
+def test_result_legend_refits_when_canvas_resizes():
+    from matplotlib.backend_bases import ResizeEvent
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+
+    result, points = _mixed_result()
+    plotter = EarthworkPlotter(figsize=(10, 4), dpi=100)
+    FigureCanvasAgg(plotter.fig)
+    plotter.bind_canvas(plotter.fig.canvas, enable_hover=False)
+    plotter.legend_left_reserve = 131
+    plotter.plot_result(result, points)
+    renderer = plotter.fig.canvas.get_renderer()
+    assert _legend_rows(plotter._result_legend, renderer) == 1
+
+    plotter.fig.set_size_inches(5.1, 3)
+    ResizeEvent("resize_event", plotter.fig.canvas)._process()
+    plotter.fig.canvas.draw()
+    renderer = plotter.fig.canvas.get_renderer()
+    assert _legend_rows(plotter._result_legend, renderer) >= 2
+    assert plotter._result_legend.get_window_extent(renderer).x0 >= 131
