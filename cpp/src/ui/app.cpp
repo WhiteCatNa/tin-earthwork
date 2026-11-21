@@ -284,12 +284,63 @@ bool CassApp::save_project_to_path(const std::string& utf8_path) {
     }
 }
 
+void CassApp::push_undo_snapshot() {
+    undo_stack_.push_back(EditSnapshot{
+        project_.boundary, project_.holes, project_.breaklines, project_.settings
+    });
+    if (undo_stack_.size() > 50) {
+        undo_stack_.erase(undo_stack_.begin());
+    }
+    redo_stack_.clear();
+}
+
+bool CassApp::undo() {
+    if (undo_stack_.empty()) {
+        status_text_ = "没有可撤销的操作";
+        return false;
+    }
+    redo_stack_.push_back(EditSnapshot{
+        project_.boundary, project_.holes, project_.breaklines, project_.settings
+    });
+    EditSnapshot prev = std::move(undo_stack_.back());
+    undo_stack_.pop_back();
+    project_.boundary = std::move(prev.boundary);
+    project_.holes = std::move(prev.holes);
+    project_.breaklines = std::move(prev.breaklines);
+    project_.settings = std::move(prev.settings);
+    status_text_ = "已撤销上一步编辑 (Ctrl+Z)";
+    log_cmd("命令: _UNDO -> " + status_text_);
+    if (result_) run_calculation();
+    return true;
+}
+
+bool CassApp::redo() {
+    if (redo_stack_.empty()) {
+        status_text_ = "没有可重做的操作";
+        return false;
+    }
+    undo_stack_.push_back(EditSnapshot{
+        project_.boundary, project_.holes, project_.breaklines, project_.settings
+    });
+    EditSnapshot next = std::move(redo_stack_.back());
+    redo_stack_.pop_back();
+    project_.boundary = std::move(next.boundary);
+    project_.holes = std::move(next.holes);
+    project_.breaklines = std::move(next.breaklines);
+    project_.settings = std::move(next.settings);
+    status_text_ = "已重做编辑 (Ctrl+Y)";
+    log_cmd("命令: _REDO -> " + status_text_);
+    if (result_) run_calculation();
+    return true;
+}
+
 void CassApp::generate_rect_boundary(double margin) {
     if (project_.points.size() < 3) {
         status_text_ = "测点不足 3 个，无法生成外接矩形边界";
         log_cmd("提示: " + status_text_);
         return;
     }
+    push_undo_snapshot();
     update_point_stats();
     project_.boundary = {
         {min_x_ - margin, min_y_ - margin},
@@ -299,7 +350,7 @@ void CassApp::generate_rect_boundary(double margin) {
     };
     double area = std::abs(signed_area(project_.boundary));
     std::ostringstream oss;
-    oss << "已生成外接矩形计算边界（面积 " << format_num(area, 2) << " m2）";
+    oss << "已生成外接矩形计算边界（面积 " << format_num(area, 2) << " m²）";
     status_text_ = oss.str();
     log_cmd("命令: _AUTOB -> " + oss.str());
 }
@@ -320,12 +371,13 @@ void CassApp::generate_auto_outline() {
             log_cmd("警告: " + status_text_);
             return;
         }
+        push_undo_snapshot();
         project_.boundary = std::move(ring);
         double area = std::abs(signed_area(project_.boundary));
         std::ostringstream oss;
         oss << "已自动提取凹轮廓边界：" << project_.boundary.size()
             << " 顶点（阈值边长 " << format_num(used_edge, 2)
-            << " m，面积 " << format_num(area, 2) << " m2）";
+            << " m，面积 " << format_num(area, 2) << " m²）";
         status_text_ = oss.str();
         log_cmd("命令: _OUTLINE -> " + oss.str());
     } catch (const std::exception& e) {
@@ -335,6 +387,7 @@ void CassApp::generate_auto_outline() {
 }
 
 void CassApp::clear_boundary() {
+    if (!project_.boundary.empty()) push_undo_snapshot();
     project_.boundary.clear();
     status_text_ = "已清除计算边界（将按全部测点凸包统计）";
     log_cmd("命令: _CLRBND -> 已清除计算边界");
@@ -524,6 +577,7 @@ void CassApp::handle_draft_committed(const std::vector<XY>& pts, CadToolMode too
             status_text_ = "边界至少需要 3 个顶点";
             return;
         }
+        push_undo_snapshot();
         project_.boundary = normalize_ring(pts);
         status_text_ = "已设置手绘计算边界（" + std::to_string(project_.boundary.size()) + " 顶点）";
         log_cmd("命令: _DRAWBND -> " + status_text_);
@@ -532,6 +586,7 @@ void CassApp::handle_draft_committed(const std::vector<XY>& pts, CadToolMode too
             status_text_ = "挖空区至少需要 3 个顶点";
             return;
         }
+        push_undo_snapshot();
         project_.holes.push_back(normalize_ring(pts));
         status_text_ = "已添加挖空岛屿 #" + std::to_string(project_.holes.size());
         log_cmd("命令: _ADDHOLE -> " + status_text_);
@@ -540,6 +595,7 @@ void CassApp::handle_draft_committed(const std::vector<XY>& pts, CadToolMode too
             status_text_ = "特征线至少需要 2 个顶点";
             return;
         }
+        push_undo_snapshot();
         Breakline bl;
         bl.name = "BL-" + std::to_string(project_.breaklines.size() + 1);
         bl.closed = false;
@@ -657,6 +713,10 @@ void CassApp::execute_command(const std::string& raw_cmd) {
         action_export_cass_dat();
     } else if (up == "DXF") {
         action_export_dxf();
+    } else if (up == "UNDO" || up == "_UNDO" || up == "U") {
+        undo();
+    } else if (up == "REDO" || up == "_REDO") {
+        redo();
     } else if (up == "CLEAR" || up == "CLS") {
         console_lines_.clear();
         log_cmd("命令行历史记录已清空");
@@ -862,6 +922,11 @@ void CassApp::action_export_cass_dat() {
 void CassApp::render() {
     // 全局快捷键处理
     if (!ImGui::GetIO().WantTextInput) {
+        const bool ctrl = ImGui::GetIO().KeyCtrl;
+        if (ctrl && ImGui::IsKeyPressed(ImGuiKey_Z)) undo();
+        if (ctrl && ImGui::IsKeyPressed(ImGuiKey_Y)) redo();
+        if (ctrl && ImGui::IsKeyPressed(ImGuiKey_O)) action_open_project();
+        if (ctrl && ImGui::IsKeyPressed(ImGuiKey_S)) action_save_project(false);
         if (ImGui::IsKeyPressed(ImGuiKey_F5)) {
             run_calculation();
         }
@@ -1218,7 +1283,7 @@ void CassApp::render_kpi_strip() {
 
         ImGui::TableNextRow();
         draw_card(0, "总挖方量 (Cut)",
-                  has_res ? (format_num(cut_v, 2) + " m3") : "--",
+                  has_res ? (format_num(cut_v, 2) + " m³") : "--",
                   has_res && !result_->soil_balance.factors.is_default()
                       ? ("松散 " + format_num(result_->soil_balance.cut_loose(), 1))
                       : "高差 ΔZ > 0",
@@ -1226,7 +1291,7 @@ void CassApp::render_kpi_strip() {
                   rgba(0xF4, 0x83, 0x74));
 
         draw_card(1, "总填方量 (Fill)",
-                  has_res ? (format_num(fill_v, 2) + " m3") : "--",
+                  has_res ? (format_num(fill_v, 2) + " m³") : "--",
                   has_res && !result_->soil_balance.factors.is_default()
                       ? ("天然需土 " + format_num(result_->soil_balance.fill_natural(), 1))
                       : "高差 ΔZ < 0",
@@ -1238,14 +1303,14 @@ void CassApp::render_kpi_strip() {
                          : (std::abs(net_v) < 1e-2 ? IM_COL32(0x2E, 0xCC, 0x71, 255)
                          : (net_v >= 0.0 ? IM_COL32(0xF5, 0x9E, 0x0B, 255) : IM_COL32(0x38, 0xBD, 0xF8, 255)));
         draw_card(2, "挖填净方 (Net = Cut - Fill)",
-                  has_res ? (format_num(net_v, 2) + " m3") : "--",
+                  has_res ? (format_num(net_v, 2) + " m³") : "--",
                   net_tag,
                   net_accent,
                   !has_res ? rgba(0xC0, 0xCA, 0xD8)
                            : (std::abs(net_v) < 1e-2 ? rgba(0x4A, 0xDE, 0x80) : rgba(0xFB, 0xBF, 0x24)));
 
         draw_card(3, "有效算量面积 (Area)",
-                  has_res ? (format_num(area_v, 2) + " m2") : "--",
+                  has_res ? (format_num(area_v, 2) + " m²") : "--",
                   has_res ? (std::to_string(result_->triangle_count) + " 三角形 | " + format_num(area_v / 666.6667, 2) + " 亩")
                           : ("测点 " + std::to_string(project_.points.size()) + " 个"),
                   IM_COL32(0x26, 0xA6, 0x7A, 255),
@@ -1529,20 +1594,20 @@ void CassApp::render_tab_summary() {
             ImGui::TableSetColumnIndex(1); ImGui::TextColored(vc, "%s", v.c_str());
         };
         kv("设计方式", result_->design_description);
-        kv("总挖方量", format_num(result_->total_cut, 2) + " m3", rgba(0xF4, 0x83, 0x74));
-        kv("总填方量", format_num(result_->total_fill, 2) + " m3", rgba(0x63, 0xB8, 0xFF));
-        kv("挖填净方", format_num(result_->net_volume, 2) + " m3", rgba(0xFB, 0xBF, 0x24));
-        kv("有效面积", format_num(result_->computed_area, 2) + " m2 (" + format_num(result_->computed_area / 666.6667, 3) + " 亩)");
+        kv("总挖方量", format_num(result_->total_cut, 2) + " m³", rgba(0xF4, 0x83, 0x74));
+        kv("总填方量", format_num(result_->total_fill, 2) + " m³", rgba(0x63, 0xB8, 0xFF));
+        kv("挖填净方", format_num(result_->net_volume, 2) + " m³", rgba(0xFB, 0xBF, 0x24));
+        kv("有效面积", format_num(result_->computed_area, 2) + " m² (" + format_num(result_->computed_area / 666.6667, 3) + " 亩)");
         kv("三角网规模", std::to_string(result_->triangle_count) + " 个 (混合零线 " + std::to_string(result_->mixed_triangle_count) + " / 边界裁剪 " + std::to_string(result_->clipped_triangle_count) + ")");
         if (!result_->soil_balance.factors.is_default()) {
-            kv("松散挖方(运出)", format_num(result_->soil_balance.cut_loose(), 2) + " m3");
-            kv("压实需自然方", format_num(result_->soil_balance.fill_natural(), 2) + " m3");
+            kv("松散挖方(运出)", format_num(result_->soil_balance.cut_loose(), 2) + " m³");
+            kv("压实需自然方", format_num(result_->soil_balance.fill_natural(), 2) + " m³");
         }
         if (result_->grid_check) {
             const auto& gc = *result_->grid_check;
             double diff_pct = (std::abs(result_->total_cut) > 1e-6)
                 ? ((gc.total_cut - result_->total_cut) / result_->total_cut * 100.0) : 0.0;
-            kv("方格网校核(挖/填)", format_num(gc.total_cut, 1) + " / " + format_num(gc.total_fill, 1) + " m3");
+            kv("方格网校核(挖/填)", format_num(gc.total_cut, 1) + " / " + format_num(gc.total_fill, 1) + " m³");
             kv("格网与TIN挖方偏差", format_num(diff_pct, 2) + " %");
         }
         ImGui::EndTable();

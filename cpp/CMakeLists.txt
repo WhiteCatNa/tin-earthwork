@@ -27,7 +27,12 @@ target_compile_definitions(tin_earthwork_core PUBLIC
     UNICODE
     _UNICODE
     WIN32_LEAN_AND_MEAN
+    $<$<BOOL:${MSVC}>:_CRT_SECURE_NO_WARNINGS>
 )
+
+if (MSVC)
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+endif()
 
 if (MINGW OR CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(tin_earthwork_core PRIVATE
@@ -105,4 +110,7 @@ elseif (MSVC)
 endif()
 
 enable_testing()
-add_test(NAME tin_earthwork_core_tests COMMAND tin_earthwork_tests)
+add_test(
+    NAME tin_earthwork_core_tests
+    COMMAND tin_earthwork_tests "${CMAKE_CURRENT_SOURCE_DIR}/../test_data_1000.xlsx"
+)

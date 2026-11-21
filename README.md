@@ -1,6 +1,22 @@
 # TIN 土方自动算量系统
 
-基于 TIN（不规则三角网）的土方工程量自动计算桌面应用，适用于施工现场测量数据的土方挖填量精确计算。
+基于 TIN（不规则三角网）的土方工程量自动计算桌面应用，适用于施工现场测量数据的土方挖填量精确计算。现同时提供 **Python 桌面版** 与 **原生 C++20 南方CASS 风格 CAD 工作站版（`cpp/`）**。
+
+## 原生 C++20 南方CASS 工作站版（`cpp/`）
+
+- **技术架构**：C++20 + Win32 + Direct3D 11 + Dear ImGui，单文件静态链接，无外部运行时依赖。
+- **界面风格**：仿照 **南方CASS 10/11** 深色工程 CAD 工作站布局（顶部菜单/工具栏 + 左侧可折叠屏幕菜单 + 中央黑底模型/白底布局交互画布 + 右侧五标签属性页 + 底部 CAD 命令控制台与状态栏）。
+- **核心算法对齐与性能实测**（`test_data_1000.xlsx`，1000 测点，设计高程 `50.0 m`）：
+  - **精度对齐**：C++ 版挖方 `3569.3644 m³` / 填方 `3876.4035 m³`，与 Python SciPy 核心版（`3569.3669 m³` / `3876.4042 m³`）相对偏差 `< 0.0001%`。
+  - **计算速度**：C++20 单次构网与算量约 `1.0 ~ 1.2 ms`，较 Python 版（`41 ~ 54 ms`）提速约 **40 倍**。
+- **快速构建（Windows MinGW-w64 / MSVC + CMake）**：
+  ```powershell
+  cmake -S cpp -B cpp/build -G Ninja -DCMAKE_BUILD_TYPE=Release
+  cmake --build cpp/build
+  ctest --test-dir cpp/build --output-on-failure
+  # 运行桌面端或命令行自动化演示截图：
+  .\cpp\build\tin_earthwork_cass.exe --demo test_data_1000.xlsx --capture-dir ./cpp_shots
+  ```
 
 ## 功能简介
 

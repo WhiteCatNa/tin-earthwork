@@ -34,6 +34,8 @@ public:
     void generate_rect_boundary(double margin = 0.0);
     void generate_auto_outline();
     void clear_boundary();
+    bool undo();
+    bool redo();
     void enable_grid_check(bool enabled, double spacing = 15.0);
     void enable_contours(bool enabled, double interval = 0.0);
     void set_design_elevation(double elev);
@@ -78,6 +80,7 @@ private:
     void configure_calculator(TINEarthworkCalculator& calc) const;
     void update_point_stats();
     void sync_project_name_buffer();
+    void push_undo_snapshot();
     void handle_draft_committed(const std::vector<XY>& pts, CadToolMode tool);
     void handle_profile_picked(const XY& a, const XY& b);
 
@@ -137,6 +140,15 @@ private:
     char point_filter_buf_[64]{};
     int tri_filter_mode_ = 0; // 0=全部 1=挖方 2=填方 3=挖填混合 4=边界裁剪
     int compare_invert_ = 0;
+
+    struct EditSnapshot {
+        std::vector<XY> boundary;
+        std::vector<std::vector<XY>> holes;
+        std::vector<Breakline> breaklines;
+        CalculationSettings settings;
+    };
+    std::vector<EditSnapshot> undo_stack_;
+    std::vector<EditSnapshot> redo_stack_;
 };
 
 } // namespace tin::ui
