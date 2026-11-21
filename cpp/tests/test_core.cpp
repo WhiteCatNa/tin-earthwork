@@ -1,6 +1,7 @@
 #include "core/analysis.hpp"
 #include "core/calculator.hpp"
 #include "core/delaunay.hpp"
+#include "core/engineering.hpp"
 #include "core/geometry.hpp"
 #include "io/io.hpp"
 
@@ -428,6 +429,78 @@ int main(int argc, char** argv) {
                       << "  [SECTIONS test_data_1000.xlsx @20m] stations=" << rsec.stations.size()
                       << " cut=" << rsec.total_cut << " fill=" << rsec.total_fill << "\n";
         }
+    });
+
+    // 16. 分层土方严格守恒（按深度分层 + 按绝对标高分层，含真实测点验证）
+    run_test("16_strata_elevation_and_depth_conservation", [&]() {
+        auto pts = make_grid_points(6, 6, 10.0, [](double x, double y) {
+            return 10.0 + 0.08 * x - 0.04 * y; // z in [8..14]
+        });
+        tin::TINEarthworkCalculator calc(11.0);
+        calc.add_points(pts);
+        auto res = calc.run_full_calculation();
+
+        auto s_depth = tin::compute_strata_volumes(res, tin::StrataMode::ByDepth, {0.5, 1.5});
+        check_true(s_depth.layers.size() == 3, "3 depth strata");
+        double sum_c = 0.0, sum_f = 0.0;
+        for (const auto& l : s_depth.layers) { sum_c += l.cut_volume; sum_f += l.fill_volume; }
+        check_near(sum_c, res.total_cut, 1e-6, "depth strata cut conservation");
+        check_near(sum_f, res.total_fill, 1e-6, "depth strata fill conservation");
+
+        auto s_elev = tin::compute_strata_volumes(res, tin::StrataMode::ByElevation, {10.0, 11.5, 13.0});
+        check_true(s_elev.layers.size() == 4, "4 elevation strata");
+        sum_c = sum_f = 0.0;
+        for (const auto& l : s_elev.layers) { sum_c += l.cut_volume; sum_f += l.fill_volume; }
+        check_near(sum_c, res.total_cut, 1e-6, "elevation strata cut conservation");
+        check_near(sum_f, res.total_fill, 1e-6, "elevation strata fill conservation");
+
+        std::string xlsx = find_test_xlsx(argc, argv);
+        if (!xlsx.empty()) {
+            auto imp = tin::import_points_file(xlsx);
+            tin::TINEarthworkCalculator rc(50.0);
+            rc.add_points(imp.points);
+            auto rres = rc.run_full_calculation();
+            auto rs = tin::compute_strata_volumes(rres, tin::StrataMode::ByDepth, {0.2, 0.4});
+            double rc_sum = 0.0, rf_sum = 0.0;
+            for (const auto& l : rs.layers) { rc_sum += l.cut_volume; rf_sum += l.fill_volume; }
+            check_near(rc_sum, rres.total_cut, 1e-5, "real xlsx strata cut conservation");
+            check_near(rf_sum, rres.total_fill, 1e-5, "real xlsx strata fill conservation");
+        }
+    });
+
+    // 17. 土方调配质量守恒与 2-opt 运距优化验证
+    run_test("17_haul_plan_mass_conservation_and_optimization", [&]() {
+        // 左侧挖方 (x<25, z=12)、右侧填方 (x>25, z=8)，设计标高 10
+        auto pts = make_grid_points(6, 5, 10.0, [](double x, double) {
+            return (x <= 20.0) ? 12.0 : ((x >= 30.0) ? 8.0 : 10.0);
+        });
+        tin::TINEarthworkCalculator calc(10.0);
+        calc.add_points(pts);
+        auto res = calc.run_full_calculation();
+        auto plan = tin::compute_haul_plan(res, 4, 2);
+        check_near(plan.internal_balanced + plan.cross_zone_hauled + plan.export_surplus,
+                   res.total_cut, 1e-4, "haul cut mass balance");
+        check_near(plan.internal_balanced + plan.cross_zone_hauled + plan.borrow_deficit,
+                   res.total_fill, 1e-4, "haul fill mass balance");
+        check_true(plan.cross_zone_hauled > 0.0 && plan.avg_haul_distance > 10.0, "expected cross-zone haul flows");
+        check_true(plan.estimated_cost > 0.0, "positive cost estimate");
+    });
+
+    // 18. 场地周边放坡解析验证（均匀高差台地楔形边坡体积 = 0.5 * h^2 * m * 周长）
+    run_test("18_slope_grading_analytical_and_real", [&]() {
+        // 均匀自然地面 z = 14.0，设计平台标高 10.0 (全挖 h = 4.0 m)，平台 40x40 (周长 160 m)
+        // 挖坡 1:1.5 => 坡宽 w = 6.0 m，横截面积 A = 0.5 * 6 * 4 = 12 m²，边坡挖方 = 12 * 160 = 1920 m³
+        auto pts = make_grid_points(5, 5, 10.0, [](double, double) { return 14.0; });
+        tin::TINEarthworkCalculator calc(10.0);
+        calc.add_points(pts);
+        calc.set_boundary({{0, 0}, {40, 0}, {40, 40}, {0, 40}});
+        calc.build_tin();
+        auto sl = tin::compute_slope_grading(calc, 1.5, 1.5, 4.0);
+        check_near(sl.perimeter, 160.0, 1e-6, "platform perimeter");
+        check_near(sl.max_slope_width, 6.0, 1e-4, "max slope width");
+        check_near(sl.slope_cut_volume, 1920.0, 1e-2, "analytical slope cut volume");
+        check_near(sl.slope_fill_volume, 0.0, 1e-6, "analytical slope fill volume");
+        check_true(!sl.slope_ticks.empty() && sl.daylight_ring.size() >= 12, "slope ticks and daylight ring");
     });
 
     std::cout << "=== Summary: PASSED " << g_passed << " / " << (g_passed + g_failed) << " ===\n";

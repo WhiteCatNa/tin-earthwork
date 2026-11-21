@@ -347,6 +347,19 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
             app.set_dark_mode(false);
             app.set_inspector_tab(0);
             save_shot("cass_04_light_layout.png");
+
+            // Wave 3: 3D 地形视口 + 分层/调配/放坡工程专题
+            app.set_dark_mode(true);
+            app.compute_strata_action();
+            app.compute_haul_action();
+            app.compute_slope_action();
+            app.set_inspector_tab(5);
+            app.set_3d_view(true);
+            save_shot("cass_05_3d_terrain.png");
+
+            app.set_3d_view(false);
+            app.zoom_extents();
+            save_shot("cass_06_haul_slope_2d.png");
         }
     } else {
         if (!startup_file.empty()) {
