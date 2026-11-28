@@ -754,6 +754,10 @@ void CassApp::set_3d_view(bool enabled) {
     status_text_ = enabled ? "已切换至 3D 实景地形与设计面透视视口" : "已返回 2D CAD 平面视口";
 }
 
+void CassApp::set_3d_color_mode(ColorMode3D mode) {
+    viewport_3d_.color_mode = mode;
+}
+
 void CassApp::set_tool_mode(CadToolMode mode) {
     canvas_.clear_draft();
     canvas_.tool = mode;
@@ -947,6 +951,90 @@ bool CassApp::run_sensitivity_action() {
         log_cmd("错误: " + status_text_);
         return false;
     }
+}
+
+bool CassApp::run_pareto_action() {
+    if (project_.points.size() < 3) {
+        status_text_ = "测点不足，无法计算 Pareto 多目标前沿";
+        return false;
+    }
+    try {
+        TINEarthworkCalculator calc(project_.settings.design_elevation);
+        configure_calculator(calc);
+        calc.build_tin();
+        pareto_result_ = compute_grade_pareto_frontier(calc, cost_params_, opt_constraints_);
+        status_text_ = pareto_result_->summary;
+        log_cmd("命令: _PARETO -> " + pareto_result_->summary);
+        return !pareto_result_->plans.empty();
+    } catch (const std::exception& e) {
+        status_text_ = std::string("Pareto 多目标优化失败: ") + e.what();
+        log_cmd("错误: " + status_text_);
+        return false;
+    }
+}
+
+bool CassApp::apply_pareto_plan_action(size_t idx) {
+    if (!pareto_result_ || idx >= pareto_result_->plans.size()) return false;
+    push_undo_snapshot();
+    const auto& chosen = pareto_result_->plans[idx];
+    project_.settings.design_mode = DesignMode::Plane;
+    project_.settings.use_partition = false;
+    project_.settings.design_plane = chosen.summary.plane;
+    bool ok = run_calculation();
+    if (ok) compute_haul_action();
+    status_text_ = "已应用 Pareto 方案「" + chosen.tag + "」";
+    log_cmd("命令: _APPLY_PARETO -> " + status_text_);
+    return ok;
+}
+
+bool CassApp::run_multi_bench_action(int max_benches) {
+    if (project_.points.size() < 4) {
+        status_text_ = "测点不足，无法执行主坡向多级台阶优化";
+        return false;
+    }
+    try {
+        if (max_benches >= 2 && max_benches <= 4) {
+            multi_bench_max_k_ = max_benches;
+        }
+        TINEarthworkCalculator calc(project_.settings.design_elevation);
+        configure_calculator(calc);
+        calc.build_tin();
+        multi_bench_result_ = optimize_multi_bench_terraces(calc, cost_params_, multi_bench_max_k_, wall_cost_per_m2_);
+        canvas_.layers.stepped = true;
+        status_text_ = multi_bench_result_->summary;
+        log_cmd("命令: _MULTIBENCH -> " + multi_bench_result_->summary);
+        return true;
+    } catch (const std::exception& e) {
+        status_text_ = std::string("多级台阶 DP 优化失败: ") + e.what();
+        log_cmd("错误: " + status_text_);
+        return false;
+    }
+}
+
+bool CassApp::apply_multi_bench_action() {
+    if (!multi_bench_result_ || multi_bench_result_->benches.empty()) {
+        if (!run_multi_bench_action()) return false;
+    }
+    const auto& mb = *multi_bench_result_;
+    push_undo_snapshot();
+    project_.settings.design_mode = DesignMode::Flat;
+    project_.settings.use_partition = true;
+    project_.settings.design_elevation = mb.benches.front().elevation;
+    project_.settings.partition.clear();
+    for (const auto& pt : project_.points) {
+        double s = (pt.x - mb.origin_x) * mb.dir_x + (pt.y - mb.origin_y) * mb.dir_y;
+        size_t zone_idx = 0;
+        while (zone_idx < mb.dividers.size() && s > mb.dividers[zone_idx].s_coord) {
+            ++zone_idx;
+        }
+        zone_idx = std::min(zone_idx, mb.benches.size() - 1);
+        project_.settings.partition[pt.id] = mb.benches[zone_idx].elevation;
+    }
+    bool ok = run_calculation();
+    if (ok) compute_haul_action();
+    status_text_ = "已将 " + std::to_string(mb.bench_count) + " 级台阶标高写入分区设计面并完成算量";
+    log_cmd("命令: _APPLY_BENCH -> " + status_text_);
+    return ok;
 }
 
 bool CassApp::run_stepped_platform_action(double wall_cost_per_m2) {
@@ -1163,7 +1251,7 @@ void CassApp::execute_command(const std::string& raw_cmd) {
         log_cmd("CAD 经典指令: AUTOB | OUTLINE | CLRBND | CALC(F5) | BALANCE/H0 | FITPLANE | BALPLANE | SECTIONS");
         log_cmd("专题与绘图   : STRATA | HAUL | SLOPE | GRID | CONTOUR | PROFILE | MEASURE | AREA | 3D | 2D | ZE");
         log_cmd("AI 智能指令  : OPT/AIOPT(联合费用优化) | DIAG/ANOMALY(异常体检) | CLEAN(修复粗差) | UNCERT(补测推荐)");
-        log_cmd("实用分析指令 : SIGNIF(共形LoD) | THIN(抽稀) | DRAIN(排水) | SENSITIVITY(敏感性) | BENCH(双级台阶) | FLEET(机械工期)");
+        log_cmd("实用分析指令 : SIGNIF(共形LoD) | THIN(抽稀) | DRAIN(排水) | SENSITIVITY(敏感性) | PARETO(多目标) | MULTIBENCH(多级台阶) | APPLY_BENCH | BENCH | FLEET");
         log_cmd("智能成果导出 : HTMLRPT(决策报告) | EXP_REC(补测点CSV) | EXP_AIDXF(AI图层) | EXP_BOQ(工程量报价清单CSV)");
         log_cmd("自然语言示例 : \"把标高设为50.8\" | \"优化总费用\" | \"检查测点异常\" | \"推荐10个补测点\" | \"放坡 1:1.2 1:1.5\"");
         log_cmd("视图与编辑   : DARK | LIGHT | SWAP | UNDO | REDO | DAT | DXF | CLEAR (支持 Tab 自动补全)");
@@ -1247,17 +1335,20 @@ void CassApp::execute_command(const std::string& raw_cmd) {
         set_inspector_tab(6);
         break;
     case AssistantAction::RunPareto:
-        log_cmd("命令: _PARETO -> Pareto 多目标方案计算将在界面模块启用");
+        run_pareto_action();
+        set_inspector_tab(6);
         break;
     case AssistantAction::OptimizeStepped:
         run_stepped_platform_action(intent.has_param1 ? intent.param1 : -1.0);
         set_inspector_tab(6);
         break;
     case AssistantAction::OptimizeMultiBench:
-        log_cmd("命令: _MULTIBENCH -> 多级台阶将在 Phase 4 UI 面板挂载");
+        run_multi_bench_action(intent.count_param);
+        set_inspector_tab(6);
         break;
     case AssistantAction::ApplyMultiBench:
-        log_cmd("命令: _APPLY_BENCH -> 应用多级台阶将在 Phase 4 UI 面板挂载");
+        apply_multi_bench_action();
+        set_inspector_tab(6);
         break;
     case AssistantAction::EstimateFleet:
         run_fleet_estimate_action(intent.has_param1 ? intent.param1 : -1.0);
@@ -1575,7 +1666,9 @@ void CassApp::action_export_ai_report_html() {
                 diagnosis_summary_ ? &(*diagnosis_summary_) : nullptr,
                 *p,
                 stepped_result_ ? &(*stepped_result_) : nullptr,
-                fleet_result_ ? &(*fleet_result_) : nullptr);
+                fleet_result_ ? &(*fleet_result_) : nullptr,
+                pareto_result_ ? &(*pareto_result_) : nullptr,
+                multi_bench_result_ ? &(*multi_bench_result_) : nullptr);
             status_text_ = "已导出 HTML 智能决策报告: " + *p;
             log_cmd("命令: HTMLRPT -> " + status_text_);
         } catch (const std::exception& e) {
@@ -1643,6 +1736,21 @@ void CassApp::action_export_boq_csv() {
             log_cmd("命令: EXP_BOQ -> " + status_text_);
         } catch (const std::exception& e) {
             status_text_ = std::string("导出工程量报价表失败: ") + e.what();
+            log_cmd("错误: " + status_text_);
+        }
+    }
+}
+
+void CassApp::action_export_pareto_csv() {
+    if (!pareto_result_ && !run_pareto_action()) return;
+    static const wchar_t filter[] = L"CSV 文件 (*.csv)\0*.csv\0\0";
+    if (auto p = save_file_dialog(L"导出 Pareto 多目标方案对比表 (CSV)", filter, L"csv", project_.project_name + "_Pareto方案.csv")) {
+        try {
+            export_pareto_csv(*pareto_result_, *p);
+            status_text_ = "已导出 Pareto 多目标方案表: " + *p;
+            log_cmd("命令: EXP_PARETO -> " + status_text_);
+        } catch (const std::exception& e) {
+            status_text_ = std::string("导出 Pareto 方案失败: ") + e.what();
             log_cmd("错误: " + status_text_);
         }
     }
@@ -1800,6 +1908,7 @@ void CassApp::render_menu_bar() {
         if (ImGui::MenuItem("导出补测推荐点表 (CSV)...")) action_export_survey_rec_csv();
         if (ImGui::MenuItem("导出 AI 专题图层 (DXF)...")) action_export_ai_dxf();
         if (ImGui::MenuItem("导出工程量清单报价表 (BOQ CSV)...")) action_export_boq_csv();
+        if (ImGui::MenuItem("导出多目标 Pareto 方案对比 (CSV)...")) action_export_pareto_csv();
         ImGui::EndMenu();
     }
 
@@ -2141,15 +2250,16 @@ void CassApp::render_center_viewport(float width, float height) {
     const CalculationResult* res_ptr = result_ ? &(*result_) : nullptr;
     const SiteHealthReport* health_ptr = health_report_ ? &(*health_report_) : nullptr;
     const UncertaintyReport* uncert_ptr = uncertainty_report_ ? &(*uncertainty_report_) : nullptr;
+    const MultiBenchResult* mb_ptr = multi_bench_result_ ? &(*multi_bench_result_) : nullptr;
     if (show_3d_view_) {
         viewport_3d_.dark_mode = canvas_.dark_mode;
-        viewport_3d_.render(project_, res_ptr, health_ptr, uncert_ptr);
+        viewport_3d_.render(project_, res_ptr, health_ptr, uncert_ptr, mb_ptr);
     } else {
         const HaulPlanResult* haul_ptr = haul_result_ ? &(*haul_result_) : nullptr;
         const SlopeGradingResult* slope_ptr = slope_result_ ? &(*slope_result_) : nullptr;
         const SteppedPlatformResult* stepped_ptr = stepped_result_ ? &(*stepped_result_) : nullptr;
         canvas_.render(project_, res_ptr, profile_line_, selected_tri_id_, callbacks,
-                       haul_ptr, slope_ptr, health_ptr, uncert_ptr, stepped_ptr);
+                       haul_ptr, slope_ptr, health_ptr, uncert_ptr, stepped_ptr, mb_ptr);
     }
 
     ImGui::EndChild();
@@ -2668,9 +2778,14 @@ void CassApp::render_tab_ai() {
     ImGui::InputDouble("借土单价(元/m³)", &cost_params_.borrow_unit_cost, 1.0, 5.0, "%.1f");
     ImGui::InputDouble("最大坡度约束(%)", &opt_constraints_.max_slope_x, 0.5, 1.0, "%.1f");
     opt_constraints_.max_slope_y = opt_constraints_.max_slope_x;
+    ImGui::InputDouble("最小排水坡(%)", &opt_constraints_.min_drain_slope_pct, 0.1, 0.5, "%.2f");
 
-    if (colored_button("开始联合费用优化", rgba(0x16, 0x7A, 0x55), rgba(0x1D, 0x99, 0x6B), rgba(0x12, 0x63, 0x45), ImVec2(-1, 0))) {
+    if (colored_button("开始联合费用优化", rgba(0x16, 0x7A, 0x55), rgba(0x1D, 0x99, 0x6B), rgba(0x12, 0x63, 0x45), ImVec2(168, 0))) {
         run_grade_optimization_action();
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("多目标 Pareto", ImVec2(-1, 0))) {
+        run_pareto_action();
     }
     if (grade_opt_result_) {
         const auto& g = *grade_opt_result_;
@@ -2699,6 +2814,33 @@ void CassApp::render_tab_ai() {
         }
         if (colored_button("一键采纳 AI 最优斜面并重算", rgba(0x23, 0x5C, 0x9F), rgba(0x2E, 0x73, 0xC4), rgba(0x1C, 0x4B, 0x82), ImVec2(-1, 0))) {
             apply_optimized_plane_action();
+        }
+    }
+    if (pareto_result_ && !pareto_result_->plans.empty()) {
+        ImGui::TextWrapped("%s (点击行一键采纳)", pareto_result_->summary.c_str());
+        ImGuiTableFlags ptf = ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp;
+        if (ImGui::BeginTable("##pareto_tbl", 4, ptf)) {
+            ImGui::TableSetupColumn("策略", ImGuiTableColumnFlags_WidthStretch);
+            ImGui::TableSetupColumn("总费用", ImGuiTableColumnFlags_WidthFixed, 68.0f);
+            ImGui::TableSetupColumn("挖填方m³", ImGuiTableColumnFlags_WidthFixed, 68.0f);
+            ImGui::TableSetupColumn("坡度%", ImGuiTableColumnFlags_WidthFixed, 44.0f);
+            ImGui::TableHeadersRow();
+            for (size_t i = 0; i < pareto_result_->plans.size(); ++i) {
+                const auto& p = pareto_result_->plans[i];
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0);
+                std::string lbl = p.tag + "##par" + std::to_string(i);
+                if (ImGui::Selectable(lbl.c_str(), false, ImGuiSelectableFlags_SpanAllColumns)) {
+                    apply_pareto_plan_action(i);
+                }
+                ImGui::TableSetColumnIndex(1); ImGui::Text("%s", format_num(p.summary.total_cost, 0).c_str());
+                ImGui::TableSetColumnIndex(2); ImGui::Text("%s", format_num(p.total_moved_volume, 0).c_str());
+                ImGui::TableSetColumnIndex(3); ImGui::Text("%.2f", p.slope_pct);
+            }
+            ImGui::EndTable();
+        }
+        if (ImGui::Button("导出 Pareto 方案 CSV", ImVec2(-1, 0))) {
+            action_export_pareto_csv();
         }
     }
 
@@ -2884,13 +3026,25 @@ void CassApp::render_tab_ai() {
     }
 
     ImGui::Spacing();
-    draw_section_bar("8. 双级台阶优化 & 机械排班工期估算");
+    draw_section_bar("8. 多级台阶自适应优化 & 机械排班工期估算");
     ImGui::InputDouble("挡墙护坡(元/m2)", &wall_cost_per_m2_, 10.0, 50.0, "%.0f");
-    if (ImGui::Button("双级台阶优化", ImVec2(-1, 0))) {
+    ImGui::SliderInt("最大台阶级数", &multi_bench_max_k_, 2, 4);
+    if (ImGui::Button("正交两级台阶", ImVec2(142, 0))) {
         run_stepped_platform_action();
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("主坡向多级台阶(DP)", ImVec2(-1, 0))) {
+        run_multi_bench_action();
     }
     if (stepped_result_) {
         ImGui::TextWrapped("%s", stepped_result_->summary.c_str());
+    }
+    if (multi_bench_result_) {
+        ImGui::TextWrapped("%s", multi_bench_result_->summary.c_str());
+        if (multi_bench_result_->bench_count >= 2 &&
+            colored_button("一键应用多级台阶到当前工程(可Ctrl+Z)", rgba(0x23, 0x5C, 0x9F), rgba(0x2E, 0x73, 0xC4), rgba(0x1C, 0x4B, 0x82), ImVec2(-1, 0))) {
+            apply_multi_bench_action();
+        }
     }
 
     ImGui::InputDouble("目标工期(天)", &fleet_params_.target_days, 1.0, 5.0, "%.0f");

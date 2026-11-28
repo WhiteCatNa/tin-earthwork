@@ -162,10 +162,21 @@ int main(int argc, char** argv) {
     tin::TINEarthworkCalculator calc(50.0);
     calc.add_points(imp.points);
 
-    auto t0 = std::chrono::steady_clock::now();
-    auto res = calc.run_full_calculation();
-    auto t1 = std::chrono::steady_clock::now();
-    double tin_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    tin::CalculationResult res;
+    std::array<double, 3> tin_runs{};
+    for (int r = 0; r < 3; ++r) {
+        tin::TINEarthworkCalculator c_run(50.0);
+        c_run.add_points(imp.points);
+        auto t0 = std::chrono::steady_clock::now();
+        res = c_run.run_full_calculation();
+        auto t1 = std::chrono::steady_clock::now();
+        tin_runs[static_cast<size_t>(r)] = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    }
+    std::sort(tin_runs.begin(), tin_runs.end());
+    double tin_ms = tin_runs[1];
+    calc = tin::TINEarthworkCalculator(50.0);
+    calc.add_points(imp.points);
+    res = calc.run_full_calculation();
 
     // v4.0 万点级 (101x101 = 10,201 点) 构网+算量耗时基准
     auto pts_10k = make_grid_points(101, 101, 5.0, [](double x, double y) {
@@ -443,6 +454,25 @@ int main(int argc, char** argv) {
         ui_vtx_min = std::min(ui_vtx_min, vtx);
     }
     bool ui_ok = ai_wf_ok && (ui_vtx_min > 200);
+    app.execute_command("PARETO");
+    app.execute_command("MULTIBENCH");
+    app.execute_command("APPLY_BENCH");
+    app.set_3d_view(true);
+    app.set_3d_color_mode(tin::ui::ColorMode3D::SlopeDrainage);
+    io.DisplaySize = ImVec2(1440.0f, 900.0f);
+    io.DeltaTime = 1.0f / 60.0f;
+    ImGui::NewFrame();
+    app.render();
+    ImGui::Render();
+    ImDrawData* dd3 = ImGui::GetDrawData();
+    int vtx3d = 0;
+    if (dd3) {
+        for (int i = 0; i < dd3->CmdListsCount; ++i) vtx3d += dd3->CmdLists[i]->VtxBuffer.Size;
+    }
+    bool ui_has_v4_features =
+        (app.pareto_result() != nullptr && app.pareto_result()->plans.size() >= 3) &&
+        (app.multi_bench_result() != nullptr) &&
+        (vtx3d > 200);
     double contrast = tin::ui::contrast_ratio(
         ImGui::GetStyle().Colors[ImGuiCol_Text],
         ImGui::GetStyle().Colors[ImGuiCol_WindowBg]);
@@ -486,7 +516,7 @@ int main(int argc, char** argv) {
                   << "  \"multi_bench_vs_flat_pct\": " << mb_vs_flat_pct << ",\n"
                   << "  \"multi_bench_vs_2axis_pct\": " << mb_vs_2ax_pct << ",\n"
                   << "  \"multi_bench_ms\": " << mb_ms << ",\n"
-                  << "  \"ui_has_v4_features\": false\n"
+                  << "  \"ui_has_v4_features\": " << (ui_has_v4_features ? "true" : "false") << "\n"
                   << "}\n";
     } else {
         std::cout << "[BENCH] parity=" << (parity_ok ? "OK" : "FAIL")

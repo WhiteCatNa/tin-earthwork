@@ -229,7 +229,8 @@ void CadCanvas::render(const ProjectData& project,
                        const SlopeGradingResult* slope,
                        const SiteHealthReport* health,
                        const UncertaintyReport* uncertainty,
-                       const SteppedPlatformResult* stepped) {
+                       const SteppedPlatformResult* stepped,
+                       const MultiBenchResult* multi_bench) {
 
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
     ImGui::BeginChild("CadViewportHost", ImVec2(-1, -1), true,
@@ -752,8 +753,39 @@ void CadCanvas::render(const ProjectData& project,
         }
     }
 
-    // 10f. 双级台阶分界线及级差标高徽标
-    if (layers.stepped && stepped != nullptr && stepped->step_height > 1e-3 && !project.points.empty()) {
+    // 10f. 台阶分界线及级差标高徽标（优先绘制主坡向 DP 多级台阶，其次兼容正交两级台阶）
+    if (layers.stepped && multi_bench != nullptr && multi_bench->bench_count >= 2 && !multi_bench->dividers.empty()) {
+        ImU32 step_col = dark_mode ? col32(0xFA, 0xCC, 0x15, 245) : col32(0xD9, 0x77, 0x06, 245);
+        ImU32 badge_bg = dark_mode ? col32(0x14, 0x18, 0x1F, 225) : col32(0xFF, 0xFF, 0xFF, 235);
+        for (const auto& dv : multi_bench->dividers) {
+            ImVec2 a = world_to_screen(dv.start.x, dv.start.y, view_origin, view_size);
+            ImVec2 b = world_to_screen(dv.end.x, dv.end.y, view_origin, view_size);
+            draw_dashed_line(dl, a, b, step_col, 2.6f, 12.0f, 6.0f);
+            ImVec2 mid_ab(0.5f * (a.x + b.x), 0.5f * (a.y + b.y));
+            char dbuf[48];
+            std::snprintf(dbuf, sizeof(dbuf), "ΔH=%.2fm", dv.step_height);
+            ImVec2 tsd = ImGui::CalcTextSize(dbuf);
+            dl->AddRectFilled(ImVec2(mid_ab.x - tsd.x * 0.5f - 4, mid_ab.y - 10),
+                              ImVec2(mid_ab.x + tsd.x * 0.5f + 4, mid_ab.y + 8), badge_bg, 3.0f);
+            dl->AddRect(ImVec2(mid_ab.x - tsd.x * 0.5f - 4, mid_ab.y - 10),
+                        ImVec2(mid_ab.x + tsd.x * 0.5f + 4, mid_ab.y + 8), step_col, 3.0f);
+            dl->AddText(ImVec2(mid_ab.x - tsd.x * 0.5f, mid_ab.y - 8), step_col, dbuf);
+        }
+        for (const auto& bz : multi_bench->benches) {
+            double s_mid = 0.5 * (bz.s_min + bz.s_max);
+            double wx = multi_bench->origin_x + s_mid * multi_bench->dir_x;
+            double wy = multi_bench->origin_y + s_mid * multi_bench->dir_y;
+            ImVec2 sp = world_to_screen(wx, wy, view_origin, view_size);
+            char bbuf[48];
+            std::snprintf(bbuf, sizeof(bbuf), "台%d H=%.2fm", bz.index, bz.elevation);
+            ImVec2 tsb = ImGui::CalcTextSize(bbuf);
+            dl->AddRectFilled(ImVec2(sp.x - tsb.x * 0.5f - 4, sp.y - 10),
+                              ImVec2(sp.x + tsb.x * 0.5f + 4, sp.y + 8), badge_bg, 3.0f);
+            dl->AddRect(ImVec2(sp.x - tsb.x * 0.5f - 4, sp.y - 10),
+                        ImVec2(sp.x + tsb.x * 0.5f + 4, sp.y + 8), step_col, 3.0f);
+            dl->AddText(ImVec2(sp.x - tsb.x * 0.5f, sp.y - 8), step_col, bbuf);
+        }
+    } else if (layers.stepped && stepped != nullptr && stepped->step_height > 1e-3 && !project.points.empty()) {
         double bx0 = project.points[0].x, bx1 = bx0;
         double by0 = project.points[0].y, by1 = by0;
         for (const auto& p : project.points) {
@@ -968,7 +1000,9 @@ void CadCanvas::render(const ProjectData& project,
             {"计算边界", bnd_col, layers.boundary && !project.boundary.empty()},
             {"异常测点", col32(0xEF, 0x44, 0x44), layers.anomalies && health != nullptr && !health->anomalies.empty()},
             {"补测推荐", col32(0xE8, 0x79, 0xF9), layers.survey_recs && uncertainty != nullptr && !uncertainty->recommendations.empty()},
-            {"台阶分界", col32(0xFA, 0xCC, 0x15), layers.stepped && stepped != nullptr && stepped->step_height > 1e-3},
+            {"台阶分界", col32(0xFA, 0xCC, 0x15),
+             layers.stepped && ((multi_bench != nullptr && multi_bench->bench_count >= 2) ||
+                                (stepped != nullptr && stepped->step_height > 1e-3))},
         };
         int active_cnt = 0;
         for (const auto& it : items) if (it.show) ++active_cnt;
@@ -1016,6 +1050,54 @@ void CadCanvas::render(const ProjectData& project,
                             ImVec2(nc.x, nc.y),
                             ImVec2(nc.x + 5.0f, nc.y + 4.0f), ncol, 1.2f);
             dl->AddText(ImVec2(nc.x - 4.0f, nc.y - 28.0f), nfill, "N");
+        }
+
+        // 右下角实时鼠标悬停工程遥测 HUD（地面高程 / 设计标高 / 挖填高差 / 局部坡度与坡向）
+        if (hover_valid_ && result != nullptr && !result->triangles.empty()) {
+            const double hx = hover_world_.x;
+            const double hy = hover_world_.y;
+            for (const auto& t : result->triangles) {
+                if (t.is_boundary || t.area <= 1e-12) continue;
+                double xmin_t = std::min({t.p0.x, t.p1.x, t.p2.x});
+                double xmax_t = std::max({t.p0.x, t.p1.x, t.p2.x});
+                if (hx < xmin_t - 1e-6 || hx > xmax_t + 1e-6) continue;
+                double ymin_t = std::min({t.p0.y, t.p1.y, t.p2.y});
+                double ymax_t = std::max({t.p0.y, t.p1.y, t.p2.y});
+                if (hy < ymin_t - 1e-6 || hy > ymax_t + 1e-6) continue;
+
+                double denom = (t.p1.y - t.p2.y) * (t.p0.x - t.p2.x) +
+                               (t.p2.x - t.p1.x) * (t.p0.y - t.p2.y);
+                if (std::abs(denom) <= 1e-18) continue;
+                double u = ((t.p1.y - t.p2.y) * (hx - t.p2.x) + (t.p2.x - t.p1.x) * (hy - t.p2.y)) / denom;
+                double v = ((t.p2.y - t.p0.y) * (hx - t.p2.x) + (t.p0.x - t.p2.x) * (hy - t.p2.y)) / denom;
+                double w = 1.0 - u - v;
+                if (u < -1e-4 || v < -1e-4 || w < -1e-4) continue;
+
+                double nat_z = u * t.p0.z + v * t.p1.z + w * t.p2.z;
+                double des_z = u * t.p0.design_z + v * t.p1.design_z + w * t.p2.design_z;
+                double dz = nat_z - des_z;
+
+                double dx1 = t.p1.x - t.p0.x, dy1 = t.p1.y - t.p0.y, dz1 = t.p1.z - t.p0.z;
+                double dx2 = t.p2.x - t.p0.x, dy2 = t.p2.y - t.p0.y, dz2 = t.p2.z - t.p0.z;
+                double gx = (dz1 * dy2 - dz2 * dy1) / denom;
+                double gy = (dx1 * dz2 - dx2 * dz1) / denom;
+                double slope_pct = std::hypot(gx, gy) * 100.0;
+                double aspect = std::atan2(-gx, -gy) * (180.0 / 3.14159265358979323846);
+                if (aspect < 0.0) aspect += 360.0;
+
+                char hbuf[160];
+                std::snprintf(hbuf, sizeof(hbuf),
+                              "地面Z=%.2fm | 设计H=%.2fm | %s%.2fm | 坡度%.1f%% (%.0f°)",
+                              nat_z, des_z, (dz >= 0.0 ? "挖+" : "填"), dz, slope_pct, aspect);
+                ImVec2 ts = ImGui::CalcTextSize(hbuf);
+                ImVec2 hp(view_end.x - ts.x - 18.0f, view_end.y - ts.y - 16.0f);
+                ImU32 hbg = dark_mode ? col32(0x14, 0x18, 0x1F, 225) : col32(0xFF, 0xFF, 0xFF, 235);
+                ImU32 hbd = (dz >= 0.0) ? col32(0xF8, 0x71, 0x71, 220) : col32(0x38, 0xBD, 0xF8, 220);
+                dl->AddRectFilled(ImVec2(hp.x - 7, hp.y - 4), ImVec2(hp.x + ts.x + 7, hp.y + ts.y + 4), hbg, 3.0f);
+                dl->AddRect(ImVec2(hp.x - 7, hp.y - 4), ImVec2(hp.x + ts.x + 7, hp.y + ts.y + 4), hbd, 3.0f);
+                dl->AddText(hp, dark_mode ? col32(0xE6, 0xED, 0xF3) : col32(0x0F, 0x17, 0x2A), hbuf);
+                break;
+            }
         }
     }
 

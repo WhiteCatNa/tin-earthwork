@@ -91,7 +91,8 @@ void Viewport3D::set_side_view() {
 void Viewport3D::render(const ProjectData& project,
                         const CalculationResult* result,
                         const SiteHealthReport* health,
-                        const UncertaintyReport* uncertainty) {
+                        const UncertaintyReport* uncertainty,
+                        const MultiBenchResult* multi_bench) {
     ImVec2 avail = ImGui::GetContentRegionAvail();
     if (avail.x < 40.0f || avail.y < 40.0f) return;
 
@@ -110,6 +111,8 @@ void Viewport3D::render(const ProjectData& project,
     if (ImGui::RadioButton("高程色谱", &cm, 1)) color_mode = ColorMode3D::Elevation;
     ImGui::SameLine();
     if (ImGui::RadioButton("线框", &cm, 2)) color_mode = ColorMode3D::Wireframe;
+    ImGui::SameLine();
+    if (ImGui::RadioButton("排水坡度", &cm, 3)) color_mode = ColorMode3D::SlopeDrainage;
     ImGui::SameLine();
     ImGui::Checkbox("网格线", &show_wireframe);
     ImGui::SameLine();
@@ -274,6 +277,27 @@ void Viewport3D::render(const ProjectData& project,
             hypsometric_rgb(frac, r, g, b);
             dt.fill_col = shade_rgb(r, g, b, lambert, 245);
             dt.line_col = IM_COL32(0x10, 0x15, 0x1D, 85);
+        } else if (color_mode == ColorMode3D::SlopeDrainage) {
+            double denom = (t.p1.y - t.p2.y) * (t.p0.x - t.p2.x) +
+                           (t.p2.x - t.p1.x) * (t.p0.y - t.p2.y);
+            double slope_pct = 0.0;
+            if (std::abs(denom) > 1e-18) {
+                double dx1 = t.p1.x - t.p0.x, dy1 = t.p1.y - t.p0.y, dz1 = t.p1.z - t.p0.z;
+                double dx2 = t.p2.x - t.p0.x, dy2 = t.p2.y - t.p0.y, dz2 = t.p2.z - t.p0.z;
+                double gx = (dz1 * dy2 - dz2 * dy1) / denom;
+                double gy = (dx1 * dz2 - dx2 * dz1) / denom;
+                slope_pct = std::hypot(gx, gy) * 100.0;
+            }
+            if (slope_pct < 0.3) {
+                dt.fill_col = shade_rgb(0x38, 0xBD, 0xF8, lambert, 245); // 平缓易积水区
+            } else if (slope_pct < 5.0) {
+                dt.fill_col = shade_rgb(0x22, 0xC5, 0x5E, lambert, 242); // 良好排水缓坡
+            } else if (slope_pct < 15.0) {
+                dt.fill_col = shade_rgb(0xF5, 0x9E, 0x0B, lambert, 242); // 中陡坡
+            } else {
+                dt.fill_col = shade_rgb(0xEF, 0x44, 0x44, lambert, 245); // 陡坎/冲刷风险区
+            }
+            dt.line_col = IM_COL32(0x10, 0x15, 0x1D, 90);
         } else {
             dt.fill_col = 0;
             dt.line_col = dark_mode ? IM_COL32(0x38, 0xE5, 0x8F, 185) : IM_COL32(0x0E, 0x7A, 0x54, 195);
@@ -377,8 +401,19 @@ void Viewport3D::render(const ProjectData& project,
             dl->AddText(ImVec2(tip.x + 6, tip.y - 7), rcol, rb);
         }
     }
+    if (multi_bench && multi_bench->bench_count >= 2 && !multi_bench->dividers.empty()) {
+        ImU32 scol = IM_COL32(0xFA, 0xCC, 0x15, 245);
+        for (size_t i = 0; i < multi_bench->dividers.size(); ++i) {
+            const auto& dv = multi_bench->dividers[i];
+            double zref = 0.5 * (multi_bench->benches[i].elevation + multi_bench->benches[i + 1].elevation);
+            float d0 = 0.0f, d1 = 0.0f;
+            ImVec2 p0 = project_pt(to_norm(dv.start.x, dv.start.y, zref), d0);
+            ImVec2 p1 = project_pt(to_norm(dv.end.x, dv.end.y, zref), d1);
+            dl->AddLine(p0, p1, scol, 2.8f);
+        }
+    }
 
-    // 5. 右上角高程/挖填三维色带图例
+    // 5. 右上角高程/挖填/排水坡度三维色带图例
     {
         float lx = canvas_p1.x - 122.0f, ly = canvas_p0.y + 44.0f;
         dl->AddRectFilled(ImVec2(lx, ly), ImVec2(lx + 110.0f, ly + 74.0f),
@@ -397,6 +432,16 @@ void Viewport3D::render(const ProjectData& project,
             ImU32 tc = dark_mode ? IM_COL32(0xE2, 0xE8, 0xF0, 255) : IM_COL32(0x0F, 0x17, 0x2A, 255);
             dl->AddText(ImVec2(lx + 28, ly + 6), tc, bmax);
             dl->AddText(ImVec2(lx + 28, ly + 50), tc, bmin);
+        } else if (color_mode == ColorMode3D::SlopeDrainage) {
+            ImU32 tc = dark_mode ? IM_COL32(0xE2, 0xE8, 0xF0, 255) : IM_COL32(0x0F, 0x17, 0x2A, 255);
+            dl->AddRectFilled(ImVec2(lx + 8, ly + 7), ImVec2(lx + 20, ly + 17), IM_COL32(0x38, 0xBD, 0xF8, 255));
+            dl->AddText(ImVec2(lx + 26, ly + 4), tc, "<0.3% 积水");
+            dl->AddRectFilled(ImVec2(lx + 8, ly + 23), ImVec2(lx + 20, ly + 33), IM_COL32(0x22, 0xC5, 0x5E, 255));
+            dl->AddText(ImVec2(lx + 26, ly + 20), tc, "0.3~5% 顺畅");
+            dl->AddRectFilled(ImVec2(lx + 8, ly + 39), ImVec2(lx + 20, ly + 49), IM_COL32(0xF5, 0x9E, 0x0B, 255));
+            dl->AddText(ImVec2(lx + 26, ly + 36), tc, "5~15% 较陡");
+            dl->AddRectFilled(ImVec2(lx + 8, ly + 55), ImVec2(lx + 20, ly + 65), IM_COL32(0xEF, 0x44, 0x44, 255));
+            dl->AddText(ImVec2(lx + 26, ly + 52), tc, ">15% 陡坎");
         } else {
             ImU32 tc = dark_mode ? IM_COL32(0xE2, 0xE8, 0xF0, 255) : IM_COL32(0x0F, 0x17, 0x2A, 255);
             dl->AddRectFilled(ImVec2(lx + 8, ly + 10), ImVec2(lx + 20, ly + 22), IM_COL32(0xDC, 0x5B, 0x4E, 255));

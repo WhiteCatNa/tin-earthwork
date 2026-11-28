@@ -131,8 +131,20 @@ int main(int argc, char** argv) {
                "significance, thinning, drainage, sensitivity, stepped, fleet reports populated");
     app.set_inspector_tab(6);
     check_true(render_one_frame(app) > 200, "AI tab with sensitivity curve renders");
+    app.execute_command("PARETO");
+    app.execute_command("MULTIBENCH");
+    check_true(app.pareto_result() != nullptr && app.pareto_result()->plans.size() >= 3,
+               "PARETO UI command populates >=3 plans");
+    check_true(app.multi_bench_result() != nullptr && !app.multi_bench_result()->benches.empty(),
+               "MULTIBENCH UI command populates multi-bench result");
+    app.execute_command("APPLY_BENCH");
+    check_true(render_one_frame(app) > 200, "AI tab renders after Pareto & MultiBench apply");
     app.set_inspector_tab(0);
-    check_true(render_one_frame(app) > 200, "CAD viewport with stepped divider overlay renders");
+    check_true(render_one_frame(app) > 200, "CAD viewport with stepped/multibench overlay renders");
+    app.set_3d_view(true);
+    app.set_3d_color_mode(tin::ui::ColorMode3D::SlopeDrainage);
+    check_true(render_one_frame(app) > 200, "3D SlopeDrainage risk color mode renders");
+    app.set_3d_view(false);
     auto comps = tin::suggest_command_completions("AI");
     check_true(comps.size() >= 2, "Tab completion returns AI commands");
 

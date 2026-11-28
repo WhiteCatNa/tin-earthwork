@@ -61,7 +61,9 @@ void export_ai_report_html(
     const DiagnosisSummary* diagnosis,
     const std::string& utf8_path,
     const SteppedPlatformResult* stepped = nullptr,
-    const FleetEstimateResult* fleet = nullptr);
+    const FleetEstimateResult* fleet = nullptr,
+    const GradeParetoResult* pareto = nullptr,
+    const MultiBenchResult* multi_bench = nullptr);
 void export_boq_csv(
     const ProjectData& project,
     const CalculationResult& result,

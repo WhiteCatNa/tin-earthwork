@@ -70,7 +70,8 @@ public:
                 const SlopeGradingResult* slope = nullptr,
                 const SiteHealthReport* health = nullptr,
                 const UncertaintyReport* uncertainty = nullptr,
-                const SteppedPlatformResult* stepped = nullptr);
+                const SteppedPlatformResult* stepped = nullptr,
+                const MultiBenchResult* multi_bench = nullptr);
 
     // 交互绘制草稿控制
     void clear_draft();

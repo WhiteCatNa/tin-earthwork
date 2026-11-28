@@ -9,7 +9,8 @@ namespace tin::ui {
 enum class ColorMode3D {
     CutFill = 0,     // 挖填着色（红挖青填 + 光照）
     Elevation = 1,   // 测绘高程色谱（蓝绿黄棕 + 光照）
-    Wireframe = 2    // 经典 CAD 绿线框三角网
+    Wireframe = 2,   // 经典 CAD 绿线框三角网
+    SlopeDrainage = 3 // 坡度与积水风险分级着色 (v4.4)
 };
 
 // 原生 Direct3D 11 / ImDrawList 交互式 3D 地形与挖填透视视口
@@ -32,7 +33,8 @@ public:
     void render(const ProjectData& project,
                 const CalculationResult* result,
                 const SiteHealthReport* health = nullptr,
-                const UncertaintyReport* uncertainty = nullptr);
+                const UncertaintyReport* uncertainty = nullptr,
+                const MultiBenchResult* multi_bench = nullptr);
 
 private:
     ImVec2 pan_px_{0.0f, 0.0f};

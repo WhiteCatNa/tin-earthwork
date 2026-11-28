@@ -333,6 +333,11 @@ AssistantIntent parse_engineering_intent(const std::string& raw_input) {
         out.reply = "AI助手: 生成设计面多目标 Pareto 非支配方案前沿";
         return out;
     }
+    if (contains_any(lo, {"应用台阶", "应用多级台阶", "采纳台阶", "apply bench", "apply terrace"})) {
+        out.action = AssistantAction::ApplyMultiBench;
+        out.reply = "AI助手: 将多级台阶设计标高写入当前工程分区设计面";
+        return out;
+    }
     if (contains_any(lo, {"多级台阶", "坡向台阶", "三级台阶", "四级台阶", "multi bench", "multibench", "dp terrace"})) {
         out.action = AssistantAction::OptimizeMultiBench;
         if (!nums.empty()) {
@@ -341,11 +346,6 @@ AssistantIntent parse_engineering_intent(const std::string& raw_input) {
             out.count_param = 3;
         }
         out.reply = "AI助手: 执行主坡向自适应动态规划多级台阶优化";
-        return out;
-    }
-    if (contains_any(lo, {"应用台阶", "应用多级台阶", "apply bench", "apply terrace"})) {
-        out.action = AssistantAction::ApplyMultiBench;
-        out.reply = "AI助手: 将多级台阶设计标高写入当前工程分区设计面";
         return out;
     }
     if (contains_any(lo, {"台阶", "阶梯", "二级平场", "双级", "stepped", "terrace", "bench"})) {

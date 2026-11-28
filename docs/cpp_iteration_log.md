@@ -248,3 +248,25 @@ _以下各轮记录均由 `python3 tools/eval_cpp_goal.py` 真实编译、运行
 - **关键实测指标**：对角陡坡 DP 三级台阶较单平场降本 **45.79%**、较正交两级台阶再降本 **37.67%**，总耗时仅 **10.61 ms**（`tin_ms = 1.33 ms`, `tin_10k_ms = 9.08 ms`）
 
 - **下一步持续迭代方向**：进入 `v4.4.0`（2D CAD 实时悬停工程遥测 HUD、主坡向台阶可视化、3D 排水坡度风险着色模式及 Tab7 Pareto/台阶一键应用与导出闭环）。
+
+---
+
+## Iteration 15 — 实时 CAD 遥测 HUD、3D 排水风险视口与全链路交互闭环 (v4.4.0)
+
+### 改动清单
+1. **2D CAD 实时悬停工程遥测 HUD & 主坡向多级台阶叠加** (`cpp/src/ui/cad_canvas.hpp/.cpp`)
+   - 鼠标悬停任意三角形内时实时重心插值显示「地面高程 Z | 设计标高 H | 挖/填高差 ΔZ | 局部坡度 % 与坡向 °」；优先沿主坡向绘制金黄色虚线台阶分界与级差标高徽标。
+2. **3D 实景视口「排水坡度」风险着色模式** (`cpp/src/ui/viewport_3d.hpp/.cpp`)
+   - 新增 `ColorMode3D::SlopeDrainage`（`<0.3%` 积水区青蓝、`0.3~5%` 顺畅绿、`5~15%` 较陡橙、`>15%` 陡坎红）与多级台阶三维分割棱线显示。
+3. **南方CASS Tab7 `AI智能` 一键应用与增强 HTML/CSV 报告** (`cpp/src/ui/app.hpp/.cpp`, `cpp/src/io/io.hpp/.cpp`, `cpp/src/core/ai_assistant.cpp`)
+   - 新增最小排水坡输入、Pareto 可点击采纳表、`APPLY_BENCH`（按主坡向投影写入 `CalculationSettings::partition` 并支持 `Ctrl+Z` 撤销重算）、`EXP_PARETO` 菜单项及 HTML 第 8/9 节表格。
+4. **测试与双榜门禁验证** (`cpp/tests/test_core.cpp`, `cpp/tests/test_ui_headless.cpp`, `cpp/tests/test_ai_benchmark.cpp`)
+   - 新增 Test 37 (`37_pareto_and_multibench_v4_html_export`) 与无头 CAD/3D 排水坡度渲染及 Pareto/多级台阶一键应用实机回归。
+
+### 门禁验证结果
+- **v3.0 回归保护分**：**100.00 / 100.00**
+- **v4.0 北极星评分**：`90.00` → **100.00 / 100.00**（第 4 维 `CAD/3D HUD & UX` 升至 **20.00 / 20.00**）
+- Compiler warnings (project `src/` & `tests/`): **0** | CTest: **3/3 PASS** (Core 37/37 PASS)
+- **关键实测性能**：`tin_ms = 1.26 ms`、`tin_10k_ms = 8.76 ms`、`multi_bench_ms = 10.37 ms`
+
+- **下一步持续迭代方向**：进入 `v4.5.0`（全量 ASan + UBSan 审计、`README.md` 与 `v4.0.0-alpha → v4.5.0` 总览收尾）。

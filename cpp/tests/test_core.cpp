@@ -1055,6 +1055,40 @@ int main(int argc, char** argv) {
         check_true(dp3.elapsed_ms < 25.0, "DP multi-bench solver < 25 ms");
     });
 
+    // 37. v4.0 HTML 报告 Pareto/多级台阶渲染与助手机构意图集成校验
+    run_test("37_pareto_and_multibench_v4_html_export", [&]() {
+        auto diag_pts = make_grid_points(11, 11, 18.0, [](double x, double y) {
+            return 10.0 + 0.12 * x + 0.12 * y + 0.4 * std::sin(0.03 * x);
+        });
+        tin::TINEarthworkCalculator calc(24.0);
+        calc.add_points(diag_pts);
+        auto res = calc.run_full_calculation();
+        auto pareto = tin::compute_grade_pareto_frontier(calc);
+        auto mb = tin::optimize_multi_bench_terraces(calc, tin::HaulCostParams{}, 3, 180.0);
+
+        tin::ProjectData proj;
+        proj.project_name = "V4_Report_Verify";
+        proj.points = diag_pts;
+        auto tmp = std::filesystem::temp_directory_path() / L"tin_earthwork_cpp_tests";
+        std::filesystem::create_directories(tmp);
+        std::string html_p = tin::wide_to_utf8((tmp / L"v4_report.html").wstring());
+        tin::export_ai_report_html(proj, &res, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+                                   html_p, nullptr, nullptr, &pareto, &mb);
+
+        std::ifstream ifs(std::filesystem::path(tin::utf8_to_wide(html_p)), std::ios::binary);
+        std::string html_s((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
+        check_true(html_s.find("多目标 Pareto 设计面比选方案集") != std::string::npos &&
+                   html_s.find("主坡向自适应多级台阶 DP 优化") != std::string::npos,
+                   "v4 HTML report includes Pareto & Multi-Bench DP sections");
+
+        check_true(tin::parse_engineering_intent("PARETO").action == tin::AssistantAction::RunPareto,
+                   "PARETO CAD command recognized");
+        check_true(tin::parse_engineering_intent("MULTIBENCH").action == tin::AssistantAction::OptimizeMultiBench,
+                   "MULTIBENCH CAD command recognized");
+        check_true(tin::parse_engineering_intent("应用多级台阶").action == tin::AssistantAction::ApplyMultiBench,
+                   "APPLY_BENCH Chinese intent recognized");
+    });
+
     std::cout << "=== Summary: PASSED " << g_passed << " / " << (g_passed + g_failed) << " ===\n";
     return g_failed == 0 ? 0 : 1;
 }

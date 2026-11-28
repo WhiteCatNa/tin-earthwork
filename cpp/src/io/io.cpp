@@ -1377,7 +1377,9 @@ void export_ai_report_html(
     const DiagnosisSummary* diagnosis,
     const std::string& utf8_path,
     const SteppedPlatformResult* stepped,
-    const FleetEstimateResult* fleet) {
+    const FleetEstimateResult* fleet,
+    const GradeParetoResult* pareto,
+    const MultiBenchResult* multi_bench) {
     auto esc = [](const std::string& s) {
         std::string r;
         r.reserve(s.size());
@@ -1508,6 +1510,31 @@ void export_ai_report_html(
            << "</td><td>" << fleet->compaction_sets << "</td><td>" << fleet->avg_haul_dist_m
            << "</td><td>" << fleet->estimated_days << "</td><td><b>" << fleet->total_machine_cost
            << "</b></td></tr></table>";
+    }
+
+    if (pareto && !pareto->plans.empty()) {
+        os << "<h2>8. 多目标 Pareto 设计面比选方案集</h2>"
+           << "<p>" << esc(pareto->summary) << "</p>"
+           << "<table><tr><th>策略标签</th><th>H0(m)</th><th>坡度(%)</th><th>挖+填总方量(m³)</th><th>最大挖/填深(m)</th><th>综合成本(元)</th></tr>";
+        for (const auto& p : pareto->plans) {
+            os << "<tr><td>" << esc(p.tag) << "</td><td>" << p.summary.plane.h0
+               << "</td><td>" << p.slope_pct << "</td><td>" << p.total_moved_volume
+               << "</td><td>" << p.max_cut_depth << " / " << p.max_fill_depth
+               << "</td><td><b>" << p.summary.total_cost << "</b></td></tr>";
+        }
+        os << "</table>";
+    }
+
+    if (multi_bench && multi_bench->bench_count >= 2) {
+        os << "<h2>9. 主坡向自适应多级台阶 DP 优化</h2>"
+           << "<p>" << esc(multi_bench->summary) << "</p>"
+           << "<table><tr><th>台号</th><th>设计标高(m)</th><th>面积(m²)</th><th>挖方(m³)</th><th>填方(m³)</th></tr>";
+        for (const auto& bz : multi_bench->benches) {
+            os << "<tr><td>第" << bz.index << "级</td><td>" << bz.elevation
+               << "</td><td>" << bz.area << "</td><td>" << bz.cut_volume
+               << "</td><td>" << bz.fill_volume << "</td></tr>";
+        }
+        os << "</table>";
     }
 
     os << "</body></html>";
