@@ -2,27 +2,26 @@
 
 基于 TIN（不规则三角网）的土方工程量自动计算桌面应用，适用于施工现场测量数据的土方挖填量精确计算。现同时提供 **Python 桌面版** 与 **原生 C++20 南方CASS 风格 CAD 工作站版（`cpp/`）**。
 
-## 原生 C++20 南方CASS 工作站版（`cpp/`，v3.10.0）
+## 原生 C++20 南方CASS 工作站版（`cpp/`，v4.5.0）
 
-- **技术架构**：C++20 + Dear ImGui（Windows 原生 Win32 + Direct3D 11 静态链接；macOS/Linux 原生支持无头/核心与 UI 回归编译测试）。
-- **界面风格**：仿照 **南方CASS 10/11** 深色工程 CAD 工作站布局（顶部菜单/快捷工具栏 + 左侧可折叠屏幕菜单 + 中央黑底模型/白底出图交互画布 + **3D 实景视口** + 右侧 **7 标签属性页含 `AI智能`** + 底部双语 CAD 命令控制台与状态栏）。
-- **核心算法对齐与性能实测**（`test_data_1000.xlsx`，1000 测点，设计高程 `50.0 m`）：
+- **技术架构**：C++20 + Dear ImGui（Windows 原生 Win32 + Direct3D 11 静态链接；macOS/Linux 原生支持核心算量/AI 与无头 UI 回归编译测试）。
+- **界面风格**：仿照 **南方CASS 10/11** 深色工程 CAD 工作站布局（顶部菜单/快捷工具栏 + 左侧可折叠屏幕菜单 + 中央黑底模型/白底出图交互画布含**实时悬停工程遥测 HUD** + **3D 实景视口含排水坡度风险着色** + 右侧 **7 标签属性页含 `AI智能`** + 底部双语 CAD 命令控制台与状态栏）。
+- **核心算法对齐与万点级性能实测**（`test_data_1000.xlsx` & `101×101` 规则地形网格）：
   - **精度对齐**：C++ 版挖方 `3569.3644 m³` / 填方 `3876.4035 m³`，与 Python SciPy 核心版相对偏差 `< 0.0001%`。
-  - **构网与算量速度**：带 X-排序扫描剔除的 Bowyer-Watson TIN + 平板算量约 `1.9 ms`；SPFA 最小费用最大流土方调配约 `0.04 ~ 0.07 ms`。
-- **v3.x 新增 AI 工程智能与实用工具矩阵**（见 [cpp/ITERATION_GOAL.md](cpp/ITERATION_GOAL.md) 与 [docs/cpp_iteration_log.md](docs/cpp_iteration_log.md)）：
-  - **SPFA 精确土方调配 + 设计面联合费用优化**（`OPT` / `AIOPT`）：联合搜寻基准高程与双向排水坡度 $(H_0, i_x, i_y)$，融合挖填、跨区调配与弃/借土综合费用，较单平场显著降本。
-  - **$O(N)$ 空间网格测点异常诊断与自动修复**（`DIAG` / `CLEAN`）：2 遍 IRLS 局部最小二乘拟合检出高程突刺、深坑、坐标飞点与重合冲突点并支持一键局部修复（5,041 点规模扫描 `< 5 ms`）。
-  - **不确定度评定与自适应补测点推荐**（`UNCERT`）：Richardson 抽稀外推偏差修正 + 曲率-面积误差尺度贪心补测建议。
-  - **分裂共形变化显著性 LoD / 保精度点云抽稀 / 排水积水风险分析 / 标高敏感性曲线**（`SIGNIF` / `THIN` / `DRAIN` / `SENSITIVITY`）。
-  - **双级台阶斜坡平场优化 + 施工机械排班与工期台班估算**（`BENCH` / `FLEET`）：结合挡土墙/护坡造价自动比选两级台阶方案，并在 2D CAD 视口叠绘台阶分界线与标高徽标。
-  - **双语自然语言 CAD 控制台与 Tab 自动补全**（如 `"把标高设为50.8"`、`"优化总费用"`、`"推荐8个补测点"`、`"导出工程量清单报价表"`）。
-  - **完整成果交付导出**：`EXP_BOQ`（工程量清单报价表 CSV）、`HTMLRPT`（含内嵌 SVG 对照图与台阶/机械卡片的 HTML 决策报告）、`EXP_REC`（补测点 CSV）、`EXP_AIDXF`（AI 专题 R12 DXF 图层）。
-- **跨平台构建、全量测试与目标评分验证**：
+  - **构网与算量速度**：空间蛇形行走定位 + Lawson Delaunay 将 `1,000` 测点单次构网算量提速至 **`~1.3 ms`**，`10,201` 测点（`20,000` 三角面片）构网算量提速 13 倍至 **`~8.8 ms`**；SPFA 最小费用最大流土方调配 `< 0.15 ms`。
+- **v3.x ~ v4.x AI 工程智能与实用工具矩阵**（见 [cpp/ITERATION_GOAL.md](cpp/ITERATION_GOAL.md)、[cpp/ITERATION_GOAL_V4.md](cpp/ITERATION_GOAL_V4.md) 与 [docs/cpp_iteration_log.md](docs/cpp_iteration_log.md)）：
+  - **SPFA 精确土方调配 + 多约束/多目标 Pareto 优化**（`OPT` / `PARETO`）：支持最大坡度约束、最小排水合成坡度 `min_drain_slope_pct` 与控制点接边高程容差约束 `ControlPointConstraint`，并在三维目标 $(\text{综合费用}, \text{挖填总量}, \max(\text{挖深},\text{填高}))$ 上生成非支配 Pareto 前沿支持点击采纳与 `EXP_PARETO` 导出。
+  - **主坡向自适应 $K=2..4$ 动态规划多级台阶与正交两级台阶优化**（`MULTIBENCH` / `APPLY_BENCH` / `BENCH`）：拟合地形主上升坡向，在含挡墙造价下以精确 DP 搜寻最优多级台阶标高，支持一键写入工程分区设计面（`Ctrl+Z` 可撤销）并在 2D/3D 视口叠绘分界线与级差徽标；在 45° 对角陡坡山地较单平场降本 **45.79%**、较正交两级台阶再降本 **37.67%**。
+  - **施工机械集群排班与工期台班估算 + 工程量清单报价表**（`FLEET` / `EXP_BOQ`）：计算挖机/自卸车/压实机组配置、预计工期及带 UTF-8 BOM 的 BOQ 分部分项报价 CSV。
+  - **$O(N)$ 空间网格测点异常诊断与修复 + Richardson 不确定度与补测推荐**（`DIAG` / `CLEAN` / `UNCERT` / `EXP_REC`）：5,041 点扫描 `< 4 ms`，输出自适应高收益补测靶标与 95% 置信区间。
+  - **分裂共形显著性 LoD / 保精度点云抽稀 / 排水积水检查 / 17 档标高敏感性曲线**（`SIGNIF` / `THIN` / `DRAIN` / `SENSITIVITY`）。
+  - **双语自然语言 CAD 控制台与全成果交付**：支持中文/英文命令与 Tab 补全，导出 BOQ CSV、Pareto CSV、补测点 CSV、AI 专题 R12 DXF 及含内嵌 SVG 与多级台阶/机械表格的 HTML 决策报告（`HTMLRPT`）。
+- **跨平台构建、双榜目标评测与 ASan+UBSan 验证**：
   ```bash
-  # macOS / Linux（核心库 + 33 项核心单元测试 + 无头 UI 回归 + AI 基准与评分）
+  # macOS / Linux（同时运行 37 项核心单测 + 无头 UI 回归 + AI 基准，同步输出 v3.0 与 v4.0 双榜评分）
   python3 tools/eval_cpp_goal.py
 
-  # 地址/未定义行为消毒器 (ASan + UBSan) 审计
+  # 地址/未定义行为消毒器 (ASan + UBSan) 全量审计
   cmake -S cpp -B cpp/build_asan -DCMAKE_BUILD_TYPE=RelWithDebInfo \
     -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer" \
     -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"

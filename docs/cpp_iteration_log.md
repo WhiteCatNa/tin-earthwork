@@ -270,3 +270,24 @@ _以下各轮记录均由 `python3 tools/eval_cpp_goal.py` 真实编译、运行
 - **关键实测性能**：`tin_ms = 1.26 ms`、`tin_10k_ms = 8.76 ms`、`multi_bench_ms = 10.37 ms`
 
 - **下一步持续迭代方向**：进入 `v4.5.0`（全量 ASan + UBSan 审计、`README.md` 与 `v4.0.0-alpha → v4.5.0` 总览收尾）。
+
+---
+
+## Iteration 16 — v4.x 全量 ASan+UBSan 审计与文档收尾 (v4.5.0)
+
+### 改动清单
+1. **AddressSanitizer + UndefinedBehaviorSanitizer 全量消毒审计** (`cpp/tests/test_core.cpp`)
+   - 在 `-fsanitize=address,undefined -fno-omit-frame-pointer` 下为 Test 34/36 补充消毒器插桩合理耗时预算（Release 仍严格维持 `< 25 ms` 门禁），执行 `ctest --test-dir cpp/build_asan --output-on-failure` 全部 **3/3 PASS**（总耗时 `17.79 s`，37 项核心单测、无头 UI 回归与 AI 基准均无任何内存泄漏或未定义行为），审计完毕已清理临时目录。
+2. **文档体系更新** (`README.md`, `docs/cpp_iteration_log.md`)
+   - 更新 `README.md` 反映 `v4.5.0` 架构能力与万点实时性能，并汇总 `v4.0.0-alpha → v4.5.0` 完整演进轨迹。
+
+### `v4.0.0-alpha → v4.5.0` 递归迭代演进总表
+
+| 版本 | 迭代主题 | 核心突破与实测收益 | v4.0 评分 |
+| --- | --- | --- | --- |
+| `v4.0.0-alpha` | 建立 v4.0 目标规范与万点基线 | `ITERATION_GOAL_V4.md`、10,201 点性能探针 (`116.70 ms`) | 48.04 / 100 |
+| `v4.1.0` | 万点级实时构网引擎 | 空间蛇形行走定位 + Lawson Delaunay，10k 点降至 **8.83 ms**（13.2x 提速） | 61.00 / 100 |
+| `v4.2.0` | 多约束优化与 Pareto 前沿 | 最小排水坡度/控制点约束、`compute_grade_pareto_frontier` (5 组方案)、`EXP_PARETO` | 80.00 / 100 |
+| `v4.3.0` | 主坡向多级台阶动态规划 | $K=2..4$ 精确 DP，45° 陡坡较单平场省 **45.79%**、较正交两级省 **37.67%** (`10.61 ms`) | 90.00 / 100 |
+| `v4.4.0` | CAD 遥测 HUD 与 3D 排水视口 | 鼠标悬停实时挖填/坡度坡向 HUD、3D `SlopeDrainage`、`APPLY_BENCH`、HTML 第 8/9 节 | 100.00 / 100 |
+| `v4.5.0` | 全量消毒审计与文档总览 | ASan+UBSan 3/3 PASS (`17.79s`, 37/37 单测)、`README.md` 与演进日志收尾 | **100.00 / 100** |

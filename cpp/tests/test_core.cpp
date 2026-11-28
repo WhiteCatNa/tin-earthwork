@@ -974,7 +974,18 @@ int main(int argc, char** argv) {
         check_near(res.computed_area, expected_area, 1e-4, "10k grid area exact");
         check_near(res.total_cut, expected_cut, 1e-2, "10k grid analytical volume exact");
         check_true(res.triangle_count == 20000, "101x101 grid forms 20,000 triangles");
-        check_true(ms < 25.0, "10,201 pts TIN+volume runs in < 25 ms");
+#if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_UNDEFINED__)
+        constexpr double k10kLimitMs = 250.0;
+#elif defined(__has_feature)
+#  if __has_feature(address_sanitizer) || __has_feature(undefined_behavior_sanitizer)
+        constexpr double k10kLimitMs = 250.0;
+#  else
+        constexpr double k10kLimitMs = 25.0;
+#  endif
+#else
+        constexpr double k10kLimitMs = 25.0;
+#endif
+        check_true(ms < k10kLimitMs, "10,201 pts TIN+volume within latency budget");
     });
 
     // 35. 最小排水坡度 + 控制点接边约束优化与多目标 Pareto 前沿校验
@@ -1052,7 +1063,18 @@ int main(int argc, char** argv) {
         check_true(dp3.savings_pct > 40.0, "oriented 3-bench DP saves > 40% vs single pad");
         double vs_axis2 = (axis2.total_cost - dp3.total_cost) / axis2.total_cost * 100.0;
         check_true(vs_axis2 > 10.0, "oriented 3-bench DP beats axis-aligned 2-bench by > 10%");
-        check_true(dp3.elapsed_ms < 25.0, "DP multi-bench solver < 25 ms");
+#if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_UNDEFINED__)
+        constexpr double kDpLimitMs = 250.0;
+#elif defined(__has_feature)
+#  if __has_feature(address_sanitizer) || __has_feature(undefined_behavior_sanitizer)
+        constexpr double kDpLimitMs = 250.0;
+#  else
+        constexpr double kDpLimitMs = 25.0;
+#  endif
+#else
+        constexpr double kDpLimitMs = 25.0;
+#endif
+        check_true(dp3.elapsed_ms < kDpLimitMs, "DP multi-bench solver within latency budget");
     });
 
     // 37. v4.0 HTML 报告 Pareto/多级台阶渲染与助手机构意图集成校验
