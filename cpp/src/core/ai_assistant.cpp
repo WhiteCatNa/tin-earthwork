@@ -168,6 +168,14 @@ AssistantIntent parse_engineering_intent(const std::string& raw_input) {
         out.action = AssistantAction::RunSensitivity;
         return out;
     }
+    if (up == "BENCH" || up == "STEPPED" || up == "TERRACE") {
+        out.action = AssistantAction::OptimizeStepped;
+        return out;
+    }
+    if (up == "FLEET" || up == "SCHEDULE" || up == "MACHINES") {
+        out.action = AssistantAction::EstimateFleet;
+        return out;
+    }
     if (up == "MEASURE" || up == "DIST" || up == "DI") {
         out.action = AssistantAction::MeasureDist;
         return out;
@@ -302,6 +310,24 @@ AssistantIntent parse_engineering_intent(const std::string& raw_input) {
     if (contains_any(lo, {"敏感性", "标高曲线", "sensitivity", "elevation curve"})) {
         out.action = AssistantAction::RunSensitivity;
         out.reply = "AI助手: 生成设计标高-方量/综合费用敏感性曲线";
+        return out;
+    }
+    if (contains_any(lo, {"台阶", "阶梯", "二级平场", "双级", "stepped", "terrace", "bench"})) {
+        out.action = AssistantAction::OptimizeStepped;
+        if (!nums.empty()) {
+            out.param1 = std::clamp(std::abs(nums[0]), 0.0, 2000.0);
+            out.has_param1 = true;
+        }
+        out.reply = "AI助手: 执行双级台阶平场及挡土墙联合造价优化";
+        return out;
+    }
+    if (contains_any(lo, {"机械", "挖机", "自卸车", "工期", "台班", "排班", "fleet", "schedule", "excavator", "truck"})) {
+        out.action = AssistantAction::EstimateFleet;
+        if (!nums.empty()) {
+            out.param1 = std::clamp(std::abs(nums[0]), 1.0, 365.0);
+            out.has_param1 = true;
+        }
+        out.reply = "AI助手: 执行土方施工机械配置与工期台班估算";
         return out;
     }
     if (contains_any(lo, {"积水", "排水", "drainage", "ponding"})) {
@@ -472,9 +498,9 @@ AssistantIntent parse_engineering_intent(const std::string& raw_input) {
 
 std::vector<std::string> suggest_command_completions(const std::string& prefix) {
     static const char* kCommands[] = {
-        "AI", "AIOPT", "ANOMALY", "AREA", "AUTOB", "BALANCE", "BALPLANE",
+        "AI", "AIOPT", "ANOMALY", "AREA", "AUTOB", "BALANCE", "BALPLANE", "BENCH",
         "CALC", "CLEAN", "CLEAR", "CLRBND", "CONTOUR", "DARK", "DAT",
-        "DIAG", "DIST", "DRAIN", "DXF", "EXP_AIDXF", "EXP_REC", "FITPLANE", "GRID", "H0", "HAUL",
+        "DIAG", "DIST", "DRAIN", "DXF", "EXP_AIDXF", "EXP_REC", "FITPLANE", "FLEET", "GRID", "H0", "HAUL",
         "HELP", "HTMLRPT", "LIGHT", "MEASURE", "OPT", "OUTLINE", "PROFILE",
         "REDO", "SECTIONS", "SENSITIVITY", "SIGNIF", "SLOPE", "STRATA", "SWAP", "THIN", "UNCERT",
         "UNDO", "ZE", "2D", "3D"

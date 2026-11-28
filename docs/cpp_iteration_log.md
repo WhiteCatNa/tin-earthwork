@@ -110,3 +110,24 @@ _以下各轮记录均由 `python3 tools/eval_cpp_goal.py` 真实编译、运行
 - CTest: **3/3 PASS**
 
 - **下一步持续迭代方向**：进入 `v3.8.0`（双级台阶斜坡平场联合优化 + 土方机械配置与工期造价估算）。
+
+---
+
+## Iteration 8 — 双级台阶斜坡平场联合优化与施工机械工期估算 (v3.8.0)
+
+### 改动清单
+1. **双级台阶斜坡平场联合优化** (`cpp/src/core/ai_optimizer.hpp/.cpp`)
+   - 新增 `SteppedPlatformResult` 与 `optimize_stepped_platform(...)`：围绕 X 轴（左右台阶）及 Y 轴（南北台阶）扫描 9 档面积分割界线（0.30..0.70），按各分区三角网面积与松散/压实系数二分精确求解两级台阶零平衡标高 $(H_1, H_2)$，结合挡土墙/护坡接触线造价及跨区土方调配成本与单平场 $H_0$ 对比，自动优选总造价最低的台阶平场方案。
+2. **施工机械配置与工期台班估算** (`cpp/src/core/ai_optimizer.hpp/.cpp`)
+   - 新增 `FleetParams` / `FleetEstimateResult` 与 `estimate_earthwork_fleet(...)`：结合松方系数、跨区加权运距、自卸车单趟循环周期（装卸+往返运距/车速）及目标工期约束，推荐挖掘机台数、自卸车数量、推平压实机组套数、预计完工天数与机械台班总造价。
+3. **助手语义路由与 CASS 工作台集成** (`cpp/src/core/ai_assistant.hpp/.cpp`, `cpp/src/ui/app.hpp/.cpp`)
+   - 新增 CAD 命令 `BENCH` / `FLEET` 与中英文自然语言意图（“双级台阶”、“挡土墙”、“机械排班”、“预计工期”），并加入 Tab 自动补全与 `HELP` 清单；`AI智能` 标签页新增第 8 节参数设置与一键测算面板。
+4. **单元测试与无头 UI 验证** (`cpp/tests/test_core.cpp`, `cpp/tests/test_ui_headless.cpp`)
+   - 新增 Test 31 (`31_stepped_terrace_saves_cost_on_steep_slope`) 验证陡坡山地双级台阶含挡墙总造价较单平场降低 > 15%；新增 Test 32 (`32_earthwork_fleet_and_schedule_estimator`) 验证机械配置与运距-循环周期单调性。
+
+### 门禁验证结果
+- `python3 tools/eval_cpp_goal.py`：**100.00 / 100.00**（`tin_ms=1.87ms`, `haul_ms=0.07ms`, `grade_ms=44.40ms`, `uncertainty_ms=9.81ms`, `anomaly_recall=1.00`, `anomaly_precision=0.9091`, `survey_rec_ratio=208.55x`, `nl_intent_acc=1.00`, `ui_contrast=13.52`）
+- Compiler warnings (project `src/` & `tests/`): **0**
+- CTest: **3/3 PASS** (Core 32/32 PASS)
+
+- **下一步持续迭代方向**：进入 `v3.9.0`（2D CAD 台阶分界可视化 + 工程量清单报价表 BOQ CSV 导出 + HTML 决策报告升级）。

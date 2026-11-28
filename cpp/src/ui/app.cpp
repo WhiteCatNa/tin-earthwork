@@ -949,6 +949,46 @@ bool CassApp::run_sensitivity_action() {
     }
 }
 
+bool CassApp::run_stepped_platform_action(double wall_cost_per_m2) {
+    if (project_.points.size() < 4) {
+        status_text_ = "测点不足，无法执行双级台阶平场优化";
+        return false;
+    }
+    try {
+        if (wall_cost_per_m2 >= 0.0) {
+            wall_cost_per_m2_ = wall_cost_per_m2;
+        }
+        TINEarthworkCalculator calc(project_.settings.design_elevation);
+        configure_calculator(calc);
+        calc.build_tin();
+        stepped_result_ = optimize_stepped_platform(calc, cost_params_, wall_cost_per_m2_);
+        status_text_ = stepped_result_->summary;
+        log_cmd("命令: _BENCH -> " + stepped_result_->summary);
+        return true;
+    } catch (const std::exception& e) {
+        status_text_ = std::string("双级台阶优化失败: ") + e.what();
+        log_cmd("错误: " + status_text_);
+        return false;
+    }
+}
+
+bool CassApp::run_fleet_estimate_action(double target_days) {
+    if (!result_) {
+        if (!run_calculation()) return false;
+    }
+    if (!haul_result_) {
+        compute_haul_action();
+    }
+    if (target_days > 0.5) {
+        fleet_params_.target_days = target_days;
+    }
+    fleet_result_ = estimate_earthwork_fleet(
+        *result_, haul_result_ ? &(*haul_result_) : nullptr, fleet_params_);
+    status_text_ = fleet_result_->summary;
+    log_cmd("命令: _FLEET -> " + fleet_result_->summary);
+    return true;
+}
+
 bool CassApp::run_ai_full_workflow_action() {
     if (project_.points.size() < 4) {
         status_text_ = "请先导入不少于 4 个测点再运行一键 AI 全流程诊断";
@@ -1123,7 +1163,7 @@ void CassApp::execute_command(const std::string& raw_cmd) {
         log_cmd("CAD 经典指令: AUTOB | OUTLINE | CLRBND | CALC(F5) | BALANCE/H0 | FITPLANE | BALPLANE | SECTIONS");
         log_cmd("专题与绘图   : STRATA | HAUL | SLOPE | GRID | CONTOUR | PROFILE | MEASURE | AREA | 3D | 2D | ZE");
         log_cmd("AI 智能指令  : OPT/AIOPT(联合费用优化) | DIAG/ANOMALY(异常体检) | CLEAN(修复粗差) | UNCERT(补测推荐)");
-        log_cmd("实用分析指令 : SIGNIF(共形显著性LoD) | THIN(保精度抽稀) | DRAIN(排水/积水风险检查)");
+        log_cmd("实用分析指令 : SIGNIF(共形LoD) | THIN(抽稀) | DRAIN(排水) | SENSITIVITY(敏感性) | BENCH(双级台阶) | FLEET(机械工期)");
         log_cmd("自然语言示例 : \"把标高设为50.8\" | \"优化总费用\" | \"检查测点异常\" | \"推荐10个补测点\" | \"放坡 1:1.2 1:1.5\"");
         log_cmd("视图与编辑   : DARK | LIGHT | SWAP | UNDO | REDO | DAT | DXF | CLEAR (支持 Tab 自动补全)");
         break;
@@ -1203,6 +1243,14 @@ void CassApp::execute_command(const std::string& raw_cmd) {
         break;
     case AssistantAction::RunSensitivity:
         run_sensitivity_action();
+        set_inspector_tab(6);
+        break;
+    case AssistantAction::OptimizeStepped:
+        run_stepped_platform_action(intent.has_param1 ? intent.param1 : -1.0);
+        set_inspector_tab(6);
+        break;
+    case AssistantAction::EstimateFleet:
+        run_fleet_estimate_action(intent.has_param1 ? intent.param1 : -1.0);
         set_inspector_tab(6);
         break;
     case AssistantAction::MeasureDist:
@@ -2787,6 +2835,25 @@ void CassApp::render_tab_ai() {
         dl->AddText(ImVec2(p0.x + 42, p0.y + 4), IM_COL32(0x38, 0xBD, 0xF8, 240), "填方");
         dl->AddText(ImVec2(p0.x + 76, p0.y + 4), IM_COL32(0x4A, 0xDE, 0x80, 240), "总费用");
         ImGui::Dummy(ImVec2(cw, ch + 4.0f));
+    }
+
+    ImGui::Spacing();
+    draw_section_bar("8. 双级台阶优化 & 机械排班工期估算");
+    ImGui::InputDouble("挡墙护坡(元/m2)", &wall_cost_per_m2_, 10.0, 50.0, "%.0f");
+    if (ImGui::Button("双级台阶优化", ImVec2(-1, 0))) {
+        run_stepped_platform_action();
+    }
+    if (stepped_result_) {
+        ImGui::TextWrapped("%s", stepped_result_->summary.c_str());
+    }
+
+    ImGui::InputDouble("目标工期(天)", &fleet_params_.target_days, 1.0, 5.0, "%.0f");
+    ImGui::InputDouble("自卸车速(km/h)", &fleet_params_.truck_speed_kmh, 2.0, 5.0, "%.0f");
+    if (ImGui::Button("机械配置与工期估算", ImVec2(-1, 0))) {
+        run_fleet_estimate_action();
+    }
+    if (fleet_result_) {
+        ImGui::TextWrapped("%s", fleet_result_->summary.c_str());
     }
 
     ImGui::EndChild();

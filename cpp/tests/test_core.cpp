@@ -858,6 +858,58 @@ int main(int argc, char** argv) {
         check_true(std::filesystem::file_size(tin::utf8_to_wide(sens_csv)) > 200, "sensitivity csv non-empty");
     });
 
+    // 31. 双级台阶斜坡平场优化验证（陡坡山地较单平场显著降低综合造价）
+    run_test("31_stepped_terrace_saves_cost_on_steep_slope", [&]() {
+        auto slope_pts = make_grid_points(11, 11, 12.0, [](double x, double y) {
+            // 西低东高剧烈地形，适合南北轴分段（X分两级）
+            return 10.0 + 0.14 * x + 0.01 * y + 0.6 * std::sin(0.05 * y);
+        });
+        tin::TINEarthworkCalculator calc(18.0);
+        calc.add_points(slope_pts);
+        calc.build_tin();
+
+        auto st = tin::optimize_stepped_platform(calc, tin::HaulCostParams{}, 180.0);
+        check_true(st.split_axis == 0, "steep X-slope chooses X split axis");
+        check_true(st.step_height > 2.0, "stepped terrace introduces clear bench height delta");
+        check_true(st.bench2_elevation > st.bench1_elevation, "east bench higher than west bench");
+        check_true(st.total_cost < st.single_pad_cost && st.savings_pct > 15.0,
+                   "stepped terrace reduces total cost >15% including retaining wall");
+    });
+
+    // 32. 施工机械配置与工期台班造价估算验证
+    run_test("32_earthwork_fleet_and_schedule_estimator", [&]() {
+        auto pts = make_grid_points(9, 9, 15.0, [](double x, double y) {
+            return 25.0 + 0.03 * x - 0.02 * y + 1.5 * std::sin(0.04 * x);
+        });
+        tin::TINEarthworkCalculator calc(24.5);
+        calc.add_points(pts);
+        auto res = calc.run_full_calculation();
+        auto haul = tin::compute_haul_plan(res, 4, 3);
+
+        tin::FleetParams fp;
+        fp.target_days = 10.0;
+        auto f_fast = tin::estimate_earthwork_fleet(res, &haul, fp);
+        check_true(f_fast.excavators_needed >= 1 && f_fast.trucks_needed >= 1 && f_fast.compaction_sets >= 1,
+                   "fleet recommends positive equipment counts");
+        check_true(f_fast.estimated_days > 0.0 && f_fast.total_machine_cost > 0.0,
+                   "fleet schedule days and cost positive");
+
+        // 运距增大时单趟循环周期应单调变长，单车日运能下降
+        tin::HaulPlanResult short_haul = haul;
+        short_haul.export_surplus = 0.0;
+        short_haul.borrow_deficit = 0.0;
+        short_haul.cross_zone_hauled = std::max(1000.0, res.total_cut);
+        short_haul.avg_haul_distance = 120.0;
+        auto f_short = tin::estimate_earthwork_fleet(res, &short_haul, fp);
+
+        tin::HaulPlanResult long_haul = short_haul;
+        long_haul.avg_haul_distance = 650.0;
+        auto f_long = tin::estimate_earthwork_fleet(res, &long_haul, fp);
+        check_true(f_long.truck_cycle_min > f_short.truck_cycle_min, "longer haul increases truck cycle time");
+        check_true(f_long.truck_daily_cap_m3 < f_short.truck_daily_cap_m3, "longer haul reduces per-truck daily capacity");
+        check_true(f_long.trucks_needed >= f_short.trucks_needed, "longer haul requires >= trucks");
+    });
+
     std::cout << "=== Summary: PASSED " << g_passed << " / " << (g_passed + g_failed) << " ===\n";
     return g_failed == 0 ? 0 : 1;
 }

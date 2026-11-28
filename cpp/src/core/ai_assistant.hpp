@@ -30,6 +30,8 @@ enum class AssistantAction {
     ThinPoints,
     CheckDrainage,
     RunSensitivity,
+    OptimizeStepped,
+    EstimateFleet,
     MeasureDist,
     MeasureArea,
     SetElevation,

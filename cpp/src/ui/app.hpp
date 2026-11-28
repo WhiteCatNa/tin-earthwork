@@ -56,6 +56,8 @@ public:
     bool run_thinning_action(double tol_m = 0.15);
     bool run_drainage_action(double min_slope_pct = 0.3);
     bool run_sensitivity_action();
+    bool run_stepped_platform_action(double wall_cost_per_m2 = -1.0);
+    bool run_fleet_estimate_action(double target_days = -1.0);
     bool run_ai_full_workflow_action();
     void set_3d_view(bool enabled);
     void set_tool_mode(CadToolMode mode);
@@ -75,6 +77,8 @@ public:
     const ThinningResult* thinning_result() const { return thinning_result_ ? &(*thinning_result_) : nullptr; }
     const DrainageReport* drainage_report() const { return drainage_report_ ? &(*drainage_report_) : nullptr; }
     const SensitivityCurveResult* sensitivity_result() const { return sensitivity_result_ ? &(*sensitivity_result_) : nullptr; }
+    const SteppedPlatformResult* stepped_result() const { return stepped_result_ ? &(*stepped_result_) : nullptr; }
+    const FleetEstimateResult* fleet_result() const { return fleet_result_ ? &(*fleet_result_) : nullptr; }
     const DiagnosisSummary* diagnosis_summary() const { return diagnosis_summary_ ? &(*diagnosis_summary_) : nullptr; }
     const ProjectData& project() const { return project_; }
     double min_z() const { return min_nat_z_; }
@@ -153,6 +157,8 @@ private:
     std::optional<ThinningResult> thinning_result_;
     std::optional<DrainageReport> drainage_report_;
     std::optional<SensitivityCurveResult> sensitivity_result_;
+    std::optional<SteppedPlatformResult> stepped_result_;
+    std::optional<FleetEstimateResult> fleet_result_;
     std::optional<DiagnosisSummary> diagnosis_summary_;
     std::optional<std::string> current_project_path_;
 
@@ -201,6 +207,8 @@ private:
     double measure_sigma_ = 0.03;
     double thin_tol_m_ = 0.15;
     double drain_min_slope_ = 0.3;
+    double wall_cost_per_m2_ = 220.0;
+    FleetParams fleet_params_;
 
     struct EditSnapshot {
         std::vector<XY> boundary;

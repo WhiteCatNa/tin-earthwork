@@ -203,4 +203,68 @@ SensitivityCurveResult run_elevation_sensitivity_curve(
     int steps = 17,
     double half_span_m = 0.0);
 
+// ---------- 8. 双级台阶斜坡平场联合优化（减少大高差场地挖填成本） ----------
+struct SteppedPlatformResult {
+    int split_axis = 0;            // 0=沿X坐标分段(西/东台阶), 1=沿Y坐标分段(南/北台阶)
+    double split_coord = 0.0;      // 分段界线坐标 (m)
+    double split_length = 0.0;     // 台阶挡墙/护坡接触线长度 (m)
+    double bench1_elevation = 0.0; // 分界线低坐标侧设计标高 (m)
+    double bench2_elevation = 0.0; // 分界线高坐标侧设计标高 (m)
+    double bench1_cut = 0.0;
+    double bench1_fill = 0.0;
+    double bench2_cut = 0.0;
+    double bench2_fill = 0.0;
+    double step_height = 0.0;      // 两级台阶级差 |H1 - H2| (m)
+    double wall_cost_per_m2 = 220.0;
+    double step_wall_cost = 0.0;   // 挡土墙/边坡支护造价 (元)
+    double earthwork_cost = 0.0;   // 两级台阶土方挖填及调配造价 (元)
+    double total_cost = 0.0;       // 两级台阶综合总造价 (元)
+    double single_pad_elevation = 0.0;
+    double single_pad_cut = 0.0;
+    double single_pad_fill = 0.0;
+    double single_pad_cost = 0.0;
+    double savings_vs_single = 0.0;
+    double savings_pct = 0.0;
+    std::string summary;
+};
+
+SteppedPlatformResult optimize_stepped_platform(
+    const TINEarthworkCalculator& base_calc,
+    const HaulCostParams& costs = HaulCostParams{},
+    double wall_cost_per_m2 = 220.0);
+
+// ---------- 9. 施工机械配置与工期台班造价估算 ----------
+struct FleetParams {
+    double exc_rate_m3_per_h = 110.0;  // 挖掘机小时产能 (自然方 m³/h)
+    double truck_capacity_m3 = 18.0;   // 自卸车松方斗容 (m³/车)
+    double truck_speed_kmh = 22.0;     // 场内施工道路平均车速 (km/h)
+    double load_dump_wait_min = 6.5;   // 装卸等候单趟辅助时间 (min)
+    double work_hours_per_day = 9.0;   // 日有效台班作业时长 (h/d)
+    double exc_daily_rent = 3600.0;    // 挖掘机台班日租金 (元/台·天)
+    double truck_daily_rent = 1800.0;  // 自卸车日租金 (元/辆·天)
+    double dozer_daily_rent = 2600.0;  // 推土/平地/压实机组日租金 (元/套·天)
+    double target_days = 15.0;         // 目标工期天数 (天)
+    int max_excavators = 8;            // 最大可展开挖机工作面数
+};
+
+struct FleetEstimateResult {
+    double loose_cut_volume = 0.0;
+    double compact_fill_volume = 0.0;
+    double avg_haul_dist_m = 0.0;
+    double truck_cycle_min = 0.0;
+    double truck_daily_cap_m3 = 0.0;
+    int excavators_needed = 0;
+    int trucks_needed = 0;
+    int compaction_sets = 0;
+    double estimated_days = 0.0;
+    double daily_peak_m3 = 0.0;
+    double total_machine_cost = 0.0;
+    std::string summary;
+};
+
+FleetEstimateResult estimate_earthwork_fleet(
+    const CalculationResult& calc_res,
+    const HaulPlanResult* haul = nullptr,
+    const FleetParams& params = FleetParams{});
+
 } // namespace tin

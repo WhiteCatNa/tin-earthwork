@@ -1474,4 +1474,321 @@ SensitivityCurveResult run_elevation_sensitivity_curve(
     return out;
 }
 
+SteppedPlatformResult optimize_stepped_platform(
+    const TINEarthworkCalculator& base_calc,
+    const HaulCostParams& costs,
+    double wall_cost_per_m2) {
+    if (base_calc.points().size() < 4) {
+        throw std::runtime_error("至少需要 4 个测量点才能执行双级台阶平场优化");
+    }
+
+    TINEarthworkCalculator work = base_calc;
+    if (!work.has_tin()) work.build_tin();
+
+    const SoilFactors sf = work.soil_factors();
+    BalanceResult bal = solve_balance_elevation(work, sf);
+    work.set_design_elevation(bal.elevation);
+    CalculationResult single_res = work.calculate_volumes();
+    HaulPlanResult single_haul = compute_haul_plan(single_res, 4, 3, costs);
+
+    SteppedPlatformResult best;
+    best.wall_cost_per_m2 = std::max(0.0, wall_cost_per_m2);
+    best.single_pad_elevation = bal.elevation;
+    best.single_pad_cut = single_res.total_cut;
+    best.single_pad_fill = single_res.total_fill;
+    best.single_pad_cost = single_haul.estimated_cost;
+    best.bench1_elevation = bal.elevation;
+    best.bench2_elevation = bal.elevation;
+    best.bench1_cut = single_res.total_cut;
+    best.bench1_fill = single_res.total_fill;
+    best.earthwork_cost = single_haul.estimated_cost;
+    best.total_cost = single_haul.estimated_cost;
+
+    struct TriItem {
+        SurveyPoint p0, p1, p2;
+        double area = 0.0;
+        double cx = 0.0, cy = 0.0;
+        double zmin = 0.0, zmax = 0.0;
+    };
+    std::vector<TriItem> items;
+    items.reserve(single_res.triangles.size());
+    double total_area = 0.0;
+    double xmin = 1e30, xmax = -1e30, ymin = 1e30, ymax = -1e30;
+    for (const auto& t : single_res.triangles) {
+        if (t.is_boundary || t.area <= 1e-12) continue;
+        TriItem it;
+        it.p0 = t.p0;
+        it.p1 = t.p1;
+        it.p2 = t.p2;
+        it.area = t.area;
+        it.cx = (t.p0.x + t.p1.x + t.p2.x) / 3.0;
+        it.cy = (t.p0.y + t.p1.y + t.p2.y) / 3.0;
+        it.zmin = std::min({t.p0.z, t.p1.z, t.p2.z});
+        it.zmax = std::max({t.p0.z, t.p1.z, t.p2.z});
+        xmin = std::min(xmin, it.cx);
+        xmax = std::max(xmax, it.cx);
+        ymin = std::min(ymin, it.cy);
+        ymax = std::max(ymax, it.cy);
+        total_area += it.area;
+        items.push_back(it);
+    }
+
+    if (items.size() < 6 || total_area <= 1e-9) {
+        best.summary = "有效三角网数量不足，维持单平场平衡标高方案";
+        return best;
+    }
+
+    auto eval_subset_vol = [&](const std::vector<size_t>& idxs, double h,
+                               double& out_cut, double& out_fill,
+                               std::vector<Triangle>* out_tris) {
+        out_cut = 0.0;
+        out_fill = 0.0;
+        for (size_t idx : idxs) {
+            const auto& it = items[idx];
+            double dz0 = it.p0.z - h;
+            double dz1 = it.p1.z - h;
+            double dz2 = it.p2.z - h;
+
+            double raw_area = std::abs(
+                (it.p0.x * (it.p1.y - it.p2.y) +
+                 it.p1.x * (it.p2.y - it.p0.y) +
+                 it.p2.x * (it.p0.y - it.p1.y)) * 0.5);
+            double scale = (raw_area > 1e-12) ? std::clamp(it.area / raw_area, 0.0, 1.0) : 1.0;
+
+            double t_cut = 0.0, t_fill = 0.0;
+            Triangle tri;
+            tri.p0 = it.p0; tri.p1 = it.p1; tri.p2 = it.p2;
+            tri.p0.design_z = h; tri.p1.design_z = h; tri.p2.design_z = h;
+            tri.p0.delta_z = dz0; tri.p1.delta_z = dz1; tri.p2.delta_z = dz2;
+            tri.area = it.area;
+
+            const bool pos = (dz0 > 0.0 || dz1 > 0.0 || dz2 > 0.0);
+            const bool neg = (dz0 < 0.0 || dz1 < 0.0 || dz2 < 0.0);
+            if (!(pos && neg)) {
+                double vol = it.area * (dz0 + dz1 + dz2) / 3.0;
+                if (vol >= 0.0) t_cut = vol;
+                else t_fill = -vol;
+            } else {
+                std::vector<XY> poly = {{it.p0.x, it.p0.y}, {it.p1.x, it.p1.y}, {it.p2.x, it.p2.y}};
+                std::vector<double> vals = {dz0, dz1, dz2};
+                auto [cp, cv] = clip_by_sign(poly, vals, true);
+                auto [fp, fv] = clip_by_sign(poly, vals, false);
+                auto [_ca, cvol] = polygon_integral(cp, cv);
+                auto [_fa, fvol] = polygon_integral(fp, fv);
+                (void)_ca; (void)_fa;
+                t_cut = std::max(0.0, cvol) * scale;
+                t_fill = std::max(0.0, -fvol) * scale;
+                if (out_tris) {
+                    tri.cut_polygon = std::move(cp);
+                    tri.fill_polygon = std::move(fp);
+                }
+            }
+            tri.cut_volume = t_cut;
+            tri.fill_volume = t_fill;
+            out_cut += t_cut;
+            out_fill += t_fill;
+            if (out_tris) out_tris->push_back(std::move(tri));
+        }
+    };
+
+    auto solve_subset_balance = [&](const std::vector<size_t>& idxs,
+                                    double& out_h, double& out_cut, double& out_fill) {
+        double lo = 1e30, hi = -1e30;
+        for (size_t idx : idxs) {
+            lo = std::min(lo, items[idx].zmin);
+            hi = std::max(hi, items[idx].zmax);
+        }
+        if (hi - lo < 1e-6) {
+            out_h = lo;
+            eval_subset_vol(idxs, out_h, out_cut, out_fill, nullptr);
+            return;
+        }
+        double compact = std::max(0.5, sf.compact);
+        for (int it = 0; it < 28; ++it) {
+            double mid = 0.5 * (lo + hi);
+            double c = 0.0, f = 0.0;
+            eval_subset_vol(idxs, mid, c, f, nullptr);
+            double surplus = c - f / compact;
+            if (surplus > 0.0) lo = mid;
+            else hi = mid;
+        }
+        out_h = 0.5 * (lo + hi);
+        eval_subset_vol(idxs, out_h, out_cut, out_fill, nullptr);
+    };
+
+    bool found_better = false;
+    double best_score_cost = std::numeric_limits<double>::infinity();
+    std::vector<size_t> side1, side2;
+    side1.reserve(items.size());
+    side2.reserve(items.size());
+
+    for (int axis = 0; axis < 2; ++axis) {
+        double umin = (axis == 0) ? xmin : ymin;
+        double umax = (axis == 0) ? xmax : ymax;
+        double perp_span = (axis == 0) ? (ymax - ymin) : (xmax - xmin);
+        if (umax - umin < 1.0 || perp_span < 1.0) continue;
+
+        for (int s = 0; s < 9; ++s) {
+            double frac = 0.30 + 0.05 * static_cast<double>(s);
+            double split = umin + frac * (umax - umin);
+            side1.clear();
+            side2.clear();
+            double area1 = 0.0, area2 = 0.0;
+            double band = 0.12 * (umax - umin);
+            double p_lo = 1e30, p_hi = -1e30;
+
+            for (size_t i = 0; i < items.size(); ++i) {
+                double u = (axis == 0) ? items[i].cx : items[i].cy;
+                double v = (axis == 0) ? items[i].cy : items[i].cx;
+                if (std::abs(u - split) <= band) {
+                    p_lo = std::min(p_lo, v);
+                    p_hi = std::max(p_hi, v);
+                }
+                if (u <= split) {
+                    side1.push_back(i);
+                    area1 += items[i].area;
+                } else {
+                    side2.push_back(i);
+                    area2 += items[i].area;
+                }
+            }
+            if (side1.size() < 3 || side2.size() < 3) continue;
+            if (area1 < 0.15 * total_area || area2 < 0.15 * total_area) continue;
+
+            double split_len = (p_hi > p_lo) ? std::min(perp_span, (p_hi - p_lo)) : 0.85 * perp_span;
+            split_len = std::max(1.0, split_len);
+
+            double h1 = 0.0, c1 = 0.0, f1 = 0.0;
+            double h2 = 0.0, c2 = 0.0, f2 = 0.0;
+            solve_subset_balance(side1, h1, c1, f1);
+            solve_subset_balance(side2, h2, c2, f2);
+
+            CalculationResult step_res;
+            step_res.soil_balance.factors = sf;
+            step_res.triangles.reserve(items.size());
+            double check_c1 = 0.0, check_f1 = 0.0, check_c2 = 0.0, check_f2 = 0.0;
+            eval_subset_vol(side1, h1, check_c1, check_f1, &step_res.triangles);
+            eval_subset_vol(side2, h2, check_c2, check_f2, &step_res.triangles);
+            step_res.total_cut = check_c1 + check_c2;
+            step_res.total_fill = check_f1 + check_f2;
+            step_res.net_volume = step_res.total_cut - step_res.total_fill;
+            step_res.soil_balance = SoilBalance{step_res.total_cut, step_res.total_fill, sf};
+
+            HaulPlanResult haul_step = compute_haul_plan(step_res, 4, 3, costs);
+            double dh = std::abs(h1 - h2);
+            double wall_cost = split_len * dh * best.wall_cost_per_m2;
+            double total_c = haul_step.estimated_cost + wall_cost;
+
+            if (total_c < best_score_cost) {
+                best_score_cost = total_c;
+                found_better = true;
+                best.split_axis = axis;
+                best.split_coord = split;
+                best.split_length = split_len;
+                best.bench1_elevation = h1;
+                best.bench2_elevation = h2;
+                best.bench1_cut = check_c1;
+                best.bench1_fill = check_f1;
+                best.bench2_cut = check_c2;
+                best.bench2_fill = check_f2;
+                best.step_height = dh;
+                best.step_wall_cost = wall_cost;
+                best.earthwork_cost = haul_step.estimated_cost;
+                best.total_cost = total_c;
+            }
+        }
+    }
+
+    if (found_better) {
+        best.savings_vs_single = best.single_pad_cost - best.total_cost;
+        best.savings_pct = (best.single_pad_cost > 1e-6)
+                               ? (best.savings_vs_single / best.single_pad_cost * 100.0)
+                               : 0.0;
+    }
+
+    std::ostringstream oss;
+    oss << std::fixed << std::setprecision(2);
+    if (!found_better || best.savings_vs_single <= 0.0) {
+        oss << "推荐维持单平场 (H0=" << best.single_pad_elevation << " m，造价 ¥"
+            << std::setprecision(0) << best.single_pad_cost
+            << "；双级台阶加支护成本反而高出 ¥" << std::max(0.0, -best.savings_vs_single) << ")";
+    } else {
+        oss << "建议沿" << (best.split_axis == 0 ? "X=" : "Y=") << best.split_coord
+            << "m 分两级台阶（H1=" << best.bench1_elevation << " m, H2=" << best.bench2_elevation
+            << " m, 级差 " << best.step_height << " m），含挡墙总造价 ¥"
+            << std::setprecision(0) << best.total_cost
+            << "，较单平场节省 ¥" << best.savings_vs_single
+            << " (" << std::setprecision(1) << best.savings_pct << "%)";
+    }
+    best.summary = oss.str();
+    return best;
+}
+
+FleetEstimateResult estimate_earthwork_fleet(
+    const CalculationResult& calc_res,
+    const HaulPlanResult* haul,
+    const FleetParams& params) {
+    FleetEstimateResult out;
+    double loose = std::max(1.0, calc_res.soil_balance.factors.loose);
+    out.loose_cut_volume = calc_res.total_cut * loose;
+    out.compact_fill_volume = calc_res.total_fill;
+
+    double equiv_nat = std::max(calc_res.total_cut, 0.35 * calc_res.total_fill);
+    if (equiv_nat <= 1e-6) {
+        out.summary = "当前挖填方量为 0，无需机械排班";
+        return out;
+    }
+
+    double avg_dist = 120.0;
+    if (haul) {
+        double moved = haul->cross_zone_hauled + haul->export_surplus + haul->borrow_deficit;
+        if (moved > 1e-6) {
+            avg_dist = (haul->cross_zone_hauled * haul->avg_haul_distance +
+                        (haul->export_surplus + haul->borrow_deficit) * 800.0) / moved;
+        } else if (haul->internal_balanced > 1e-6) {
+            avg_dist = 45.0;
+        }
+    }
+    out.avg_haul_dist_m = std::clamp(avg_dist, 25.0, 5000.0);
+
+    double speed_m_min = std::max(50.0, params.truck_speed_kmh * 1000.0 / 60.0);
+    double work_h = std::max(1.0, params.work_hours_per_day);
+    double truck_cap = std::max(2.0, params.truck_capacity_m3);
+    out.truck_cycle_min = std::max(2.0, params.load_dump_wait_min + (2.0 * out.avg_haul_dist_m) / speed_m_min);
+    out.truck_daily_cap_m3 = ((work_h * 60.0) / out.truck_cycle_min) * truck_cap;
+
+    double exc_daily_nat = std::max(10.0, params.exc_rate_m3_per_h) * work_h;
+    double target_d = std::max(1.0, params.target_days);
+    int max_exc = std::max(1, params.max_excavators);
+
+    out.excavators_needed = std::clamp(
+        static_cast<int>(std::ceil(equiv_nat / (exc_daily_nat * target_d))),
+        1, max_exc);
+
+    double exc_days = std::max(0.5, equiv_nat / (static_cast<double>(out.excavators_needed) * exc_daily_nat));
+    double loose_need_per_day = (equiv_nat * loose) / exc_days;
+    out.trucks_needed = std::max(1, static_cast<int>(std::ceil(loose_need_per_day / out.truck_daily_cap_m3)));
+    out.compaction_sets = std::max(1, static_cast<int>(std::ceil((calc_res.total_fill / exc_days) / 1800.0)));
+
+    double raw_days = std::max(
+        equiv_nat / (static_cast<double>(out.excavators_needed) * exc_daily_nat),
+        (equiv_nat * loose) / (static_cast<double>(out.trucks_needed) * out.truck_daily_cap_m3));
+    out.estimated_days = std::max(0.5, std::ceil(raw_days * 10.0) / 10.0);
+    out.daily_peak_m3 = (calc_res.total_cut + calc_res.total_fill) / out.estimated_days;
+    out.total_machine_cost = out.estimated_days *
+                             (out.excavators_needed * params.exc_daily_rent +
+                              out.trucks_needed * params.truck_daily_rent +
+                              out.compaction_sets * params.dozer_daily_rent);
+
+    std::ostringstream oss;
+    oss << std::fixed << std::setprecision(1)
+        << "建议配置 " << out.excavators_needed << " 台挖机 + " << out.trucks_needed
+        << " 辆自卸车 + " << out.compaction_sets << " 套压实机组，综合运距 "
+        << std::setprecision(0) << out.avg_haul_dist_m << " m，预计工期 "
+        << std::setprecision(1) << out.estimated_days << " 天，机械台班费约 ¥"
+        << std::setprecision(0) << out.total_machine_cost;
+    out.summary = oss.str();
+    return out;
+}
+
 } // namespace tin
