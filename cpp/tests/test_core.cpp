@@ -956,6 +956,27 @@ int main(int argc, char** argv) {
         check_true(boq_intent.action == tin::AssistantAction::ExportBoqCsv, "BOQ Chinese intent recognized");
     });
 
+    // 34. 万点级 (101x101 = 10,201 点) Y-分带 Bowyer-Watson 构网与算量实时性能校验
+    run_test("34_10000_points_delaunay_and_volume_perf", [&]() {
+        auto pts10k = make_grid_points(101, 101, 5.0, [](double x, double y) {
+            return 25.0 + 0.015 * x - 0.01 * y;
+        }); // 严格线性倾斜平面对 500x500m，Z=25+0.015*250-0.01*250=26.25 mean
+        auto t0 = std::chrono::steady_clock::now();
+        tin::TINEarthworkCalculator calc(20.0);
+        calc.add_points(pts10k);
+        auto res = calc.run_full_calculation();
+        auto t1 = std::chrono::steady_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        std::cout << "  [BENCH 10201 pts Y-strip Delaunay+Vol] tris=" << res.triangle_count
+                  << " area=" << res.computed_area << " ms=" << ms << "\n";
+        double expected_area = 500.0 * 500.0;
+        double expected_cut = expected_area * ((25.0 + 0.015 * 250.0 - 0.01 * 250.0) - 20.0);
+        check_near(res.computed_area, expected_area, 1e-4, "10k grid area exact");
+        check_near(res.total_cut, expected_cut, 1e-2, "10k grid analytical volume exact");
+        check_true(res.triangle_count == 20000, "101x101 grid forms 20,000 triangles");
+        check_true(ms < 25.0, "10,201 pts TIN+volume runs in < 25 ms");
+    });
+
     std::cout << "=== Summary: PASSED " << g_passed << " / " << (g_passed + g_failed) << " ===\n";
     return g_failed == 0 ? 0 : 1;
 }

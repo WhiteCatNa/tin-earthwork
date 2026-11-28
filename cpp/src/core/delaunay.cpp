@@ -1,6 +1,7 @@
 #include "core/delaunay.hpp"
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <limits>
 #include <map>
 #include <numeric>
@@ -29,38 +30,10 @@ double in_circle_ccw(const XY& a, const XY& b, const XY& c, const XY& d) {
          + ad  * (bdx * cdy - bdy * cdx);
 }
 
-struct BWCircle {
-    int a, b, c;
-    double cx, cy, r2, max_x;
+struct LTri {
+    int v[3];
+    int nb[3]; // nb[k] 是边 (v[(k+1)%3], v[(k+2)%3]) 对侧相邻三角形索引，-1 表示边界
 };
-
-BWCircle make_bw_tri(const std::vector<XY>& pts, int a, int b, int c) {
-    if (orient2d(pts[a], pts[b], pts[c]) < 0.0) {
-        std::swap(b, c);
-    }
-    const XY& pa = pts[a];
-    const XY& pb = pts[b];
-    const XY& pc = pts[c];
-    double ax = pb.x - pa.x, ay = pb.y - pa.y;
-    double bx = pc.x - pa.x, by = pc.y - pa.y;
-    double d = 2.0 * (ax * by - ay * bx);
-    BWCircle tri{a, b, c, 0.0, 0.0, 0.0, std::numeric_limits<double>::infinity()};
-    if (std::abs(d) < 1e-18) {
-        tri.cx = (pa.x + pb.x + pc.x) / 3.0;
-        tri.cy = (pa.y + pb.y + pc.y) / 3.0;
-        tri.r2 = std::numeric_limits<double>::infinity();
-        return tri;
-    }
-    double a2 = ax * ax + ay * ay;
-    double b2 = bx * bx + by * by;
-    double ux = (by * a2 - ay * b2) / d;
-    double uy = (ax * b2 - bx * a2) / d;
-    tri.cx = pa.x + ux;
-    tri.cy = pa.y + uy;
-    tri.r2 = ux * ux + uy * uy;
-    tri.max_x = tri.cx + std::sqrt(tri.r2);
-    return tri;
-}
 
 } // namespace
 
@@ -93,93 +66,215 @@ std::vector<TriIndex> build_delaunay(const std::vector<XY>& points) {
     norm[s1] = {200.0, -100.0};
     norm[s2] = {50.0, 200.0};
 
+    // 空间蛇形网格排序：相邻插入点在平面上高度局域，保证三角形行走 Locate 仅需 O(1) 步
+    const int G = std::clamp(static_cast<int>(std::sqrt(static_cast<double>(n))), 4, 256);
     std::vector<int> order(n);
     std::iota(order.begin(), order.end(), 0);
     std::sort(order.begin(), order.end(), [&](int i, int j) {
-        if (norm[i].x != norm[j].x) return norm[i].x < norm[j].x;
+        int gy_i = std::clamp(static_cast<int>(norm[i].y * G), 0, G - 1);
+        int gy_j = std::clamp(static_cast<int>(norm[j].y * G), 0, G - 1);
+        if (gy_i != gy_j) return gy_i < gy_j;
+        int gx_i = std::clamp(static_cast<int>(norm[i].x * G), 0, G - 1);
+        int gx_j = std::clamp(static_cast<int>(norm[j].x * G), 0, G - 1);
+        bool rev = (gy_i & 1) != 0;
+        if (gx_i != gx_j) return rev ? (gx_i > gx_j) : (gx_i < gx_j);
+        if (norm[i].x != norm[j].x) return rev ? (norm[i].x > norm[j].x) : (norm[i].x < norm[j].x);
         return norm[i].y < norm[j].y;
     });
 
-    std::vector<BWCircle> active_tris;
-    std::vector<BWCircle> finished_tris;
-    active_tris.reserve(256);
-    finished_tris.reserve(n * 2 + 8);
-    active_tris.push_back(make_bw_tri(norm, s0, s1, s2));
+    std::vector<LTri> tris;
+    tris.reserve(static_cast<size_t>(n) * 2 + 8);
+    tris.push_back({{s0, s1, s2}, {-1, -1, -1}});
 
-    struct Edge {
-        int u, v;
+    auto replace_nbr = [&](int tri_id, int old_nbr, int new_nbr) {
+        if (tri_id < 0 || old_nbr == new_nbr) return;
+        int* nb = tris[static_cast<size_t>(tri_id)].nb;
+        for (int k = 0; k < 3; ++k) {
+            if (nb[k] == old_nbr) {
+                nb[k] = new_nbr;
+                return;
+            }
+        }
     };
 
-    std::vector<Edge> edges;
-    std::vector<Edge> polygon;
-    edges.reserve(48);
-    polygon.reserve(24);
+    auto find_nbr_corner = [&](int tri_id, int target_nbr) -> int {
+        const int* nb = tris[static_cast<size_t>(tri_id)].nb;
+        if (nb[0] == target_nbr) return 0;
+        if (nb[1] == target_nbr) return 1;
+        return 2;
+    };
+
+    std::vector<int> flip_stack;
+    flip_stack.reserve(64);
+    int last_tri = 0;
 
     for (int p : order) {
         const XY& pt = norm[p];
-        edges.clear();
-        polygon.clear();
 
-        size_t ti = 0;
-        while (ti < active_tris.size()) {
-            const BWCircle& t = active_tris[ti];
-            if (t.max_x < pt.x - 1e-10) {
-                if (t.a < n && t.b < n && t.c < n) {
-                    finished_tris.push_back(t);
-                }
-                active_tris[ti] = active_tris.back();
-                active_tris.pop_back();
-                continue;
+        // 1. 从 last_tri 出发进行 O(1) 期望步数的方向行走定位包含 pt 的三角形
+        int cur = last_tri;
+        int steps = 0;
+        const int max_steps = std::min<int>(512, static_cast<int>(tris.size()) + 16);
+        bool located = false;
+        while (steps < max_steps) {
+            const LTri& t = tris[static_cast<size_t>(cur)];
+            const XY& a = norm[t.v[0]];
+            const XY& b = norm[t.v[1]];
+            const XY& c = norm[t.v[2]];
+            double o0 = orient2d(b, c, pt);
+            double o1 = orient2d(c, a, pt);
+            double o2 = orient2d(a, b, pt);
+            int next_k = -1;
+            double worst = -1e-13;
+            if (o0 < worst && t.nb[0] >= 0) { worst = o0; next_k = 0; }
+            if (o1 < worst && t.nb[1] >= 0) { worst = o1; next_k = 1; }
+            if (o2 < worst && t.nb[2] >= 0) { worst = o2; next_k = 2; }
+            if (next_k < 0) {
+                located = true;
+                break;
             }
-            double dx = pt.x - t.cx;
-            double dy = pt.y - t.cy;
-            if (dx * dx + dy * dy <= t.r2 * (1.0 + 1e-12) + 1e-15) {
-                edges.push_back({t.a, t.b});
-                edges.push_back({t.b, t.c});
-                edges.push_back({t.c, t.a});
-                active_tris[ti] = active_tris.back();
-                active_tris.pop_back();
-                continue;
-            }
-            ++ti;
+            cur = t.nb[next_k];
+            ++steps;
         }
-
-        for (size_t i = 0; i < edges.size(); ++i) {
-            bool shared = false;
-            for (size_t j = 0; j < edges.size(); ++j) {
-                if (i == j) continue;
-                if (edges[i].u == edges[j].v && edges[i].v == edges[j].u) {
-                    shared = true;
+        if (!located) {
+            for (int ti = 0; ti < static_cast<int>(tris.size()); ++ti) {
+                const LTri& t = tris[static_cast<size_t>(ti)];
+                if (orient2d(norm[t.v[1]], norm[t.v[2]], pt) >= -1e-11 &&
+                    orient2d(norm[t.v[2]], norm[t.v[0]], pt) >= -1e-11 &&
+                    orient2d(norm[t.v[0]], norm[t.v[1]], pt) >= -1e-11) {
+                    cur = ti;
+                    located = true;
                     break;
                 }
             }
-            if (!shared) {
-                polygon.push_back(edges[i]);
+        }
+        if (!located) continue;
+
+        // 判断点是否近似落在某条边上：若共线则执行 2->4 剖分，避免产生零面积退化三角形
+        const LTri tcopy = tris[static_cast<size_t>(cur)];
+        int edge_k = -1;
+        double min_norm_d = 1e30;
+        for (int k = 0; k < 3; ++k) {
+            const XY& eu = norm[tcopy.v[(k + 1) % 3]];
+            const XY& ev = norm[tcopy.v[(k + 2) % 3]];
+            double elen = std::hypot(ev.x - eu.x, ev.y - eu.y);
+            if (elen > 1e-14) {
+                double d = std::abs(orient2d(eu, ev, pt)) / elen;
+                if (d < 1e-11 && d < min_norm_d && tcopy.nb[k] >= 0) {
+                    min_norm_d = d;
+                    edge_k = k;
+                }
             }
         }
 
-        for (const auto& e : polygon) {
-            if (std::abs(orient2d(norm[e.u], norm[e.v], pt)) <= 1e-16) {
-                continue; // 避免退化零面积三角形
+        flip_stack.clear();
+        if (edge_k >= 0) {
+            // 2 -> 4 边分裂
+            int a = tcopy.v[edge_k];
+            int u = tcopy.v[(edge_k + 1) % 3];
+            int v = tcopy.v[(edge_k + 2) % 3];
+            int n_au = tcopy.nb[(edge_k + 2) % 3];
+            int n_va = tcopy.nb[(edge_k + 1) % 3];
+            int nt_id = tcopy.nb[edge_k];
+            const LTri ntcopy = tris[static_cast<size_t>(nt_id)];
+            int nk = find_nbr_corner(nt_id, cur);
+            int b = ntcopy.v[nk];
+            int n_bv = ntcopy.nb[(nk + 2) % 3];
+            int n_ub = ntcopy.nb[(nk + 1) % 3];
+
+            int id2 = static_cast<int>(tris.size());
+            int id3 = id2 + 1;
+            tris.resize(static_cast<size_t>(id3 + 1));
+
+            tris[static_cast<size_t>(cur)]   = {{p, a, u}, {n_au, id3, id2}};
+            tris[static_cast<size_t>(id2)]   = {{p, v, a}, {n_va, cur, nt_id}};
+            tris[static_cast<size_t>(nt_id)] = {{p, b, v}, {n_bv, id2, id3}};
+            tris[static_cast<size_t>(id3)]   = {{p, u, b}, {n_ub, nt_id, cur}};
+
+            replace_nbr(n_va, cur, id2);
+            replace_nbr(n_ub, nt_id, id3);
+
+            flip_stack.push_back(cur);
+            flip_stack.push_back(id2);
+            flip_stack.push_back(nt_id);
+            flip_stack.push_back(id3);
+            last_tri = cur;
+        } else {
+            // 1 -> 3 内部分裂
+            int v0 = tcopy.v[0], v1 = tcopy.v[1], v2 = tcopy.v[2];
+            int nb0 = tcopy.nb[0], nb1 = tcopy.nb[1], nb2 = tcopy.nb[2];
+            int id1 = static_cast<int>(tris.size());
+            int id2 = id1 + 1;
+            tris.resize(static_cast<size_t>(id2 + 1));
+
+            tris[static_cast<size_t>(cur)] = {{p, v1, v2}, {nb0, id1, id2}};
+            tris[static_cast<size_t>(id1)] = {{p, v2, v0}, {nb1, id2, cur}};
+            tris[static_cast<size_t>(id2)] = {{p, v0, v1}, {nb2, cur, id1}};
+
+            replace_nbr(nb1, cur, id1);
+            replace_nbr(nb2, cur, id2);
+
+            flip_stack.push_back(cur);
+            flip_stack.push_back(id1);
+            flip_stack.push_back(id2);
+            last_tri = cur;
+        }
+
+        // 2. Lawson 局部对角线翻转恢复严格空圆性
+        int flip_guard = 0;
+        while (!flip_stack.empty() && flip_guard < 4096) {
+            int ti_id = flip_stack.back();
+            flip_stack.pop_back();
+            const LTri ti = tris[static_cast<size_t>(ti_id)];
+            int nti_id = ti.nb[0];
+            if (nti_id < 0) continue;
+
+            // ti 顶点恒为 (p, u, v)，suspect edge 为 u -> v
+            int u = ti.v[1], v = ti.v[2];
+            const LTri nti = tris[static_cast<size_t>(nti_id)];
+            int nk = find_nbr_corner(nti_id, ti_id);
+            int d = nti.v[nk];
+
+            double dux = norm[u].x - norm[d].x, duy = norm[u].y - norm[d].y;
+            double dvx = norm[v].x - norm[d].x, dvy = norm[v].y - norm[d].y;
+            double l2 = std::max({dux * dux + duy * duy, dvx * dvx + dvy * dvy, 1e-12});
+            double thresh = (u < n && v < n && d < n) ? (1e-13 * l2 * l2) : 1e-13;
+            double ic = in_circle_ccw(norm[u], norm[d], norm[v], pt);
+            if (ic <= thresh) continue;
+            // 确保翻转后两个新三角形均有严格正面积（避免凸包/超三角形退化翻转）
+            if (orient2d(pt, norm[u], norm[d]) <= 1e-16 || orient2d(pt, norm[d], norm[v]) <= 1e-16) {
+                continue;
             }
-            active_tris.push_back(make_bw_tri(norm, e.u, e.v, p));
+
+            int n_pu = ti.nb[2];
+            int n_vp = ti.nb[1];
+            int n_dv = nti.nb[(nk + 2) % 3];
+            int n_ud = nti.nb[(nk + 1) % 3];
+
+            tris[static_cast<size_t>(ti_id)]  = {{p, u, d}, {n_ud, nti_id, n_pu}};
+            tris[static_cast<size_t>(nti_id)] = {{p, d, v}, {n_dv, n_vp, ti_id}};
+
+            replace_nbr(n_ud, nti_id, ti_id);
+            replace_nbr(n_vp, ti_id, nti_id);
+
+            flip_stack.push_back(ti_id);
+            flip_stack.push_back(nti_id);
+            ++flip_guard;
         }
     }
 
     std::vector<TriIndex> result;
-    result.reserve(finished_tris.size() + active_tris.size());
-    auto emit_if_valid = [&](const BWCircle& t) {
-        if (t.a >= n || t.b >= n || t.c >= n) return;
-        double area2 = orient2d(points[t.a], points[t.b], points[t.c]);
-        if (std::abs(area2) <= 1e-12 * scale * scale) return;
+    result.reserve(tris.size());
+    for (const auto& t : tris) {
+        if (t.v[0] >= n || t.v[1] >= n || t.v[2] >= n) continue;
+        double area2 = orient2d(points[t.v[0]], points[t.v[1]], points[t.v[2]]);
+        if (std::abs(area2) <= 1e-12 * scale * scale) continue;
         if (area2 < 0.0) {
-            result.push_back({t.a, t.c, t.b});
+            result.push_back({t.v[0], t.v[2], t.v[1]});
         } else {
-            result.push_back({t.a, t.b, t.c});
+            result.push_back({t.v[0], t.v[1], t.v[2]});
         }
-    };
-    for (const auto& t : finished_tris) emit_if_valid(t);
-    for (const auto& t : active_tris) emit_if_valid(t);
+    }
 
     if (result.empty()) {
         throw std::runtime_error("无法构建三角网：测量点全部共线或重复");
