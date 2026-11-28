@@ -167,6 +167,18 @@ int main(int argc, char** argv) {
     auto t1 = std::chrono::steady_clock::now();
     double tin_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
 
+    // v4.0 万点级 (101x101 = 10,201 点) 构网+算量耗时基准
+    auto pts_10k = make_grid_points(101, 101, 5.0, [](double x, double y) {
+        return 30.0 + 0.025 * x - 0.018 * y + 1.6 * std::sin(0.028 * x) * std::cos(0.025 * y);
+    });
+    auto tk0 = std::chrono::steady_clock::now();
+    tin::TINEarthworkCalculator calc10k(31.0);
+    calc10k.add_points(pts_10k);
+    auto res10k = calc10k.run_full_calculation();
+    auto tk1 = std::chrono::steady_clock::now();
+    double tin_10k_ms = std::chrono::duration<double, std::milli>(tk1 - tk0).count();
+    (void)res10k;
+
     bool parity_ok = std::abs(res.total_cut - 3569.3644) < 0.5 &&
                      std::abs(res.total_fill - 3876.4035) < 0.5;
 
@@ -436,7 +448,17 @@ int main(int argc, char** argv) {
                   << "  \"ui_has_ai_tab\": " << (ai_wf_ok ? "true" : "false") << ",\n"
                   << "  \"ui_has_measure_tool\": " << (measure_ok ? "true" : "false") << ",\n"
                   << "  \"ui_has_tab_completion\": " << (tab_comp_ok ? "true" : "false") << ",\n"
-                  << "  \"ui_contrast\": " << contrast << "\n"
+                  << "  \"ui_contrast\": " << contrast << ",\n"
+                  << "  \"tin_10k_ms\": " << tin_10k_ms << ",\n"
+                  << "  \"has_constrained_grade\": false,\n"
+                  << "  \"constrained_drain_ok\": false,\n"
+                  << "  \"constrained_ctrl_ok\": false,\n"
+                  << "  \"pareto_count\": 0,\n"
+                  << "  \"has_multi_bench_dp\": false,\n"
+                  << "  \"multi_bench_vs_flat_pct\": 0.0,\n"
+                  << "  \"multi_bench_vs_2axis_pct\": 0.0,\n"
+                  << "  \"multi_bench_ms\": 999.0,\n"
+                  << "  \"ui_has_v4_features\": false\n"
                   << "}\n";
     } else {
         std::cout << "[BENCH] parity=" << (parity_ok ? "OK" : "FAIL")
