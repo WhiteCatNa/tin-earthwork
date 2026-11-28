@@ -259,17 +259,21 @@ int main(int argc, char** argv) {
     rcalc.add_points(rpts);
     double s_rec_err = std::abs(rcalc.run_full_calculation().total_cut - s_true_cut);
 
-    auto rndpts = sparse_pts;
-    for (int k = 0; k < 8; ++k) {
-        double rx = 5.0 + 90.0 * ((k * 37 + 13) % 97) / 97.0;
-        double ry = 5.0 + 90.0 * ((k * 53 + 29) % 89) / 89.0;
-        rndpts.push_back({"N" + std::to_string(k), rx, ry, rec_terrain(rx, ry), 0.0, 0.0, false});
+    double rnd_drop_sum = 0.0;
+    for (int rseed = 0; rseed < 3; ++rseed) {
+        auto rndpts = sparse_pts;
+        for (int k = 0; k < 8; ++k) {
+            double rx = 5.0 + 90.0 * (((k + rseed * 5) * 37 + 13) % 97) / 97.0;
+            double ry = 5.0 + 90.0 * (((k + rseed * 7) * 53 + 29) % 89) / 89.0;
+            rndpts.push_back({"N" + std::to_string(k), rx, ry, rec_terrain(rx, ry), 0.0, 0.0, false});
+        }
+        tin::TINEarthworkCalculator rndcalc(11.5);
+        rndcalc.add_points(rndpts);
+        double s_rnd_err = std::abs(rndcalc.run_full_calculation().total_cut - s_true_cut);
+        rnd_drop_sum += std::max(0.0, s_base_err - s_rnd_err);
     }
-    tin::TINEarthworkCalculator rndcalc(11.5);
-    rndcalc.add_points(rndpts);
-    double s_rnd_err = std::abs(rndcalc.run_full_calculation().total_cut - s_true_cut);
-    double survey_rec_ratio = std::max(0.0, s_base_err - s_rec_err) /
-                              std::max(1e-6, s_base_err - s_rnd_err);
+    double rnd_drop_mean = std::max(1.0, rnd_drop_sum / 3.0);
+    double survey_rec_ratio = std::max(0.0, s_base_err - s_rec_err) / rnd_drop_mean;
     (void)uncert_real;
 
     // 2) 空间异常点检测（5% 注入粗差 Recall & Precision）

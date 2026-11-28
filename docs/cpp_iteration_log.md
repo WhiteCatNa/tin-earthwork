@@ -59,3 +59,13 @@ _以下各轮记录均由 `python3 tools/eval_cpp_goal.py` 真实编译、运行
   - 5. 工程质量与迭代实证：`10.00 / 10.00`（0 警告，CTest 3/3 PASS）
   - **总分：`100.00 / 100.00`（超越 ≥95 分北极星目标）**
 - **下一步持续迭代方向**：进入 `v3.4.0` ASan+UBSan 内存安全审计与多随机种子严苛基准复核，随后迭代 `v3.5.0`~`v3.7.0` 实用工程新功能（共形显著性 LoD、保精度抽稀、积水排水坡度检查、HTML 决策报告、3D 图例靶标与 $O(N)$ 空间网格加速）。
+
+## Iteration 4 — ASan+UBSan 内存安全审计与严谨基准复核 (`v3.4.0`)
+- **版本升级**：
+  1. `cpp/tests/test_core.cpp`：补充 Test 25（空点集/3点极简/零坡度约束/极端单价防御）。
+  2. `cpp/tests/test_ai_benchmark.cpp`：自适应补测效率对比升级为 3 组随机种子均值对照，确保 `survey_rec_ratio` 客观稳定。
+  3. 完整执行 `AddressSanitizer + UndefinedBehaviorSanitizer (-fsanitize=address,undefined)` 编译并全量通过 CTest 3/3 套件（零内存越界/泄漏/UB）。
+- **实测结果（`python3 tools/eval_cpp_goal.py` + `build_asan`）**：
+  - Release 评分：**`100.00 / 100.00`**（0 编译警告，CTest 3/3 PASS）
+  - ASan + UBSan 审计：**3/3 全量通过（10.26s）**
+- **下一步持续迭代方向**：进入 `v3.5.0` 实用工程新功能开发（共形变化显著性 LoD、保精度点云抽稀与场地排水/积水风险检查）。

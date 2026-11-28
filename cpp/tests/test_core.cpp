@@ -685,6 +685,33 @@ int main(int argc, char** argv) {
         check_true(comp.size() >= 2, "tab completion AI prefix");
     });
 
+    // 25. 极端边界与异常防御（空点集、3点极简、零坡度限制、极端单价）
+    run_test("25_edge_cases_and_extreme_costs", [&]() {
+        auto empty_rep = tin::detect_survey_anomalies({});
+        check_true(empty_rep.health_score == 100 && empty_rep.anomalies.empty(), "empty points health");
+
+        auto pts3 = make_grid_points(2, 2, 10.0, [](double x, double y) { return 10.0 + 0.05 * x + 0.03 * y; });
+        pts3.pop_back();
+        auto rep3 = tin::detect_survey_anomalies(pts3);
+        check_true(rep3.health_score == 100, "3-point health safe");
+
+        tin::TINEarthworkCalculator c3(10.0);
+        c3.add_points(pts3);
+        c3.build_tin();
+        tin::GradeOptConstraints zero_slope;
+        zero_slope.max_slope_x = 0.0;
+        zero_slope.max_slope_y = 0.0;
+        zero_slope.max_evals = 30;
+        tin::HaulCostParams extreme_costs;
+        extreme_costs.haul_per_m3_100m = 500.0;
+        extreme_costs.export_unit_cost = 1000.0;
+        extreme_costs.borrow_unit_cost = 1000.0;
+        auto opt0 = tin::optimize_grade_cost(c3, extreme_costs, zero_slope);
+        check_true(std::abs(opt0.optimized.plane.slope_x) <= 1e-9 &&
+                   std::abs(opt0.optimized.plane.slope_y) <= 1e-9, "zero slope constraint respected");
+        check_true(std::isfinite(opt0.optimized.total_cost), "finite cost under extreme rates");
+    });
+
     std::cout << "=== Summary: PASSED " << g_passed << " / " << (g_passed + g_failed) << " ===\n";
     return g_failed == 0 ? 0 : 1;
 }
