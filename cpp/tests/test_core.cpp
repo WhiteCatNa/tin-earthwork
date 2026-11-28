@@ -1030,6 +1030,31 @@ int main(int argc, char** argv) {
         check_true(std::filesystem::file_size(tin::utf8_to_wide(p_csv)) > 200, "pareto csv non-empty");
     });
 
+    // 36. 主坡向对齐 K=2..4 动态规划多级台阶优化（45°对角陡坡大幅胜过单平场与正交两级台阶）
+    run_test("36_oriented_multi_bench_dp_beats_single_and_axis_2bench", [&]() {
+        auto diag_pts = make_grid_points(12, 12, 18.0, [](double x, double y) {
+            return 10.0 + 0.12 * x + 0.12 * y + 0.25 * std::sin(0.025 * (x - y));
+        });
+        tin::TINEarthworkCalculator calc(24.0);
+        calc.add_points(diag_pts);
+        calc.build_tin();
+
+        auto axis2 = tin::optimize_stepped_platform(calc, tin::HaulCostParams{}, 180.0);
+        auto dp3 = tin::optimize_multi_bench_terraces(calc, tin::HaulCostParams{}, 3, 180.0);
+        std::cout << "  [DP MULTI-BENCH] benches=" << dp3.bench_count
+                  << " az=" << dp3.slope_azimuth_deg
+                  << " flat_sav=" << dp3.savings_pct << "%"
+                  << " vs_axis2=" << ((axis2.total_cost - dp3.total_cost) / axis2.total_cost * 100.0) << "%"
+                  << " ms=" << dp3.elapsed_ms << "\n";
+        check_true(dp3.bench_count == 3, "45-deg steep hill chooses 3 oriented benches");
+        check_true(dp3.slope_azimuth_deg > 35.0 && dp3.slope_azimuth_deg < 55.0,
+                   "principal slope azimuth tracks 45-deg ascent");
+        check_true(dp3.savings_pct > 40.0, "oriented 3-bench DP saves > 40% vs single pad");
+        double vs_axis2 = (axis2.total_cost - dp3.total_cost) / axis2.total_cost * 100.0;
+        check_true(vs_axis2 > 10.0, "oriented 3-bench DP beats axis-aligned 2-bench by > 10%");
+        check_true(dp3.elapsed_ms < 25.0, "DP multi-bench solver < 25 ms");
+    });
+
     std::cout << "=== Summary: PASSED " << g_passed << " / " << (g_passed + g_failed) << " ===\n";
     return g_failed == 0 ? 0 : 1;
 }

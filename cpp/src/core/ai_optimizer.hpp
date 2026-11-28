@@ -263,6 +263,52 @@ SteppedPlatformResult optimize_stepped_platform(
     const HaulCostParams& costs = HaulCostParams{},
     double wall_cost_per_m2 = 220.0);
 
+// ---------- 8b. 主坡向对齐 K=2..4 动态规划多级台阶优化 (v4.3.0) ----------
+struct BenchZone {
+    int index = 0;
+    double s_min = 0.0;
+    double s_max = 0.0;
+    double elevation = 0.0;
+    double area = 0.0;
+    double cut_volume = 0.0;
+    double fill_volume = 0.0;
+};
+
+struct BenchDivider {
+    double s_coord = 0.0;
+    XY start;
+    XY end;
+    double length = 0.0;
+    double step_height = 0.0;
+    double wall_cost = 0.0;
+};
+
+struct MultiBenchResult {
+    int bench_count = 1;
+    double slope_azimuth_deg = 0.0; // 主上升坡向方位角 (正北0°顺时针)
+    double dir_x = 1.0;
+    double dir_y = 0.0;
+    double origin_x = 0.0;
+    double origin_y = 0.0;
+    std::vector<BenchZone> benches;
+    std::vector<BenchDivider> dividers;
+    double wall_cost_per_m2 = 220.0;
+    double total_wall_cost = 0.0;
+    double earthwork_cost = 0.0;
+    double total_cost = 0.0;
+    double single_pad_cost = 0.0;
+    double savings_vs_single = 0.0;
+    double savings_pct = 0.0;
+    double elapsed_ms = 0.0;
+    std::string summary;
+};
+
+MultiBenchResult optimize_multi_bench_terraces(
+    const TINEarthworkCalculator& base_calc,
+    const HaulCostParams& costs = HaulCostParams{},
+    int max_benches = 3,
+    double wall_cost_per_m2 = 220.0);
+
 // ---------- 9. 施工机械配置与工期台班造价估算 ----------
 struct FleetParams {
     double exc_rate_m3_per_h = 110.0;  // 挖掘机小时产能 (自然方 m³/h)

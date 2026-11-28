@@ -240,6 +240,21 @@ int main(int argc, char** argv) {
     auto pareto_res = tin::compute_grade_pareto_frontier(slope_calc, tin::HaulCostParams{}, gcons);
     int pareto_count = static_cast<int>(pareto_res.plans.size());
 
+    // v4.0 主坡向对齐 K=3 动态规划多级台阶优化基准 (45° 对角陡坡)
+    auto diag_hill = make_grid_points(12, 12, 18.0, [](double x, double y) {
+        return 10.0 + 0.12 * x + 0.12 * y + 0.25 * std::sin(0.025 * (x - y));
+    });
+    tin::TINEarthworkCalculator hill_calc(24.0);
+    hill_calc.add_points(diag_hill);
+    hill_calc.build_tin();
+    auto axis2_hill = tin::optimize_stepped_platform(hill_calc, tin::HaulCostParams{}, 180.0);
+    auto dp3_hill = tin::optimize_multi_bench_terraces(hill_calc, tin::HaulCostParams{}, 3, 180.0);
+    double mb_vs_flat_pct = dp3_hill.savings_pct;
+    double mb_vs_2ax_pct = (axis2_hill.total_cost > 1e-6)
+                              ? ((axis2_hill.total_cost - dp3_hill.total_cost) / axis2_hill.total_cost * 100.0)
+                              : 0.0;
+    double mb_ms = dp3_hill.elapsed_ms;
+
     // Iteration 2 基准：1) 不确定度评定 + 自适应补测推荐（含真值覆盖与 10% 补测比随机对比）
     auto u0 = std::chrono::steady_clock::now();
     auto uncert_real = tin::analyze_uncertainty_and_recommend(calc, 0.03, 8, 8);
@@ -467,10 +482,10 @@ int main(int argc, char** argv) {
                   << "  \"constrained_drain_ok\": " << (constrained_drain_ok ? "true" : "false") << ",\n"
                   << "  \"constrained_ctrl_ok\": " << (constrained_ctrl_ok ? "true" : "false") << ",\n"
                   << "  \"pareto_count\": " << pareto_count << ",\n"
-                  << "  \"has_multi_bench_dp\": false,\n"
-                  << "  \"multi_bench_vs_flat_pct\": 0.0,\n"
-                  << "  \"multi_bench_vs_2axis_pct\": 0.0,\n"
-                  << "  \"multi_bench_ms\": 999.0,\n"
+                  << "  \"has_multi_bench_dp\": true,\n"
+                  << "  \"multi_bench_vs_flat_pct\": " << mb_vs_flat_pct << ",\n"
+                  << "  \"multi_bench_vs_2axis_pct\": " << mb_vs_2ax_pct << ",\n"
+                  << "  \"multi_bench_ms\": " << mb_ms << ",\n"
                   << "  \"ui_has_v4_features\": false\n"
                   << "}\n";
     } else {

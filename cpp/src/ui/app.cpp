@@ -1253,6 +1253,12 @@ void CassApp::execute_command(const std::string& raw_cmd) {
         run_stepped_platform_action(intent.has_param1 ? intent.param1 : -1.0);
         set_inspector_tab(6);
         break;
+    case AssistantAction::OptimizeMultiBench:
+        log_cmd("命令: _MULTIBENCH -> 多级台阶将在 Phase 4 UI 面板挂载");
+        break;
+    case AssistantAction::ApplyMultiBench:
+        log_cmd("命令: _APPLY_BENCH -> 应用多级台阶将在 Phase 4 UI 面板挂载");
+        break;
     case AssistantAction::EstimateFleet:
         run_fleet_estimate_action(intent.has_param1 ? intent.param1 : -1.0);
         set_inspector_tab(6);

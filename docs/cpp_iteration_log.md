@@ -231,3 +231,20 @@ _以下各轮记录均由 `python3 tools/eval_cpp_goal.py` 真实编译、运行
 - **v4.0 北极星评分**：`61.00` → **80.00 / 100.00**（第 2 维 `Constrained Pareto AI` 升至 **25.00 / 25.00**；`pareto_count = 5`, `tin_ms = 1.35 ms`, `tin_10k_ms = 8.91 ms`）
 
 - **下一步持续迭代方向**：进入 `v4.3.0`（主坡向对齐 `K=2..4` 精确动态规划多级台阶平场优化）。
+
+---
+
+## Iteration 14 — 主坡向对齐 K=2..4 精确动态规划多级台阶优化 (v4.3.0)
+
+### 改动清单
+1. **主坡向自适应动态规划多级台阶引擎** (`cpp/src/core/ai_optimizer.hpp/.cpp`)
+   - 新增 `BenchZone`、`BenchDivider`、`MultiBenchResult` 与 `optimize_multi_bench_terraces(...)`：通过 `solve_best_fit_plane` 提取场地主上升坡向方位角，沿主坡向划分条带，利用三角高程包络 $O(1)$ 棱柱加速预计算全部连续台区间零平衡标高，并在含挡墙造价约束的状态空间执行精确一维动态规划（$K = 1..4$），由 SPFA 最小费用流调配终审选优。
+2. **双语助手与测试用例** (`cpp/src/core/ai_assistant.hpp/.cpp`, `cpp/tests/test_core.cpp`, `cpp/tests/test_ai_benchmark.cpp`)
+   - 新增 `MULTIBENCH` / `APPLY_BENCH` 命令与中英文自然语言意图识别；新增 Test 36 (`36_oriented_multi_bench_dp_beats_single_and_axis_2bench`)，在 45° 对角陡坡山地（198m×198m）对比单平场与正交两级台阶。
+
+### 门禁验证结果
+- **v3.0 回归保护分**：**100.00 / 100.00**（0 告警，CTest 3/3 PASS，36/36 核心测试全过）
+- **v4.0 北极星评分**：`80.00` → **90.00 / 100.00**（第 3 维 `Multi-Bench DP & Field` 升至 **20.00 / 20.00**）
+- **关键实测指标**：对角陡坡 DP 三级台阶较单平场降本 **45.79%**、较正交两级台阶再降本 **37.67%**，总耗时仅 **10.61 ms**（`tin_ms = 1.33 ms`, `tin_10k_ms = 9.08 ms`）
+
+- **下一步持续迭代方向**：进入 `v4.4.0`（2D CAD 实时悬停工程遥测 HUD、主坡向台阶可视化、3D 排水坡度风险着色模式及 Tab7 Pareto/台阶一键应用与导出闭环）。

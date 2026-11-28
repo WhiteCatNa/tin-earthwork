@@ -32,6 +32,8 @@ enum class AssistantAction {
     RunSensitivity,
     RunPareto,
     OptimizeStepped,
+    OptimizeMultiBench,
+    ApplyMultiBench,
     EstimateFleet,
     MeasureDist,
     MeasureArea,

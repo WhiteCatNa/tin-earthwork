@@ -2038,4 +2038,354 @@ GradeParetoResult compute_grade_pareto_frontier(
     return out;
 }
 
+MultiBenchResult optimize_multi_bench_terraces(
+    const TINEarthworkCalculator& base_calc,
+    const HaulCostParams& costs,
+    int max_benches,
+    double wall_cost_per_m2) {
+    auto t0 = std::chrono::steady_clock::now();
+    if (base_calc.points().size() < 4) {
+        throw std::runtime_error("至少需要 4 个测量点才能执行多级台阶优化");
+    }
+
+    TINEarthworkCalculator work = base_calc;
+    if (!work.has_tin()) work.build_tin();
+    const SoilFactors sf = work.soil_factors();
+    const int Kmax = std::clamp(max_benches, 1, 4);
+    const double wall_rate = std::max(0.0, wall_cost_per_m2);
+
+    BalanceResult bal = solve_balance_elevation(work, sf);
+    work.set_design_elevation(bal.elevation);
+    CalculationResult single_res = work.calculate_volumes();
+    HaulPlanResult single_haul = compute_haul_plan(single_res, 4, 3, costs);
+
+    // 通过最小二乘斜面获取地形主上升坡向 (dx, dy)
+    PlaneBalanceResult bf = solve_best_fit_plane(work, sf);
+    double gx = bf.plane.slope_x / 100.0;
+    double gy = bf.plane.slope_y / 100.0;
+    double gn = std::hypot(gx, gy);
+    double dx = (gn > 1e-6) ? (gx / gn) : 1.0;
+    double dy = (gn > 1e-6) ? (gy / gn) : 0.0;
+    double ox = bf.plane.x0;
+    double oy = bf.plane.y0;
+    double az = std::atan2(dx, dy) * (180.0 / 3.14159265358979323846);
+    if (az < 0.0) az += 360.0;
+
+    MultiBenchResult best;
+    best.bench_count = 1;
+    best.slope_azimuth_deg = az;
+    best.dir_x = dx;
+    best.dir_y = dy;
+    best.origin_x = ox;
+    best.origin_y = oy;
+    best.wall_cost_per_m2 = wall_rate;
+    best.earthwork_cost = single_haul.estimated_cost;
+    best.total_cost = single_haul.estimated_cost;
+    best.single_pad_cost = single_haul.estimated_cost;
+
+    struct OrientedTri {
+        SurveyPoint p0, p1, p2;
+        double area = 0.0;
+        double raw_area = 0.0;
+        double zmin = 0.0, zmax = 0.0, zmean = 0.0;
+        double s = 0.0, t = 0.0;
+        double t_min = 0.0, t_max = 0.0;
+    };
+    std::vector<OrientedTri> items;
+    items.reserve(single_res.triangles.size());
+    double total_area = 0.0;
+
+    for (const auto& tr : single_res.triangles) {
+        if (tr.is_boundary || tr.area <= 1e-12) continue;
+        OrientedTri it;
+        it.p0 = tr.p0; it.p1 = tr.p1; it.p2 = tr.p2;
+        it.area = tr.area;
+        it.raw_area = std::abs(
+            (tr.p0.x * (tr.p1.y - tr.p2.y) +
+             tr.p1.x * (tr.p2.y - tr.p0.y) +
+             tr.p2.x * (tr.p0.y - tr.p1.y)) * 0.5);
+        it.zmin = std::min({tr.p0.z, tr.p1.z, tr.p2.z});
+        it.zmax = std::max({tr.p0.z, tr.p1.z, tr.p2.z});
+        it.zmean = (tr.p0.z + tr.p1.z + tr.p2.z) / 3.0;
+        double cx = (tr.p0.x + tr.p1.x + tr.p2.x) / 3.0;
+        double cy = (tr.p0.y + tr.p1.y + tr.p2.y) / 3.0;
+        it.s = (cx - ox) * dx + (cy - oy) * dy;
+        it.t = -(cx - ox) * dy + (cy - oy) * dx;
+        double t0p = -(tr.p0.x - ox) * dy + (tr.p0.y - oy) * dx;
+        double t1p = -(tr.p1.x - ox) * dy + (tr.p1.y - oy) * dx;
+        double t2p = -(tr.p2.x - ox) * dy + (tr.p2.y - oy) * dx;
+        it.t_min = std::min({t0p, t1p, t2p});
+        it.t_max = std::max({t0p, t1p, t2p});
+        total_area += it.area;
+        items.push_back(it);
+    }
+
+    if (items.size() < 8 || total_area <= 1e-9 || Kmax == 1) {
+        auto t1 = std::chrono::steady_clock::now();
+        best.elapsed_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        best.benches.push_back({1, 0.0, 0.0, bal.elevation, total_area, single_res.total_cut, single_res.total_fill});
+        best.summary = "维持单平场零平衡标高方案";
+        return best;
+    }
+
+    std::sort(items.begin(), items.end(), [](const OrientedTri& a, const OrientedTri& b) {
+        return a.s < b.s;
+    });
+
+    // 沿主坡向切分为 M 个均衡条带 (M <= 16)
+    const int M = std::clamp(static_cast<int>(items.size()) / 4, 4, 16);
+    std::vector<int> b_start(static_cast<size_t>(M));
+    std::vector<int> b_end(static_cast<size_t>(M));
+    std::vector<double> bin_area(static_cast<size_t>(M), 0.0);
+    for (int m = 0; m < M; ++m) {
+        b_start[m] = static_cast<int>(static_cast<long long>(m) * items.size() / M);
+        b_end[m] = static_cast<int>(static_cast<long long>(m + 1) * items.size() / M);
+        for (int idx = b_start[m]; idx < b_end[m]; ++idx) {
+            bin_area[m] += items[idx].area;
+        }
+    }
+
+    // 预计算各相邻条带界线处沿垂直方向的分割线段几何与长度
+    std::vector<double> div_s(static_cast<size_t>(M), 0.0);
+    std::vector<double> div_len(static_cast<size_t>(M), 0.0);
+    std::vector<XY> div_p0(static_cast<size_t>(M)), div_p1(static_cast<size_t>(M));
+    for (int m = 0; m + 1 < M; ++m) {
+        double sc = 0.5 * (items[b_end[m] - 1].s + items[b_start[m + 1]].s);
+        double t_lo = 1e30, t_hi = -1e30;
+        for (int idx = b_start[m]; idx < b_end[m + 1]; ++idx) {
+            t_lo = std::min(t_lo, items[idx].t_min);
+            t_hi = std::max(t_hi, items[idx].t_max);
+        }
+        if (t_hi <= t_lo) { t_lo = -1.0; t_hi = 1.0; }
+        div_s[m] = sc;
+        div_len[m] = std::max(1.0, t_hi - t_lo);
+        div_p0[m] = {ox + sc * dx - t_lo * dy, oy + sc * dy + t_lo * dx};
+        div_p1[m] = {ox + sc * dx - t_hi * dy, oy + sc * dy + t_hi * dx};
+    }
+
+    // 快速区间 [i..j] 体积与平衡标高求值器（纯区间 O(1) 棱柱公式）
+    auto eval_range_fast = [&](int i, int j, double h, double& out_cut, double& out_fill) {
+        out_cut = 0.0;
+        out_fill = 0.0;
+        const int i0 = b_start[i], i1 = b_end[j];
+        for (int idx = i0; idx < i1; ++idx) {
+            const auto& it = items[idx];
+            if (h <= it.zmin) {
+                out_cut += it.area * (it.zmean - h);
+            } else if (h >= it.zmax) {
+                out_fill += it.area * (h - it.zmean);
+            } else {
+                double dz0 = it.p0.z - h;
+                double dz1 = it.p1.z - h;
+                double dz2 = it.p2.z - h;
+                double scale = (it.raw_area > 1e-12) ? std::clamp(it.area / it.raw_area, 0.0, 1.0) : 1.0;
+                std::vector<XY> poly = {{it.p0.x, it.p0.y}, {it.p1.x, it.p1.y}, {it.p2.x, it.p2.y}};
+                std::vector<double> vals = {dz0, dz1, dz2};
+                auto [cp, cv] = clip_by_sign(poly, vals, true);
+                auto [fp, fv] = clip_by_sign(poly, vals, false);
+                auto [_ca, cvol] = polygon_integral(cp, cv);
+                auto [_fa, fvol] = polygon_integral(fp, fv);
+                (void)_ca; (void)_fa;
+                out_cut += std::max(0.0, cvol) * scale;
+                out_fill += std::max(0.0, -fvol) * scale;
+            }
+        }
+    };
+
+    const double compact = std::max(0.5, sf.compact);
+    constexpr double kInf = 1e30;
+    std::vector<std::vector<double>> seg_h(M, std::vector<double>(M, bal.elevation));
+    std::vector<std::vector<double>> seg_cost(M, std::vector<double>(M, kInf));
+    std::vector<std::vector<double>> seg_area(M, std::vector<double>(M, 0.0));
+    std::vector<std::vector<double>> seg_cut(M, std::vector<double>(M, 0.0));
+    std::vector<std::vector<double>> seg_fill(M, std::vector<double>(M, 0.0));
+
+    for (int i = 0; i < M; ++i) {
+        double area_acc = 0.0, zlo = 1e30, zhi = -1e30;
+        for (int j = i; j < M; ++j) {
+            area_acc += bin_area[j];
+            for (int idx = b_start[j]; idx < b_end[j]; ++idx) {
+                zlo = std::min(zlo, items[idx].zmin);
+                zhi = std::max(zhi, items[idx].zmax);
+            }
+            seg_area[i][j] = area_acc;
+            if (area_acc < 0.08 * total_area && !(i == 0 && j == M - 1)) continue;
+
+            double lo = zlo, hi = zhi;
+            for (int it = 0; it < 18 && hi - lo > 1e-4; ++it) {
+                double mid = 0.5 * (lo + hi);
+                double c = 0.0, f = 0.0;
+                eval_range_fast(i, j, mid, c, f);
+                if (c - f / compact > 0.0) lo = mid;
+                else hi = mid;
+            }
+            double h_opt = 0.5 * (lo + hi);
+            double c = 0.0, f = 0.0;
+            eval_range_fast(i, j, h_opt, c, f);
+            seg_h[i][j] = h_opt;
+            seg_cut[i][j] = c;
+            seg_fill[i][j] = f;
+            // DP 阶段采用台区内挖填与余缺快速代价（各阶段优胜方案随后再由精确 SPFA 调配终审）
+            double s_span = items[b_end[j] - 1].s - items[b_start[i]].s;
+            double est_d = std::max(5.0, 0.35 * s_span);
+            double haul_est = std::min(c, f) * (est_d / 100.0) * costs.haul_per_m3_100m;
+            double surp = std::max(0.0, c - f / compact);
+            double borr = std::max(0.0, f / compact - c);
+            seg_cost[i][j] = c * costs.cut_unit_cost + f * costs.fill_unit_cost + haul_est +
+                             surp * costs.export_unit_cost + borr * costs.borrow_unit_cost;
+        }
+    }
+
+    // DP[k][i][j]: 将条带 [0..j] 分为 k 级台阶，且最后一级为 [i..j] 时的最小累计总成本
+    std::vector<std::vector<std::vector<double>>> dp(
+        Kmax + 1, std::vector<std::vector<double>>(M, std::vector<double>(M, kInf)));
+    std::vector<std::vector<std::vector<int>>> prev_p(
+        Kmax + 1, std::vector<std::vector<int>>(M, std::vector<int>(M, -1)));
+
+    for (int j = 0; j < M; ++j) {
+        dp[1][0][j] = seg_cost[0][j];
+    }
+    for (int k = 2; k <= Kmax; ++k) {
+        for (int i = k - 1; i < M; ++i) {
+            for (int j = i; j < M; ++j) {
+                if (seg_cost[i][j] >= kInf * 0.5) continue;
+                double best_v = kInf;
+                int best_p = -1;
+                for (int p = k - 2; p <= i - 1; ++p) {
+                    if (dp[k - 1][p][i - 1] >= kInf * 0.5) continue;
+                    double dh = std::abs(seg_h[p][i - 1] - seg_h[i][j]);
+                    double wcost = div_len[i - 1] * dh * wall_rate;
+                    double cand = dp[k - 1][p][i - 1] + seg_cost[i][j] + wcost;
+                    if (cand < best_v) {
+                        best_v = cand;
+                        best_p = p;
+                    }
+                }
+                dp[k][i][j] = best_v;
+                prev_p[k][i][j] = best_p;
+            }
+        }
+    }
+
+    // 对每个候选台阶级数 k=1..Kmax 回溯最优点并做精确 SPFA 调配复核
+    for (int k = 1; k <= Kmax; ++k) {
+        int last_i = -1;
+        double min_dp = kInf;
+        for (int i = k - 1; i < M; ++i) {
+            if (dp[k][i][M - 1] < min_dp) {
+                min_dp = dp[k][i][M - 1];
+                last_i = i;
+            }
+        }
+        if (last_i < 0 || min_dp >= kInf * 0.5) continue;
+
+        std::vector<std::pair<int, int>> segs;
+        int ci = last_i, cj = M - 1;
+        for (int kk = k; kk >= 1; --kk) {
+            segs.push_back({ci, cj});
+            int p = prev_p[kk][ci][cj];
+            cj = ci - 1;
+            ci = p;
+        }
+        std::reverse(segs.begin(), segs.end());
+
+        CalculationResult step_res;
+        step_res.soil_balance.factors = sf;
+        step_res.triangles.reserve(items.size());
+        std::vector<BenchZone> zones;
+        std::vector<BenchDivider> divs;
+        double wall_sum = 0.0;
+        double tot_c = 0.0, tot_f = 0.0;
+
+        for (size_t bi = 0; bi < segs.size(); ++bi) {
+            int si = segs[bi].first, sj = segs[bi].second;
+            double h = seg_h[si][sj];
+            double b_cut = 0.0, b_fill = 0.0;
+            for (int idx = b_start[si]; idx < b_end[sj]; ++idx) {
+                const auto& it = items[idx];
+                double dz0 = it.p0.z - h, dz1 = it.p1.z - h, dz2 = it.p2.z - h;
+                double scale = (it.raw_area > 1e-12) ? std::clamp(it.area / it.raw_area, 0.0, 1.0) : 1.0;
+                Triangle tri;
+                tri.p0 = it.p0; tri.p1 = it.p1; tri.p2 = it.p2;
+                tri.p0.design_z = h; tri.p1.design_z = h; tri.p2.design_z = h;
+                tri.p0.delta_z = dz0; tri.p1.delta_z = dz1; tri.p2.delta_z = dz2;
+                tri.area = it.area;
+                const bool pos = (dz0 > 0.0 || dz1 > 0.0 || dz2 > 0.0);
+                const bool neg = (dz0 < 0.0 || dz1 < 0.0 || dz2 < 0.0);
+                if (!(pos && neg)) {
+                    double vol = it.area * (dz0 + dz1 + dz2) / 3.0;
+                    if (vol >= 0.0) tri.cut_volume = vol;
+                    else tri.fill_volume = -vol;
+                } else {
+                    std::vector<XY> poly = {{it.p0.x, it.p0.y}, {it.p1.x, it.p1.y}, {it.p2.x, it.p2.y}};
+                    std::vector<double> vals = {dz0, dz1, dz2};
+                    auto [cp, cv] = clip_by_sign(poly, vals, true);
+                    auto [fp, fv] = clip_by_sign(poly, vals, false);
+                    auto [_ca, cvol] = polygon_integral(cp, cv);
+                    auto [_fa, fvol] = polygon_integral(fp, fv);
+                    (void)_ca; (void)_fa;
+                    tri.cut_volume = std::max(0.0, cvol) * scale;
+                    tri.fill_volume = std::max(0.0, -fvol) * scale;
+                }
+                b_cut += tri.cut_volume;
+                b_fill += tri.fill_volume;
+                step_res.triangles.push_back(std::move(tri));
+            }
+            tot_c += b_cut;
+            tot_f += b_fill;
+            zones.push_back({
+                static_cast<int>(bi + 1),
+                items[b_start[si]].s,
+                items[b_end[sj] - 1].s,
+                h, seg_area[si][sj], b_cut, b_fill
+            });
+            if (bi + 1 < segs.size()) {
+                int cut_m = sj;
+                double h_next = seg_h[segs[bi + 1].first][segs[bi + 1].second];
+                double dh = std::abs(h - h_next);
+                double wc = div_len[cut_m] * dh * wall_rate;
+                wall_sum += wc;
+                divs.push_back({div_s[cut_m], div_p0[cut_m], div_p1[cut_m], div_len[cut_m], dh, wc});
+            }
+        }
+        step_res.total_cut = tot_c;
+        step_res.total_fill = tot_f;
+        step_res.net_volume = tot_c - tot_f;
+        step_res.soil_balance = SoilBalance{tot_c, tot_f, sf};
+
+        HaulPlanResult exact_haul = compute_haul_plan(step_res, 4, 3, costs);
+        double exact_tot = exact_haul.estimated_cost + wall_sum;
+
+        if (exact_tot < best.total_cost) {
+            best.bench_count = static_cast<int>(zones.size());
+            best.benches = std::move(zones);
+            best.dividers = std::move(divs);
+            best.total_wall_cost = wall_sum;
+            best.earthwork_cost = exact_haul.estimated_cost;
+            best.total_cost = exact_tot;
+        }
+    }
+
+    best.savings_vs_single = best.single_pad_cost - best.total_cost;
+    best.savings_pct = (best.single_pad_cost > 1e-6)
+                           ? (best.savings_vs_single / best.single_pad_cost * 100.0)
+                           : 0.0;
+    auto t1 = std::chrono::steady_clock::now();
+    best.elapsed_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+    std::ostringstream oss;
+    oss << std::fixed << std::setprecision(1)
+        << "主坡向(" << best.slope_azimuth_deg << "°)动态规划优选 " << best.bench_count << " 级台阶：";
+    for (size_t i = 0; i < best.benches.size(); ++i) {
+        if (i > 0) oss << " / ";
+        oss << "H" << best.benches[i].index << "=" << std::setprecision(2) << best.benches[i].elevation << "m";
+    }
+    oss << std::setprecision(0)
+        << "，含挡墙总造价 ¥" << best.total_cost
+        << "（较单平场省 " << std::setprecision(1) << best.savings_pct << "%，耗时 "
+        << std::setprecision(2) << best.elapsed_ms << " ms）";
+    best.summary = oss.str();
+    return best;
+}
+
 } // namespace tin
