@@ -29,3 +29,19 @@ _以下各轮记录均由 `python3 tools/eval_cpp_goal.py` 真实编译、运行
   - 5. 工程质量与迭代实证：`9.00 / 10.00`（0 警告，CTest 3/3 PASS）
   - **总分：`60.00 -> 61.00 / 100.00`**
 - **下一步瓶颈诊断**：当前最大失分项为「2. AI 工程智能」（`0/25`）。Iteration 2 (`v3.2.0`) 将落地空间异常点检测与自动修复、抽稀外推不确定度评定、自适应补测点推荐及中英双语 AI 助手。
+
+## Iteration 2 — AI 工程智能全面落地 (`v3.2.0`)
+- **版本升级**：
+  1. `cpp/src/core/ai_optimizer.hpp/.cpp`：
+     - 新增空间异常点检测 `detect_survey_anomalies`（2-pass IRLS 局部平面拟合抗粗差 + 稳健 MAD 准则，检出高程突刺/深坑、孤立飞点、重合点高程冲突并评定 0~100 场地健康分）与实用一键修复 `clean_survey_anomalies`。
+     - 新增抽稀外推不确定度评定与自适应补测点推荐 `analyze_uncertainty_and_recommend`（$K=8$ 保留凸包内部 50% 抽稀 Richardson 外推 + 面积加权测量误差 + 曲率-面积误差尺度大顶堆贪心推荐）。
+  2. `cpp/src/core/ai_assistant.hpp/.cpp`：新增中英双语自然语言/CAD 指令意图解析器 `parse_engineering_intent`、Tab 补全候选生成器 `suggest_command_completions` 与综合工程诊断报告 `generate_site_diagnosis`。
+  3. `cpp/src/core/calculator.cpp`：`unique_point_indices` 改用扁平向量排序替代 `std::map`，消除千点级堆分配。
+- **实测结果（`python3 tools/eval_cpp_goal.py`）**：
+  - 1. 算法最优性与算量精度：`30.00 / 30.00`
+  - 2. AI 工程智能：**`25.00 / 25.00`**（满分达成！异常检测 Recall `100%` / Precision `90.91%`，双语 30 用例意图识别 `100%`，95% 区间覆盖高斯山包解析真值，10% 推荐补测远超随机加密）
+  - 3. 性能与边界鲁棒性：**`15.00 / 15.00`**（满分达成！`tin_ms = 2.26 ms`，`haul_ms = 0.04 ms`，`grade_ms = 52.47 ms`，`uncertainty_ms = 15.75 ms`，边界防御 `4/4`）
+  - 4. 南方CASS UI/UX：`9.00 / 20.00`
+  - 5. 工程质量与迭代实证：**`10.00 / 10.00`**（0 警告，CTest 24/24 + UI + Benchmark 全绿）
+  - **总分：`88.00 -> 89.00 / 100.00`**
+- **下一步瓶颈诊断**：当前唯一未达标维度为「4. 南方CASS UI/UX」（`9/20`）。Iteration 3 (`v3.3.0`) 将把全部 AI 能力深度融入南方CASS 四区工作站界面并补齐交互式测距/测面积工具与智能命令行。

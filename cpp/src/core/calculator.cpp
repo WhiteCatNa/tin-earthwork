@@ -171,31 +171,49 @@ void TINEarthworkCalculator::set_soil_factors(const SoilFactors& factors) {
 }
 
 std::vector<int> TINEarthworkCalculator::unique_point_indices(const std::vector<SurveyPoint>& pts, const std::string& label) {
-    std::map<std::pair<long long, long long>, std::vector<int>> groups;
+    struct KeyIdx {
+        long long kx;
+        long long ky;
+        int idx;
+    };
+    std::vector<KeyIdx> items;
+    items.reserve(pts.size());
     for (int i = 0; i < static_cast<int>(pts.size()); ++i) {
-        long long kx = static_cast<long long>(std::llround(pts[i].x / DUPLICATE_TOL));
-        long long ky = static_cast<long long>(std::llround(pts[i].y / DUPLICATE_TOL));
-        groups[{kx, ky}].push_back(i);
+        items.push_back({
+            static_cast<long long>(std::llround(pts[i].x / DUPLICATE_TOL)),
+            static_cast<long long>(std::llround(pts[i].y / DUPLICATE_TOL)),
+            i
+        });
     }
+    std::sort(items.begin(), items.end(), [](const KeyIdx& a, const KeyIdx& b) {
+        if (a.kx != b.kx) return a.kx < b.kx;
+        if (a.ky != b.ky) return a.ky < b.ky;
+        return a.idx < b.idx;
+    });
+
     std::vector<int> keep;
-    keep.reserve(groups.size());
+    keep.reserve(items.size());
     int ignored_count = 0;
-    for (const auto& kv : groups) {
-        const auto& idxs = kv.second;
-        keep.push_back(idxs.front());
-        if (idxs.size() > 1) {
-            const auto& first = pts[idxs.front()];
-            for (size_t k = 1; k < idxs.size(); ++k) {
-                const auto& other = pts[idxs[k]];
-                if (std::abs(other.z - first.z) > ELEVATION_TOL ||
-                    std::abs(other.design_z - first.design_z) > ELEVATION_TOL) {
-                    throw std::runtime_error(
-                        label + "测点坐标重复但高程不同: " + first.id + "(" + fmt3(first.z) + ") 与 " +
-                        other.id + "(" + fmt3(other.z) + ") @ (" + fmt3(first.x) + ", " + fmt3(first.y) + ")");
-                }
-                ++ignored_count;
-            }
+    size_t i = 0;
+    while (i < items.size()) {
+        size_t j = i + 1;
+        while (j < items.size() && items[j].kx == items[i].kx && items[j].ky == items[i].ky) {
+            ++j;
         }
+        int first_idx = items[i].idx;
+        keep.push_back(first_idx);
+        const auto& first = pts[first_idx];
+        for (size_t k = i + 1; k < j; ++k) {
+            const auto& other = pts[items[k].idx];
+            if (std::abs(other.z - first.z) > ELEVATION_TOL ||
+                std::abs(other.design_z - first.design_z) > ELEVATION_TOL) {
+                throw std::runtime_error(
+                    label + "测点坐标重复但高程不同: " + first.id + "(" + fmt3(first.z) + ") 与 " +
+                    other.id + "(" + fmt3(other.z) + ") @ (" + fmt3(first.x) + ", " + fmt3(first.y) + ")");
+            }
+            ++ignored_count;
+        }
+        i = j;
     }
     std::sort(keep.begin(), keep.end());
     if (ignored_count > 0) {

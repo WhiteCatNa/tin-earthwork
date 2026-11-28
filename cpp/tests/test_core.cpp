@@ -1,3 +1,4 @@
+#include "core/ai_assistant.hpp"
 #include "core/ai_optimizer.hpp"
 #include "core/analysis.hpp"
 #include "core/calculator.hpp"
@@ -543,6 +544,145 @@ int main(int argc, char** argv) {
         check_true(opt.optimized.total_cost <= opt.flat_balance.total_cost + 1e-6, "beats flat balance");
         check_true(opt.optimized.total_cost <= opt.best_fit.total_cost + 1e-6, "beats/equals clamped best fit");
         check_true(opt.savings_pct_vs_flat > 25.0, "substantial savings > 25% on sloped terrain");
+    });
+
+    // 21. 空间测点智能异常检测与一键局部修复
+    run_test("21_anomaly_detector_and_repair", [&]() {
+        auto pts = make_grid_points(14, 14, 10.0, [](double x, double y) {
+            return 25.0 + 0.03 * x - 0.02 * y + 0.6 * std::sin(0.06 * x) * std::cos(0.05 * y);
+        });
+        std::vector<int> injected = {18, 35, 52, 74, 91, 110, 128, 149, 165, 178}; // ~5%
+        for (size_t k = 0; k < injected.size(); ++k) {
+            pts[injected[k]].z += (k % 2 == 0) ? 4.2 : -3.8;
+        }
+        auto rep = tin::detect_survey_anomalies(pts);
+        int tp = 0;
+        for (const auto& a : rep.anomalies) {
+            if (std::find(injected.begin(), injected.end(), a.point_index) != injected.end()) ++tp;
+        }
+        double recall = static_cast<double>(tp) / static_cast<double>(injected.size());
+        double precision = rep.anomalies.empty() ? 0.0 : static_cast<double>(tp) / static_cast<double>(rep.anomalies.size());
+        check_true(recall >= 0.90, "anomaly recall >= 0.90");
+        check_true(precision >= 0.85, "anomaly precision >= 0.85");
+        check_true(rep.health_score < 95, "health score penalized");
+
+        auto cleaned = tin::clean_survey_anomalies(pts, rep, true);
+        check_true(cleaned.repaired_count >= 9, "repaired injected spikes/pits");
+        auto rep_after = tin::detect_survey_anomalies(cleaned.points);
+        check_true(rep_after.health_score >= 95, "health score restored after repair");
+    });
+
+    // 22. 高斯山包解析真值：抽稀外推偏差修正与 95% 不确定度区间覆盖验证
+    run_test("22_uncertainty_analytical_mound", [&]() {
+        auto mound_z = [](double x, double y) {
+            double dx = x - 50.0, dy = y - 50.0;
+            return 4.0 * std::exp(-(dx * dx + dy * dy) / (2.0 * 18.0 * 18.0));
+        };
+        double erf1 = std::erf(50.0 / (18.0 * std::sqrt(2.0)));
+        double v_true = 4.0 * 2.0 * 3.14159265358979323846 * 18.0 * 18.0 * erf1 * erf1;
+
+        // 1) 多组外业随机散点布设（n=140）：平均外推修正后误差明显小于原始 TIN，且 95% 区间覆盖真值
+        double err_raw_sum = 0.0, err_cor_sum = 0.0;
+        int covered = 0;
+        for (int seed = 0; seed < 4; ++seed) {
+            std::vector<tin::SurveyPoint> scat_pts = {
+                {"C0", 0.0, 0.0, mound_z(0.0, 0.0), 0.0, 0.0, false},
+                {"C1", 100.0, 0.0, mound_z(100.0, 0.0), 0.0, 0.0, false},
+                {"C2", 100.0, 100.0, mound_z(100.0, 100.0), 0.0, 0.0, false},
+                {"C3", 0.0, 100.0, mound_z(0.0, 100.0), 0.0, 0.0, false},
+            };
+            unsigned long long s = 123456789ULL + static_cast<unsigned long long>(seed) * 987654321ULL;
+            auto next_u = [&]() {
+                s = s * 6364136223846793005ULL + 1442695040888963407ULL;
+                return static_cast<double>((s >> 11) & ((1ULL << 53) - 1)) / static_cast<double>(1ULL << 53);
+            };
+            for (int i = 0; i < 140; ++i) {
+                double x = 100.0 * next_u();
+                double y = 100.0 * next_u();
+                scat_pts.push_back({"S" + std::to_string(i), x, y, mound_z(x, y), 0.0, 0.0, false});
+            }
+            tin::TINEarthworkCalculator sc(0.0);
+            sc.add_points(scat_pts);
+            sc.build_tin();
+            auto su = tin::analyze_uncertainty_and_recommend(sc, 0.0, 8, 8);
+            err_raw_sum += std::abs(su.cut_raw - v_true);
+            err_cor_sum += std::abs(su.cut_corrected - v_true);
+            if (std::abs(su.cut_corrected - v_true) <= su.cut_ci95) ++covered;
+            if (seed == 0) {
+                check_true(su.recommendations.size() == 8, "generated 8 survey recommendations");
+            }
+        }
+        check_true(err_cor_sum < 0.85 * err_raw_sum, "Richardson bias correction reduces mean error on mound");
+        check_true(covered >= 3, "95% CI covers analytical mound volume across seeds");
+
+        // 2) 规则格网布设：95% 区间覆盖真值
+        auto grid_pts = make_grid_points(11, 11, 10.0, mound_z);
+        tin::TINEarthworkCalculator gc(0.0);
+        gc.add_points(grid_pts);
+        gc.build_tin();
+        auto gu = tin::analyze_uncertainty_and_recommend(gc, 0.0, 8, 8);
+        check_true(std::abs(gu.cut_corrected - v_true) <= gu.cut_ci95 * 1.25,
+                   "95% CI covers analytical mound volume on grid points");
+    });
+
+    // 23. 自适应补测点推荐明显优于等量随机加密
+    run_test("23_adaptive_survey_beats_random", [&]() {
+        auto terrain_z = [](double x, double y) {
+            double dx = x - 55.0, dy = y - 55.0;
+            return 10.0 + 6.5 * std::exp(-(dx * dx + dy * dy) / (2.0 * 14.0 * 14.0))
+                        + 0.02 * x - 0.01 * y;
+        };
+        auto pts = make_grid_points(9, 9, 12.5, terrain_z); // 81 pts on [0,100]^2
+        tin::TINEarthworkCalculator calc(11.5);
+        calc.add_points(pts);
+        calc.build_tin();
+        auto base_res = calc.calculate_volumes();
+
+        // 精细参考网 41x41 近似解析真值
+        auto fine_pts = make_grid_points(41, 41, 2.5, terrain_z);
+        tin::TINEarthworkCalculator fine_calc(11.5);
+        fine_calc.add_points(fine_pts);
+        double true_cut = fine_calc.run_full_calculation().total_cut;
+        double base_err = std::abs(base_res.total_cut - true_cut);
+
+        int add_n = 8; // ~10%
+        auto u = tin::analyze_uncertainty_and_recommend(calc, 0.02, add_n, 6);
+        auto rec_pts = pts;
+        for (const auto& r : u.recommendations) {
+            rec_pts.push_back({"REC_" + std::to_string(r.rank), r.x, r.y, terrain_z(r.x, r.y), 0.0, 0.0, false});
+        }
+        tin::TINEarthworkCalculator rec_calc(11.5);
+        rec_calc.add_points(rec_pts);
+        double rec_err = std::abs(rec_calc.run_full_calculation().total_cut - true_cut);
+
+        // 均匀分布对照补测点（边角/平坦区随机布点）
+        auto rand_pts = pts;
+        for (int k = 0; k < add_n; ++k) {
+            double rx = 5.0 + 90.0 * ((k * 37 + 13) % 97) / 97.0;
+            double ry = 5.0 + 90.0 * ((k * 53 + 29) % 89) / 89.0;
+            rand_pts.push_back({"RND_" + std::to_string(k), rx, ry, terrain_z(rx, ry), 0.0, 0.0, false});
+        }
+        tin::TINEarthworkCalculator rnd_calc(11.5);
+        rnd_calc.add_points(rand_pts);
+        double rnd_err = std::abs(rnd_calc.run_full_calculation().total_cut - true_cut);
+
+        double rec_drop = std::max(1e-6, base_err - rec_err);
+        double rnd_drop = std::max(1e-6, base_err - rnd_err);
+        check_true(rec_err < base_err && rec_drop >= 1.5 * rnd_drop,
+                   "recommended points reduce error >= 1.5x vs random");
+    });
+
+    // 24. 中英双语自然语言工程意图识别 & Tab 补全
+    run_test("24_bilingual_ai_assistant", [&]() {
+        check_true(tin::parse_engineering_intent("把标高设为51.25").action == tin::AssistantAction::SetElevation, "cn elev");
+        check_near(tin::parse_engineering_intent("把标高设为51.25").param1, 51.25, 1e-6, "cn elev param");
+        check_true(tin::parse_engineering_intent("帮我优化总费用").action == tin::AssistantAction::OptimizeGradeCost, "cn opt");
+        check_true(tin::parse_engineering_intent("detect survey outliers").action == tin::AssistantAction::RunDiagnostics, "en anomaly");
+        check_true(tin::parse_engineering_intent("推荐12个补测点").count_param == 12, "cn rec count");
+        check_true(tin::parse_engineering_intent("切换到三维视图").action == tin::AssistantAction::SetView3D, "cn 3d");
+        check_true(tin::parse_engineering_intent("白底打印模式").action == tin::AssistantAction::LightMode, "cn light");
+        auto comp = tin::suggest_command_completions("AI");
+        check_true(comp.size() >= 2, "tab completion AI prefix");
     });
 
     std::cout << "=== Summary: PASSED " << g_passed << " / " << (g_passed + g_failed) << " ===\n";

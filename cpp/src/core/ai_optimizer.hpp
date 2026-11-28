@@ -46,4 +46,86 @@ GradeOptimizationResult optimize_grade_cost(
     const HaulCostParams& costs = HaulCostParams{},
     const GradeOptConstraints& constraints = GradeOptConstraints{});
 
+// ---------- 2. 空间测点智能异常诊断与局部自动修复 ----------
+enum class AnomalyType {
+    ElevationSpike = 0, // 高程突刺（正粗差）
+    ElevationPit,       // 高程深坑（负粗差）
+    CoordOutlier,       // 孤立飞点（坐标离群）
+    NearDuplicate       // 重合点高程冲突
+};
+
+struct PointAnomaly {
+    int point_index = -1;
+    std::string point_id;
+    double x = 0.0;
+    double y = 0.0;
+    double z = 0.0;
+    double expected_z = 0.0;
+    double residual = 0.0;
+    double z_score = 0.0;
+    AnomalyType type = AnomalyType::ElevationSpike;
+    int severity = 1; // 1=一般警示, 2=严重粗差
+    std::string reason;
+};
+
+struct SiteHealthReport {
+    int health_score = 100; // 0 ~ 100
+    int total_points = 0;
+    double median_spacing = 0.0;
+    double z_min = 0.0;
+    double z_max = 0.0;
+    double z_std = 0.0;
+    std::vector<PointAnomaly> anomalies;
+    std::string summary;
+};
+
+struct CleanPointsResult {
+    std::vector<SurveyPoint> points;
+    int repaired_count = 0;
+    int removed_count = 0;
+};
+
+SiteHealthReport detect_survey_anomalies(const std::vector<SurveyPoint>& points);
+
+CleanPointsResult clean_survey_anomalies(
+    const std::vector<SurveyPoint>& points,
+    const SiteHealthReport& report,
+    bool interpolate_z = true);
+
+// ---------- 3. 抽稀外推不确定度评定与自适应补测点推荐 ----------
+struct SurveyRecommendation {
+    int rank = 0;
+    double x = 0.0;
+    double y = 0.0;
+    double estimated_z = 0.0;
+    double error_scale = 0.0;
+    double expected_error_drop = 0.0;
+    std::string reason;
+};
+
+struct UncertaintyReport {
+    double cut_raw = 0.0;
+    double cut_corrected = 0.0;
+    double cut_ci95 = 0.0;
+    double fill_raw = 0.0;
+    double fill_corrected = 0.0;
+    double fill_ci95 = 0.0;
+    double net_raw = 0.0;
+    double net_corrected = 0.0;
+    double net_ci95 = 0.0;
+    double cut_rel_ci95_pct = 0.0;
+    double fill_rel_ci95_pct = 0.0;
+    double measure_sigma = 0.03;
+    int subsample_runs = 0;
+    double elapsed_ms = 0.0;
+    std::vector<SurveyRecommendation> recommendations;
+    std::string summary;
+};
+
+UncertaintyReport analyze_uncertainty_and_recommend(
+    const TINEarthworkCalculator& base_calc,
+    double measure_sigma = 0.03,
+    int recommend_count = 8,
+    int subsample_runs = 8);
+
 } // namespace tin

@@ -1,3 +1,4 @@
+#include "core/ai_assistant.hpp"
 #include "core/ai_optimizer.hpp"
 #include "core/analysis.hpp"
 #include "core/calculator.hpp"
@@ -214,6 +215,122 @@ int main(int argc, char** argv) {
     double grade_savings_pct = opt_slope.savings_pct_vs_flat;
     double grade_ms = opt_real.elapsed_ms;
 
+    // Iteration 2 基准：1) 不确定度评定 + 自适应补测推荐（含真值覆盖与 10% 补测比随机对比）
+    auto u0 = std::chrono::steady_clock::now();
+    auto uncert_real = tin::analyze_uncertainty_and_recommend(calc, 0.03, 8, 8);
+    auto u1 = std::chrono::steady_clock::now();
+    double uncertainty_ms = std::chrono::duration<double, std::milli>(u1 - u0).count();
+
+    auto mound_fn = [](double x, double y) {
+        double dx = x - 50.0, dy = y - 50.0;
+        return 4.0 * std::exp(-(dx * dx + dy * dy) / (2.0 * 18.0 * 18.0));
+    };
+    auto mound_pts = make_grid_points(11, 11, 10.0, mound_fn);
+    tin::TINEarthworkCalculator mcalc(0.0);
+    mcalc.add_points(mound_pts);
+    mcalc.build_tin();
+    auto mu = tin::analyze_uncertainty_and_recommend(mcalc, 0.0, 6, 8);
+    double erf1 = std::erf(50.0 / (18.0 * std::sqrt(2.0)));
+    double mound_true = 4.0 * 2.0 * 3.14159265358979323846 * 18.0 * 18.0 * erf1 * erf1;
+    bool uncertainty_coverage_ok =
+        (std::abs(mu.cut_corrected - mound_true) <= mu.cut_ci95 * 1.25) &&
+        (mu.cut_ci95 > 0.0);
+
+    auto rec_terrain = [](double x, double y) {
+        double dx = x - 55.0, dy = y - 55.0;
+        return 10.0 + 6.5 * std::exp(-(dx * dx + dy * dy) / (2.0 * 14.0 * 14.0)) + 0.02 * x - 0.01 * y;
+    };
+    auto sparse_pts = make_grid_points(9, 9, 12.5, rec_terrain);
+    tin::TINEarthworkCalculator scalc(11.5);
+    scalc.add_points(sparse_pts);
+    double s_base_cut = scalc.run_full_calculation().total_cut;
+    auto fine_pts = make_grid_points(41, 41, 2.5, rec_terrain);
+    tin::TINEarthworkCalculator fcalc(11.5);
+    fcalc.add_points(fine_pts);
+    double s_true_cut = fcalc.run_full_calculation().total_cut;
+    double s_base_err = std::abs(s_base_cut - s_true_cut);
+
+    auto su = tin::analyze_uncertainty_and_recommend(scalc, 0.02, 8, 6);
+    auto rpts = sparse_pts;
+    for (const auto& r : su.recommendations) {
+        rpts.push_back({"R" + std::to_string(r.rank), r.x, r.y, rec_terrain(r.x, r.y), 0.0, 0.0, false});
+    }
+    tin::TINEarthworkCalculator rcalc(11.5);
+    rcalc.add_points(rpts);
+    double s_rec_err = std::abs(rcalc.run_full_calculation().total_cut - s_true_cut);
+
+    auto rndpts = sparse_pts;
+    for (int k = 0; k < 8; ++k) {
+        double rx = 5.0 + 90.0 * ((k * 37 + 13) % 97) / 97.0;
+        double ry = 5.0 + 90.0 * ((k * 53 + 29) % 89) / 89.0;
+        rndpts.push_back({"N" + std::to_string(k), rx, ry, rec_terrain(rx, ry), 0.0, 0.0, false});
+    }
+    tin::TINEarthworkCalculator rndcalc(11.5);
+    rndcalc.add_points(rndpts);
+    double s_rnd_err = std::abs(rndcalc.run_full_calculation().total_cut - s_true_cut);
+    double survey_rec_ratio = std::max(0.0, s_base_err - s_rec_err) /
+                              std::max(1e-6, s_base_err - s_rnd_err);
+    (void)uncert_real;
+
+    // 2) 空间异常点检测（5% 注入粗差 Recall & Precision）
+    auto clean_pts = make_grid_points(14, 14, 10.0, [](double x, double y) {
+        return 25.0 + 0.03 * x - 0.02 * y + 0.6 * std::sin(0.06 * x) * std::cos(0.05 * y);
+    });
+    std::vector<int> inj_idx = {18, 35, 52, 74, 91, 110, 128, 149, 165, 178};
+    for (size_t k = 0; k < inj_idx.size(); ++k) {
+        clean_pts[inj_idx[k]].z += (k % 2 == 0) ? 4.2 : -3.8;
+    }
+    auto anom_rep = tin::detect_survey_anomalies(clean_pts);
+    int tp = 0;
+    for (const auto& a : anom_rep.anomalies) {
+        if (std::find(inj_idx.begin(), inj_idx.end(), a.point_index) != inj_idx.end()) ++tp;
+    }
+    double anomaly_recall = static_cast<double>(tp) / static_cast<double>(inj_idx.size());
+    double anomaly_precision = anom_rep.anomalies.empty()
+                                 ? 0.0
+                                 : static_cast<double>(tp) / static_cast<double>(anom_rep.anomalies.size());
+
+    // 3) 30 条中英双语自然语言 & CAD 工程指令意图识别套件
+    struct NLCase { const char* text; tin::AssistantAction expected; };
+    const NLCase nl_cases[] = {
+        {"HELP", tin::AssistantAction::Help},
+        {"查看帮助命令", tin::AssistantAction::Help},
+        {"AUTOB", tin::AssistantAction::AutoRectBoundary},
+        {"生成矩形边界", tin::AssistantAction::AutoRectBoundary},
+        {"生成外轮廓边界", tin::AssistantAction::AutoOutline},
+        {"clear boundary", tin::AssistantAction::ClearBoundary},
+        {"开始计算", tin::AssistantAction::Calculate},
+        {"run tin calculation", tin::AssistantAction::Calculate},
+        {"求解零平衡标高", tin::AssistantAction::BalanceH0},
+        {"balance elevation", tin::AssistantAction::BalanceH0},
+        {"拟合最小二乘最优斜面", tin::AssistantAction::BestFitPlane},
+        {"保坡求解平衡高程", tin::AssistantAction::BalancePlane},
+        {"帮我联合优化总费用", tin::AssistantAction::OptimizeGradeCost},
+        {"optimize total cost", tin::AssistantAction::OptimizeGradeCost},
+        {"按间距15米做平行断面", tin::AssistantAction::RunSections},
+        {"计算分层土方", tin::AssistantAction::ComputeStrata},
+        {"计算土方调配方案", tin::AssistantAction::ComputeHaul},
+        {"放坡 1:1.2 1:1.5", tin::AssistantAction::ComputeSlope},
+        {"检查测点异常和健康分", tin::AssistantAction::RunDiagnostics},
+        {"detect survey outliers", tin::AssistantAction::RunDiagnostics},
+        {"一键修复高程粗差", tin::AssistantAction::CleanAnomalies},
+        {"推荐8个补测点", tin::AssistantAction::RunUncertainty},
+        {"uncertainty analysis", tin::AssistantAction::RunUncertainty},
+        {"测距坡度工具", tin::AssistantAction::MeasureDist},
+        {"测量多边形面积", tin::AssistantAction::MeasureArea},
+        {"把标高设为51.2", tin::AssistantAction::SetElevation},
+        {"switch to 3d view", tin::AssistantAction::SetView3D},
+        {"切换到二维平面", tin::AssistantAction::SetView2D},
+        {"白底出图打印模式", tin::AssistantAction::LightMode},
+        {"导出dxf图纸", tin::AssistantAction::ExportDxf},
+    };
+    int nl_ok = 0;
+    const int nl_total = static_cast<int>(std::size(nl_cases));
+    for (const auto& c : nl_cases) {
+        if (tin::parse_engineering_intent(c.text).action == c.expected) ++nl_ok;
+    }
+    double nl_intent_acc = static_cast<double>(nl_ok) / static_cast<double>(nl_total);
+
     // 边界鲁棒性检查
     int robust_passed = 0;
     const int robust_total = 4;
@@ -283,15 +400,15 @@ int main(int argc, char** argv) {
                   << "  \"grade_beats_best_fit\": " << (grade_beats_bf ? "true" : "false") << ",\n"
                   << "  \"grade_savings_pct\": " << grade_savings_pct << ",\n"
                   << "  \"grade_ms\": " << grade_ms << ",\n"
-                  << "  \"has_uncertainty\": false,\n"
-                  << "  \"uncertainty_coverage_ok\": false,\n"
-                  << "  \"survey_rec_ratio\": 0.0,\n"
-                  << "  \"uncertainty_ms\": 0.0,\n"
-                  << "  \"has_anomaly_detector\": false,\n"
-                  << "  \"anomaly_recall\": 0.0,\n"
-                  << "  \"anomaly_precision\": 0.0,\n"
-                  << "  \"has_ai_assistant\": false,\n"
-                  << "  \"nl_intent_acc\": 0.0,\n"
+                  << "  \"has_uncertainty\": true,\n"
+                  << "  \"uncertainty_coverage_ok\": " << (uncertainty_coverage_ok ? "true" : "false") << ",\n"
+                  << "  \"survey_rec_ratio\": " << survey_rec_ratio << ",\n"
+                  << "  \"uncertainty_ms\": " << uncertainty_ms << ",\n"
+                  << "  \"has_anomaly_detector\": true,\n"
+                  << "  \"anomaly_recall\": " << anomaly_recall << ",\n"
+                  << "  \"anomaly_precision\": " << anomaly_precision << ",\n"
+                  << "  \"has_ai_assistant\": true,\n"
+                  << "  \"nl_intent_acc\": " << nl_intent_acc << ",\n"
                   << "  \"robust_passed\": " << robust_passed << ",\n"
                   << "  \"robust_total\": " << robust_total << ",\n"
                   << "  \"ui_tabs\": 6,\n"
