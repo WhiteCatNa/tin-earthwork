@@ -879,6 +879,56 @@ bool CassApp::run_uncertainty_action() {
     }
 }
 
+bool CassApp::run_significance_action() {
+    if (project_.points.size() < 4) {
+        status_text_ = "至少需要 4 个测点才能分析变化显著性";
+        return false;
+    }
+    try {
+        TINEarthworkCalculator calc(project_.settings.design_elevation);
+        configure_calculator(calc);
+        calc.build_tin();
+        significance_report_ = analyze_change_significance(calc, measure_sigma_);
+        status_text_ = significance_report_->summary;
+        log_cmd("命令: _SIGNIF -> " + significance_report_->summary);
+        return true;
+    } catch (const std::exception& e) {
+        status_text_ = std::string("显著性分析失败: ") + e.what();
+        log_cmd("错误: " + status_text_);
+        return false;
+    }
+}
+
+bool CassApp::run_thinning_action(double tol_m) {
+    if (project_.points.size() < 5) {
+        status_text_ = "测点太少，无需抽稀";
+        return false;
+    }
+    try {
+        thin_tol_m_ = std::max(0.01, tol_m);
+        thinning_result_ = thin_points_preserve_accuracy(project_.points, thin_tol_m_);
+        status_text_ = thinning_result_->summary;
+        log_cmd("命令: _THIN -> " + thinning_result_->summary);
+        return true;
+    } catch (const std::exception& e) {
+        status_text_ = std::string("保精度抽稀失败: ") + e.what();
+        log_cmd("错误: " + status_text_);
+        return false;
+    }
+}
+
+bool CassApp::run_drainage_action(double min_slope_pct) {
+    if (!result_) {
+        if (!run_calculation()) return false;
+    }
+    drain_min_slope_ = std::max(0.05, min_slope_pct);
+    bool use_design = (project_.settings.design_mode == DesignMode::Plane);
+    drainage_report_ = analyze_drainage_and_ponding(*result_, drain_min_slope_, use_design);
+    status_text_ = drainage_report_->summary;
+    log_cmd("命令: _DRAIN -> " + drainage_report_->summary);
+    return true;
+}
+
 bool CassApp::run_ai_full_workflow_action() {
     if (project_.points.size() < 4) {
         status_text_ = "请先导入不少于 4 个测点再运行一键 AI 全流程诊断";
@@ -888,6 +938,8 @@ bool CassApp::run_ai_full_workflow_action() {
     bool ok1 = run_anomaly_diagnosis_action();
     bool ok2 = run_grade_optimization_action();
     bool ok3 = run_uncertainty_action();
+    run_significance_action();
+    run_drainage_action(drain_min_slope_);
     diagnosis_summary_ = generate_site_diagnosis(
         project_, result_ ? &(*result_) : nullptr,
         health_report_ ? &(*health_report_) : nullptr,
@@ -1051,6 +1103,7 @@ void CassApp::execute_command(const std::string& raw_cmd) {
         log_cmd("CAD 经典指令: AUTOB | OUTLINE | CLRBND | CALC(F5) | BALANCE/H0 | FITPLANE | BALPLANE | SECTIONS");
         log_cmd("专题与绘图   : STRATA | HAUL | SLOPE | GRID | CONTOUR | PROFILE | MEASURE | AREA | 3D | 2D | ZE");
         log_cmd("AI 智能指令  : OPT/AIOPT(联合费用优化) | DIAG/ANOMALY(异常体检) | CLEAN(修复粗差) | UNCERT(补测推荐)");
+        log_cmd("实用分析指令 : SIGNIF(共形显著性LoD) | THIN(保精度抽稀) | DRAIN(排水/积水风险检查)");
         log_cmd("自然语言示例 : \"把标高设为50.8\" | \"优化总费用\" | \"检查测点异常\" | \"推荐10个补测点\" | \"放坡 1:1.2 1:1.5\"");
         log_cmd("视图与编辑   : DARK | LIGHT | SWAP | UNDO | REDO | DAT | DXF | CLEAR (支持 Tab 自动补全)");
         break;
@@ -1114,6 +1167,18 @@ void CassApp::execute_command(const std::string& raw_cmd) {
     case AssistantAction::RunUncertainty:
         recommend_count_ = intent.count_param;
         run_uncertainty_action();
+        set_inspector_tab(6);
+        break;
+    case AssistantAction::AnalyzeSignificance:
+        run_significance_action();
+        set_inspector_tab(6);
+        break;
+    case AssistantAction::ThinPoints:
+        run_thinning_action(intent.has_param1 ? intent.param1 : thin_tol_m_);
+        set_inspector_tab(6);
+        break;
+    case AssistantAction::CheckDrainage:
+        run_drainage_action(intent.has_param1 ? intent.param1 : drain_min_slope_);
         set_inspector_tab(6);
         break;
     case AssistantAction::MeasureDist:
@@ -2531,6 +2596,36 @@ void CassApp::render_tab_ai() {
             ImGui::TextColored(col, "• [%s]", it.title.c_str());
             ImGui::TextWrapped("  %s", it.detail.c_str());
         }
+    }
+
+    ImGui::Spacing();
+    draw_section_bar("5. 变化显著性 / 保精度抽稀 / 排水积水");
+    if (ImGui::Button("显著性LoD", ImVec2(96, 0))) run_significance_action();
+    ImGui::SameLine();
+    if (ImGui::Button("保精度抽稀", ImVec2(96, 0))) run_thinning_action(thin_tol_m_);
+    ImGui::SameLine();
+    if (ImGui::Button("排水积水", ImVec2(-1, 0))) run_drainage_action(drain_min_slope_);
+
+    ImGui::InputDouble("抽稀容差(m)", &thin_tol_m_, 0.02, 0.1, "%.2f");
+    ImGui::InputDouble("最小排水坡(%)", &drain_min_slope_, 0.1, 0.5, "%.2f");
+
+    if (significance_report_) {
+        ImGui::TextWrapped("%s", significance_report_->summary.c_str());
+    }
+    if (thinning_result_) {
+        ImGui::TextWrapped("%s", thinning_result_->summary.c_str());
+        if (thinning_result_->retained_count < thinning_result_->original_count &&
+            ImGui::Button("应用抽稀结果到当前工程 (可Ctrl+Z撤销)", ImVec2(-1, 0))) {
+            undo_stack_.push_back(EditSnapshot{
+                project_.boundary, project_.holes, project_.breaklines, project_.settings, project_.points
+            });
+            project_.points = thinning_result_->points;
+            update_point_stats();
+            if (result_) run_calculation();
+        }
+    }
+    if (drainage_report_) {
+        ImGui::TextWrapped("%s", drainage_report_->summary.c_str());
     }
 
     ImGui::EndChild();

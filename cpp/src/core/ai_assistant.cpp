@@ -152,6 +152,18 @@ AssistantIntent parse_engineering_intent(const std::string& raw_input) {
         out.action = AssistantAction::RunUncertainty;
         return out;
     }
+    if (up == "SIGNIF" || up == "LOD") {
+        out.action = AssistantAction::AnalyzeSignificance;
+        return out;
+    }
+    if (up == "THIN" || up == "DECIMATE") {
+        out.action = AssistantAction::ThinPoints;
+        return out;
+    }
+    if (up == "DRAIN" || up == "PONDING") {
+        out.action = AssistantAction::CheckDrainage;
+        return out;
+    }
     if (up == "MEASURE" || up == "DIST" || up == "DI") {
         out.action = AssistantAction::MeasureDist;
         return out;
@@ -255,6 +267,29 @@ AssistantIntent parse_engineering_intent(const std::string& raw_input) {
     if (contains_any(lo, {"异常", "粗差", "飞点", "体检", "诊断", "健康", "anomaly", "outlier", "diagnos", "health"})) {
         out.action = AssistantAction::RunDiagnostics;
         out.reply = "AI助手: 执行测点空间异常检测与场地健康诊断";
+        return out;
+    }
+    if (contains_any(lo, {"显著性", "检测限", "lod", "conformal", "significance"})) {
+        out.action = AssistantAction::AnalyzeSignificance;
+        out.reply = "AI助手: 执行共形标定变化显著性 (LoD) 检验";
+        return out;
+    }
+    if (contains_any(lo, {"抽稀", "精简点云", "thinning", "decimate"})) {
+        out.action = AssistantAction::ThinPoints;
+        if (!nums.empty()) {
+            out.param1 = std::clamp(std::abs(nums[0]), 0.01, 2.0);
+            out.has_param1 = true;
+        }
+        out.reply = "AI助手: 执行保精度点云抽稀";
+        return out;
+    }
+    if (contains_any(lo, {"积水", "排水", "drainage", "ponding"})) {
+        out.action = AssistantAction::CheckDrainage;
+        if (!nums.empty()) {
+            out.param1 = std::clamp(std::abs(nums[0]), 0.05, 5.0);
+            out.has_param1 = true;
+        }
+        out.reply = "AI助手: 执行场地排水坡度与积水风险检查";
         return out;
     }
     if (contains_any(lo, {"补测", "不确定度", "置信区间", "误差分布", "uncertainty", "recommend", "survey point"})) {
@@ -410,9 +445,9 @@ std::vector<std::string> suggest_command_completions(const std::string& prefix) 
     static const char* kCommands[] = {
         "AI", "AIOPT", "ANOMALY", "AREA", "AUTOB", "BALANCE", "BALPLANE",
         "CALC", "CLEAN", "CLEAR", "CLRBND", "CONTOUR", "DARK", "DAT",
-        "DIAG", "DIST", "DXF", "FITPLANE", "GRID", "H0", "HAUL",
+        "DIAG", "DIST", "DRAIN", "DXF", "FITPLANE", "GRID", "H0", "HAUL",
         "HELP", "LIGHT", "MEASURE", "OPT", "OUTLINE", "PROFILE",
-        "REDO", "SECTIONS", "SLOPE", "STRATA", "SWAP", "UNCERT",
+        "REDO", "SECTIONS", "SIGNIF", "SLOPE", "STRATA", "SWAP", "THIN", "UNCERT",
         "UNDO", "ZE", "2D", "3D"
     };
     std::string up = upper_str(trim_str(prefix));

@@ -119,6 +119,11 @@ int main(int argc, char** argv) {
     app.execute_command("推荐6个补测点");
     check_true(app.uncertainty_report() != nullptr && app.uncertainty_report()->recommendations.size() == 6,
                "Chinese survey rec command sets count=6");
+    app.execute_command("SIGNIF");
+    app.execute_command("THIN");
+    app.execute_command("DRAIN");
+    check_true(app.significance_report() != nullptr && app.thinning_result() != nullptr && app.drainage_report() != nullptr,
+               "significance, thinning, drainage reports populated");
     auto comps = tin::suggest_command_completions("AI");
     check_true(comps.size() >= 2, "Tab completion returns AI commands");
 

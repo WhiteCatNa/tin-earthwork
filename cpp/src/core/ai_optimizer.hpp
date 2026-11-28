@@ -128,4 +128,56 @@ UncertaintyReport analyze_uncertainty_and_recommend(
     int recommend_count = 8,
     int subsample_runs = 8);
 
+// ---------- 4. 共形标定变化显著性 (Spatially Varying LoD) ----------
+struct SignificanceReport {
+    double confidence = 0.95;
+    double conformal_q = 1.959964;
+    double significant_cut = 0.0;
+    double significant_fill = 0.0;
+    double uncertain_cut = 0.0;
+    double uncertain_fill = 0.0;
+    double uncertain_area = 0.0;
+    double total_area = 0.0;
+    double uncertain_ratio = 0.0;
+    std::string summary;
+};
+
+SignificanceReport analyze_change_significance(
+    const TINEarthworkCalculator& base_calc,
+    double measure_sigma = 0.03);
+
+// ---------- 5. 保精度点云抽稀 (Tolerance-Bounded TIN Decimation) ----------
+struct ThinningResult {
+    std::vector<SurveyPoint> points;
+    int original_count = 0;
+    int retained_count = 0;
+    double reduction_pct = 0.0;
+    double max_error_m = 0.0;
+    double tolerance_m = 0.15;
+    std::string summary;
+};
+
+ThinningResult thin_points_preserve_accuracy(
+    const std::vector<SurveyPoint>& points,
+    double tolerance_m = 0.15);
+
+// ---------- 6. 场地排水坡度与低洼积水风险诊断 ----------
+struct DrainageReport {
+    double min_required_slope_pct = 0.3;
+    double mean_slope_pct = 0.0;
+    double min_slope_pct = 0.0;
+    double max_slope_pct = 0.0;
+    double ponding_area = 0.0;
+    double total_area = 0.0;
+    double ponding_ratio_pct = 0.0;
+    double dominant_runoff_azimuth_deg = 0.0;
+    std::vector<int> ponding_triangle_ids;
+    std::string summary;
+};
+
+DrainageReport analyze_drainage_and_ponding(
+    const CalculationResult& result,
+    double min_slope_pct = 0.3,
+    bool use_design_surface = true);
+
 } // namespace tin

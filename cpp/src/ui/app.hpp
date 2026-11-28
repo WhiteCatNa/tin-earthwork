@@ -52,6 +52,9 @@ public:
     bool run_anomaly_diagnosis_action();
     bool clean_anomalies_action();
     bool run_uncertainty_action();
+    bool run_significance_action();
+    bool run_thinning_action(double tol_m = 0.15);
+    bool run_drainage_action(double min_slope_pct = 0.3);
     bool run_ai_full_workflow_action();
     void set_3d_view(bool enabled);
     void set_tool_mode(CadToolMode mode);
@@ -67,6 +70,9 @@ public:
     const GradeOptimizationResult* grade_opt_result() const { return grade_opt_result_ ? &(*grade_opt_result_) : nullptr; }
     const SiteHealthReport* health_report() const { return health_report_ ? &(*health_report_) : nullptr; }
     const UncertaintyReport* uncertainty_report() const { return uncertainty_report_ ? &(*uncertainty_report_) : nullptr; }
+    const SignificanceReport* significance_report() const { return significance_report_ ? &(*significance_report_) : nullptr; }
+    const ThinningResult* thinning_result() const { return thinning_result_ ? &(*thinning_result_) : nullptr; }
+    const DrainageReport* drainage_report() const { return drainage_report_ ? &(*drainage_report_) : nullptr; }
     const DiagnosisSummary* diagnosis_summary() const { return diagnosis_summary_ ? &(*diagnosis_summary_) : nullptr; }
     const ProjectData& project() const { return project_; }
     double min_z() const { return min_nat_z_; }
@@ -138,6 +144,9 @@ private:
     std::optional<GradeOptimizationResult> grade_opt_result_;
     std::optional<SiteHealthReport> health_report_;
     std::optional<UncertaintyReport> uncertainty_report_;
+    std::optional<SignificanceReport> significance_report_;
+    std::optional<ThinningResult> thinning_result_;
+    std::optional<DrainageReport> drainage_report_;
     std::optional<DiagnosisSummary> diagnosis_summary_;
     std::optional<std::string> current_project_path_;
 
@@ -184,6 +193,8 @@ private:
     GradeOptConstraints opt_constraints_;
     int recommend_count_ = 8;
     double measure_sigma_ = 0.03;
+    double thin_tol_m_ = 0.15;
+    double drain_min_slope_ = 0.3;
 
     struct EditSnapshot {
         std::vector<XY> boundary;

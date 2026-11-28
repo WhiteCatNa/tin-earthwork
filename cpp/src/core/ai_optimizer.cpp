@@ -1025,4 +1025,331 @@ UncertaintyReport analyze_uncertainty_and_recommend(
     return rep;
 }
 
+SignificanceReport analyze_change_significance(
+    const TINEarthworkCalculator& base_calc,
+    double measure_sigma) {
+    if (base_calc.points().size() < 4) {
+        throw std::runtime_error("至少需要 4 个测点才能执行变化显著性分析");
+    }
+
+    TINEarthworkCalculator full_calc = base_calc;
+    CalculationResult res = full_calc.has_tin()
+                                ? full_calc.calculate_volumes()
+                                : full_calc.run_full_calculation();
+
+    const auto& pts = full_calc.points();
+    const size_t n = pts.size();
+    std::vector<int> hull = convex_hull_indices(pts);
+    std::vector<bool> is_hull(n, false);
+    for (int idx : hull) {
+        if (idx >= 0 && idx < static_cast<int>(n)) is_hull[idx] = true;
+    }
+    std::vector<int> interior;
+    for (size_t i = 0; i < n; ++i) {
+        if (!is_hull[i]) interior.push_back(static_cast<int>(i));
+    }
+
+    // 1. 分裂共形预测（3 次 10% 内部点留出交叉检验）标定检测限倍数 q
+    std::vector<double> norm_res;
+    TINEarthworkCalculator tmpl = full_calc;
+    tmpl.set_breaklines({});
+    for (int rep_i = 0; rep_i < 3 && interior.size() >= 10; ++rep_i) {
+        std::mt19937_64 rng(9911ULL + static_cast<unsigned long long>(rep_i) * 313ULL);
+        std::vector<int> perm = interior;
+        std::shuffle(perm.begin(), perm.end(), rng);
+        size_t hold = std::max<size_t>(1, perm.size() / 10);
+
+        std::vector<SurveyPoint> train;
+        train.reserve(n - hold);
+        for (int idx : hull) train.push_back(pts[idx]);
+        for (size_t j = hold; j < perm.size(); ++j) train.push_back(pts[perm[j]]);
+
+        try {
+            TINEarthworkCalculator tc = tmpl;
+            tc.add_points(train);
+            tc.build_tin();
+            for (size_t j = 0; j < hold; ++j) {
+                const auto& hp = pts[perm[j]];
+                auto [zn, _zd, _ok] = tc.sample_surface(hp.x, hp.y, false);
+                (void)_zd;
+                (void)_ok;
+                if (std::isfinite(zn)) {
+                    double scale = std::max(0.02, measure_sigma);
+                    norm_res.push_back(std::abs(hp.z - zn) / scale);
+                }
+            }
+        } catch (...) {}
+    }
+
+    double q = 1.959964;
+    if (norm_res.size() >= 20) {
+        std::sort(norm_res.begin(), norm_res.end());
+        size_t idx95 = static_cast<size_t>(std::ceil(0.95 * static_cast<double>(norm_res.size()))) - 1;
+        idx95 = std::clamp<size_t>(idx95, 0, norm_res.size() - 1);
+        q = std::clamp(norm_res[idx95], 1.959964, 6.0);
+    }
+
+    SignificanceReport out;
+    out.conformal_q = q;
+
+    // 2. 估计局部弯曲度用于空间变化检测限 LoD
+    std::unordered_map<long long, double> v_kappa;
+    auto pt_key = [](double x, double y) -> long long {
+        long long kx = static_cast<long long>(std::llround(x * 1000.0));
+        long long ky = static_cast<long long>(std::llround(y * 1000.0));
+        return (kx * 73856093LL) ^ (ky * 19349663LL);
+    };
+    std::vector<std::pair<double, size_t>> knn;
+    for (size_t i = 0; i < n; ++i) {
+        knn.clear();
+        for (size_t j = 0; j < n; ++j) {
+            if (i == j) continue;
+            double dx = pts[j].x - pts[i].x;
+            double dy = pts[j].y - pts[i].y;
+            double d2 = dx * dx + dy * dy;
+            if (d2 > 1e-6) knn.push_back({d2, j});
+        }
+        size_t take = std::min<size_t>(6, knn.size());
+        if (take == 0) continue;
+        std::partial_sort(knn.begin(), knn.begin() + static_cast<ptrdiff_t>(take), knn.end(),
+                          [](const auto& a, const auto& b) { return a.first < b.first; });
+        knn.resize(take);
+        double pred = predict_local_elevation_robust(pts, i, knn);
+        double ml2 = 0.0;
+        for (const auto& kv : knn) ml2 += kv.first;
+        ml2 /= static_cast<double>(take);
+        v_kappa[pt_key(pts[i].x, pts[i].y)] = std::abs(pts[i].z - pred) / std::max(ml2, 1.0);
+    }
+
+    for (const auto& t : res.triangles) {
+        if (t.is_boundary || t.area <= 0.0) continue;
+        out.total_area += t.area;
+        double l2 =
+            (t.p1.x - t.p0.x) * (t.p1.x - t.p0.x) + (t.p1.y - t.p0.y) * (t.p1.y - t.p0.y) +
+            (t.p2.x - t.p1.x) * (t.p2.x - t.p1.x) + (t.p2.y - t.p1.y) * (t.p2.y - t.p1.y) +
+            (t.p0.x - t.p2.x) * (t.p0.x - t.p2.x) + (t.p0.y - t.p2.y) * (t.p0.y - t.p2.y);
+        double kmax = std::max({
+            v_kappa[pt_key(t.p0.x, t.p0.y)],
+            v_kappa[pt_key(t.p1.x, t.p1.y)],
+            v_kappa[pt_key(t.p2.x, t.p2.y)],
+        });
+        double interp_s = kmax * (l2 / 12.0);
+        double s_tot = std::sqrt(measure_sigma * measure_sigma + interp_s * interp_s);
+        double lod = q * s_tot;
+
+        if (std::abs(t.avg_delta_z) > lod) {
+            out.significant_cut += t.cut_volume;
+            out.significant_fill += t.fill_volume;
+        } else {
+            out.uncertain_cut += t.cut_volume;
+            out.uncertain_fill += t.fill_volume;
+            out.uncertain_area += t.area;
+        }
+    }
+    out.uncertain_ratio = (out.total_area > 1e-9) ? (out.uncertain_area / out.total_area) : 0.0;
+
+    std::ostringstream oss;
+    oss << std::fixed << std::setprecision(1)
+        << "显著挖方 " << out.significant_cut << " m³ / 显著填方 " << out.significant_fill
+        << " m³（" << (out.uncertain_ratio * 100.0) << "% 面积高差处于检测限 LoD 内，q="
+        << std::setprecision(2) << out.conformal_q << "）";
+    out.summary = oss.str();
+    return out;
+}
+
+ThinningResult thin_points_preserve_accuracy(
+    const std::vector<SurveyPoint>& points,
+    double tolerance_m) {
+    ThinningResult out;
+    out.original_count = static_cast<int>(points.size());
+    out.tolerance_m = std::max(1e-4, tolerance_m);
+    if (points.size() <= 4) {
+        out.points = points;
+        out.retained_count = static_cast<int>(points.size());
+        out.summary = "测点数 <= 4，全部保留";
+        return out;
+    }
+
+    // 凸包顶点作为初始骨架，保证测区覆盖范围不萎缩
+    std::vector<int> hull = convex_hull_indices(points);
+    std::vector<bool> kept(points.size(), false);
+    for (int idx : hull) {
+        if (idx >= 0 && idx < static_cast<int>(points.size())) kept[idx] = true;
+    }
+
+    auto build_kept_vec = [&]() {
+        std::vector<SurveyPoint> v;
+        v.reserve(points.size());
+        for (size_t i = 0; i < points.size(); ++i) {
+            if (kept[i]) v.push_back(points[i]);
+        }
+        return v;
+    };
+
+    double worst_err = 0.0;
+    for (int pass = 0; pass < 18; ++pass) {
+        auto cur_pts = build_kept_vec();
+        if (cur_pts.size() >= points.size()) {
+            worst_err = 0.0;
+            break;
+        }
+        TINEarthworkCalculator calc(0.0);
+        calc.add_points(cur_pts);
+        calc.build_tin();
+
+        // 在当前每个超限三角形内最多挑 1 个误差最大点插入（兼顾并行收敛与不扎堆）
+        const auto& tris = calc.triangles();
+        std::vector<int> best_pt_for_tri(tris.size(), -1);
+        std::vector<double> best_err_for_tri(tris.size(), out.tolerance_m);
+
+        worst_err = 0.0;
+        int global_worst_idx = -1;
+        double global_worst_err = 0.0;
+
+        for (size_t i = 0; i < points.size(); ++i) {
+            if (kept[i]) continue;
+            auto [zn, _zd, _ok] = calc.sample_surface(points[i].x, points[i].y, true);
+            (void)_zd;
+            (void)_ok;
+            if (!std::isfinite(zn)) continue;
+            double err = std::abs(points[i].z - zn);
+            worst_err = std::max(worst_err, err);
+            if (err > global_worst_err) {
+                global_worst_err = err;
+                global_worst_idx = static_cast<int>(i);
+            }
+            if (err > out.tolerance_m) {
+                // 粗定位至最先包含该点的有效三角形（按三角网索引）
+                for (size_t ti = 0; ti < tris.size(); ++ti) {
+                    const auto& t = tris[ti];
+                    double a = (t.p1.x - t.p0.x) * (points[i].y - t.p0.y) - (t.p1.y - t.p0.y) * (points[i].x - t.p0.x);
+                    double b = (t.p2.x - t.p1.x) * (points[i].y - t.p1.y) - (t.p2.y - t.p1.y) * (points[i].x - t.p1.x);
+                    double c = (t.p0.x - t.p2.x) * (points[i].y - t.p2.y) - (t.p0.y - t.p2.y) * (points[i].x - t.p2.x);
+                    if ((a >= -1e-6 && b >= -1e-6 && c >= -1e-6) || (a <= 1e-6 && b <= 1e-6 && c <= 1e-6)) {
+                        if (err > best_err_for_tri[ti]) {
+                            best_err_for_tri[ti] = err;
+                            best_pt_for_tri[ti] = static_cast<int>(i);
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (worst_err <= out.tolerance_m) break;
+
+        int added = 0;
+        for (int idx : best_pt_for_tri) {
+            if (idx >= 0 && !kept[idx]) {
+                kept[idx] = true;
+                ++added;
+            }
+        }
+        if (added == 0 && global_worst_idx >= 0) {
+            kept[global_worst_idx] = true;
+            ++added;
+        }
+        if (added == 0) break;
+    }
+
+    out.points = build_kept_vec();
+    out.retained_count = static_cast<int>(out.points.size());
+    out.reduction_pct = (out.original_count > 0)
+        ? (100.0 * static_cast<double>(out.original_count - out.retained_count) / static_cast<double>(out.original_count))
+        : 0.0;
+
+    // 最终实测最大残差校验
+    if (out.retained_count < out.original_count) {
+        TINEarthworkCalculator fc(0.0);
+        fc.add_points(out.points);
+        fc.build_tin();
+        double final_max = 0.0;
+        for (size_t i = 0; i < points.size(); ++i) {
+            if (kept[i]) continue;
+            auto [zn, _zd, _ok] = fc.sample_surface(points[i].x, points[i].y, true);
+            (void)_zd;
+            (void)_ok;
+            if (std::isfinite(zn)) {
+                final_max = std::max(final_max, std::abs(points[i].z - zn));
+            }
+        }
+        out.max_error_m = final_max;
+    } else {
+        out.max_error_m = 0.0;
+    }
+
+    std::ostringstream oss;
+    oss << std::fixed << std::setprecision(1)
+        << "保精度抽稀完成（容差 " << std::setprecision(3) << out.tolerance_m
+        << " m）：保留 " << out.retained_count << "/" << out.original_count
+        << " 点（压缩 " << std::setprecision(1) << out.reduction_pct
+        << "%），实测最大高程误差 " << std::setprecision(3) << out.max_error_m << " m";
+    out.summary = oss.str();
+    return out;
+}
+
+DrainageReport analyze_drainage_and_ponding(
+    const CalculationResult& result,
+    double min_slope_pct,
+    bool use_design_surface) {
+    DrainageReport out;
+    out.min_required_slope_pct = std::max(0.0, min_slope_pct);
+    out.min_slope_pct = std::numeric_limits<double>::infinity();
+
+    double weighted_slope_sum = 0.0;
+    double runoff_x = 0.0, runoff_y = 0.0;
+
+    for (const auto& t : result.triangles) {
+        if (t.is_boundary || t.area <= 1e-9) continue;
+        double z0 = use_design_surface ? t.p0.design_z : t.p0.z;
+        double z1 = use_design_surface ? t.p1.design_z : t.p1.z;
+        double z2 = use_design_surface ? t.p2.design_z : t.p2.z;
+        auto pl = linear_plane(
+            {t.p0.x, t.p0.y}, {t.p1.x, t.p1.y}, {t.p2.x, t.p2.y},
+            z0, z1, z2, 1e-18);
+        double gx = 0.0, gy = 0.0;
+        if (pl.has_value()) {
+            gx = std::get<0>(*pl);
+            gy = std::get<1>(*pl);
+        }
+        double slope_pct = std::hypot(gx, gy) * 100.0;
+        out.total_area += t.area;
+        weighted_slope_sum += slope_pct * t.area;
+        out.min_slope_pct = std::min(out.min_slope_pct, slope_pct);
+        out.max_slope_pct = std::max(out.max_slope_pct, slope_pct);
+
+        // 下坡汇流方向为负梯度方向 (-gx, -gy)
+        runoff_x += (-gx) * t.area;
+        runoff_y += (-gy) * t.area;
+
+        if (slope_pct + 1e-9 < out.min_required_slope_pct) {
+            out.ponding_area += t.area;
+            out.ponding_triangle_ids.push_back(t.id);
+        }
+    }
+
+    if (out.total_area > 1e-9) {
+        out.mean_slope_pct = weighted_slope_sum / out.total_area;
+        out.ponding_ratio_pct = out.ponding_area / out.total_area * 100.0;
+        if (std::hypot(runoff_x, runoff_y) > 1e-12) {
+            // 测量方位角：正北(Y+)为 0°，顺时针正东(X+)为 90°
+            double az = std::atan2(runoff_x, runoff_y) * 180.0 / 3.14159265358979323846;
+            if (az < 0.0) az += 360.0;
+            out.dominant_runoff_azimuth_deg = az;
+        }
+    } else {
+        out.min_slope_pct = 0.0;
+    }
+
+    std::ostringstream oss;
+    oss << std::fixed << std::setprecision(2)
+        << "平均坡度 " << out.mean_slope_pct << "%，主排水方向 "
+        << std::setprecision(1) << out.dominant_runoff_azimuth_deg
+        << "°；低于 " << std::setprecision(2) << out.min_required_slope_pct
+        << "% 积水风险区占比 " << std::setprecision(1) << out.ponding_ratio_pct
+        << "%（" << out.ponding_triangle_ids.size() << " 个三角形）";
+    out.summary = oss.str();
+    return out;
+}
+
 } // namespace tin

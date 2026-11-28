@@ -712,6 +712,51 @@ int main(int argc, char** argv) {
         check_true(std::isfinite(opt0.optimized.total_cost), "finite cost under extreme rates");
     });
 
+    // 26. 共形变化显著性检测限 (LoD) 分离真实挖填与测量/内插噪声
+    run_test("26_conformal_change_significance_lod", [&]() {
+        auto pts = make_grid_points(10, 10, 10.0, [](double x, double) {
+            return (x >= 50.0) ? 12.0 : 10.02; // 左侧接近零误差噪声，右侧 2.0m 显著挖方
+        });
+        tin::TINEarthworkCalculator calc(10.0);
+        calc.add_points(pts);
+        calc.build_tin();
+        auto sig = tin::analyze_change_significance(calc, 0.03);
+        check_true(sig.conformal_q >= 1.9599, "conformal q >= z95");
+        check_true(sig.significant_cut > 1000.0, "detects large real cut");
+        check_true(sig.uncertain_area > 1000.0, "flags near-zero region as uncertain");
+    });
+
+    // 27. 保精度点云抽稀：误差严格小于容差且平坦缓坡处高压缩率
+    run_test("27_precision_preserving_point_thinning", [&]() {
+        // 大部分为平缓斜坡 + 中间小丘，15x15 = 225 点
+        auto pts = make_grid_points(15, 15, 10.0, [](double x, double y) {
+            double dx = x - 70.0, dy = y - 70.0;
+            return 20.0 + 0.02 * x + 2.5 * std::exp(-(dx * dx + dy * dy) / (2.0 * 15.0 * 15.0));
+        });
+        auto th = tin::thin_points_preserve_accuracy(pts, 0.08);
+        check_true(th.retained_count < th.original_count, "points reduced");
+        check_true(th.reduction_pct >= 30.0, "meaningful compression >= 30%");
+        check_true(th.max_error_m <= 0.08 + 1e-6, "max vertical error strictly within tolerance");
+    });
+
+    // 28. 场地排水坡度与低洼积水风险检查
+    run_test("28_drainage_and_ponding_analysis", [&]() {
+        // 平坦自然地面 (0% 坡度) vs 倾斜设计面 (2.0% X 坡度)
+        auto pts = make_grid_points(6, 6, 10.0, [](double, double) { return 10.0; });
+        tin::TINEarthworkCalculator calc(10.0);
+        calc.add_points(pts);
+        auto r_flat = calc.run_full_calculation();
+        auto d_flat = tin::analyze_drainage_and_ponding(r_flat, 0.3, false);
+        check_near(d_flat.ponding_ratio_pct, 100.0, 1e-3, "flat ground 100% ponding risk");
+
+        calc.set_design_plane({0.0, 0.0, 10.0, 2.0, 0.0});
+        auto r_sloped = calc.calculate_volumes();
+        auto d_sloped = tin::analyze_drainage_and_ponding(r_sloped, 0.3, true);
+        check_near(d_sloped.mean_slope_pct, 2.0, 1e-3, "2% design slope");
+        check_near(d_sloped.ponding_ratio_pct, 0.0, 1e-3, "no ponding on 2% slope");
+        check_near(d_sloped.dominant_runoff_azimuth_deg, 270.0, 1.0, "runoff toward -X (270 deg)");
+    });
+
     std::cout << "=== Summary: PASSED " << g_passed << " / " << (g_passed + g_failed) << " ===\n";
     return g_failed == 0 ? 0 : 1;
 }
