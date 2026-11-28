@@ -3,16 +3,19 @@
 #include "miniz.h"
 #include "nlohmann/json.hpp"
 
+#ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#endif
 
 #include <algorithm>
 #include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <ctime>
 #include <iomanip>
 #include <map>
@@ -23,6 +26,7 @@ namespace tin {
 
 using json = nlohmann::json;
 
+#ifdef _WIN32
 std::wstring utf8_to_wide(const std::string& s) {
     if (s.empty()) return {};
     int len = MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), nullptr, 0);
@@ -40,12 +44,74 @@ std::string wide_to_utf8(const std::wstring& ws) {
     WideCharToMultiByte(CP_UTF8, 0, ws.data(), static_cast<int>(ws.size()), out.data(), len, nullptr, nullptr);
     return out;
 }
+#else
+std::wstring utf8_to_wide(const std::string& s) {
+    std::wstring out;
+    out.reserve(s.size());
+    size_t i = 0;
+    while (i < s.size()) {
+        std::uint32_t cp = 0;
+        unsigned char c = static_cast<unsigned char>(s[i]);
+        if (c < 0x80) {
+            cp = c;
+            ++i;
+        } else if ((c & 0xE0) == 0xC0 && i + 1 < s.size()) {
+            cp = ((c & 0x1F) << 6) | (static_cast<unsigned char>(s[i + 1]) & 0x3F);
+            i += 2;
+        } else if ((c & 0xF0) == 0xE0 && i + 2 < s.size()) {
+            cp = ((c & 0x0F) << 12) |
+                 ((static_cast<unsigned char>(s[i + 1]) & 0x3F) << 6) |
+                 (static_cast<unsigned char>(s[i + 2]) & 0x3F);
+            i += 3;
+        } else if ((c & 0xF8) == 0xF0 && i + 3 < s.size()) {
+            cp = ((c & 0x07) << 18) |
+                 ((static_cast<unsigned char>(s[i + 1]) & 0x3F) << 12) |
+                 ((static_cast<unsigned char>(s[i + 2]) & 0x3F) << 6) |
+                 (static_cast<unsigned char>(s[i + 3]) & 0x3F);
+            i += 4;
+        } else {
+            cp = c;
+            ++i;
+        }
+        out.push_back(static_cast<wchar_t>(cp));
+    }
+    return out;
+}
+
+std::string wide_to_utf8(const std::wstring& ws) {
+    std::string out;
+    out.reserve(ws.size() * 2);
+    for (wchar_t wc : ws) {
+        std::uint32_t cp = static_cast<std::uint32_t>(wc);
+        if (cp < 0x80) {
+            out.push_back(static_cast<char>(cp));
+        } else if (cp < 0x800) {
+            out.push_back(static_cast<char>(0xC0 | (cp >> 6)));
+            out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+        } else if (cp < 0x10000) {
+            out.push_back(static_cast<char>(0xE0 | (cp >> 12)));
+            out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+            out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+        } else {
+            out.push_back(static_cast<char>(0xF0 | (cp >> 18)));
+            out.push_back(static_cast<char>(0x80 | ((cp >> 12) & 0x3F)));
+            out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+            out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+        }
+    }
+    return out;
+}
+#endif
 
 namespace {
 
 std::vector<std::uint8_t> read_file_bytes(const std::string& utf8_path) {
+#ifdef _WIN32
     std::wstring wp = utf8_to_wide(utf8_path);
     FILE* fp = _wfopen(wp.c_str(), L"rb");
+#else
+    FILE* fp = std::fopen(utf8_path.c_str(), "rb");
+#endif
     if (!fp) {
         throw std::runtime_error("无法打开文件: " + utf8_path);
     }
@@ -62,8 +128,12 @@ std::vector<std::uint8_t> read_file_bytes(const std::string& utf8_path) {
 }
 
 void write_file_bytes(const std::string& utf8_path, const void* data, size_t size) {
+#ifdef _WIN32
     std::wstring wp = utf8_to_wide(utf8_path);
     FILE* fp = _wfopen(wp.c_str(), L"wb");
+#else
+    FILE* fp = std::fopen(utf8_path.c_str(), "wb");
+#endif
     if (!fp) {
         throw std::runtime_error("无法写入文件: " + utf8_path);
     }
@@ -85,9 +155,13 @@ std::string decode_text_auto(const std::vector<std::uint8_t>& bytes) {
     if (bytes.size() >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF) {
         offset = 3;
     } else if (bytes.size() >= 2 && bytes[0] == 0xFF && bytes[1] == 0xFE) {
-        int wlen = static_cast<int>((bytes.size() - 2) / 2);
-        std::wstring ws(wlen, L'\0');
-        std::memcpy(ws.data(), bytes.data() + 2, wlen * 2);
+        size_t n_u16 = (bytes.size() - 2) / 2;
+        std::wstring ws(n_u16, L'\0');
+        for (size_t i = 0; i < n_u16; ++i) {
+            std::uint16_t u16 = static_cast<std::uint16_t>(bytes[2 + i * 2]) |
+                                (static_cast<std::uint16_t>(bytes[2 + i * 2 + 1]) << 8);
+            ws[i] = static_cast<wchar_t>(u16);
+        }
         return wide_to_utf8(ws);
     }
 
@@ -95,6 +169,7 @@ std::string decode_text_auto(const std::vector<std::uint8_t>& bytes) {
     int len = static_cast<int>(bytes.size() - offset);
     if (len <= 0) return {};
 
+#ifdef _WIN32
     // 优先严格校验 UTF-8
     int wlen = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, ptr, len, nullptr, 0);
     if (wlen > 0) {
@@ -107,6 +182,7 @@ std::string decode_text_auto(const std::vector<std::uint8_t>& bytes) {
         MultiByteToWideChar(936, 0, ptr, len, ws.data(), wlen);
         return wide_to_utf8(ws);
     }
+#endif
     return std::string(ptr, len);
 }
 
@@ -1054,7 +1130,11 @@ void export_report_txt(const CalculationResult& result, int point_count,
                        const std::string& project_name, const std::string& utf8_path) {
     std::time_t now = std::time(nullptr);
     std::tm tm_now{};
+#ifdef _WIN32
     localtime_s(&tm_now, &now);
+#else
+    localtime_r(&now, &tm_now);
+#endif
     char tbuf[64]{};
     std::strftime(tbuf, sizeof(tbuf), "%Y-%m-%d %H:%M:%S", &tm_now);
 

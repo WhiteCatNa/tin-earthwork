@@ -8,11 +8,6 @@
 #include "ui/theme.hpp"
 #include "ui/viewport_3d.hpp"
 
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#include <windows.h>
-
 #include <optional>
 #include <string>
 #include <vector>
@@ -22,7 +17,7 @@ namespace tin::ui {
 // 南方CASS 10/11 风格全功能 TIN 土方算量桌面工作站主控类
 class CassApp {
 public:
-    CassApp(HWND hwnd, const ThemeFonts& fonts);
+    CassApp(NativeWindowHandle hwnd, const ThemeFonts& fonts);
 
     // 每帧渲染（覆盖全窗口工作区：菜单栏 + 工具栏 + 左侧屏幕菜单 + 中央CAD视口 + 右侧属性页 + 命令行 + 状态栏）
     void render();
@@ -114,7 +109,7 @@ private:
     void action_export_cass_dat();
     void action_export_sections_csv();
 
-    HWND hwnd_ = nullptr;
+    [[maybe_unused]] NativeWindowHandle hwnd_ = nullptr;
     ThemeFonts fonts_;
 
     ProjectData project_;

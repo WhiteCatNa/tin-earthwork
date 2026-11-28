@@ -211,7 +211,7 @@ void Viewport3D::render(const ProjectData& project, const CalculationResult* res
         };
     };
 
-    auto project = [&](const Vec3& p, float& out_depth) -> ImVec2 {
+    auto project_pt = [&](const Vec3& p, float& out_depth) -> ImVec2 {
         // 先绕 Z 轴旋转 yaw
         float x1 = p.x * cyaw - p.y * syaw;
         float y1 = p.x * syaw + p.y * cyaw;
@@ -250,9 +250,9 @@ void Viewport3D::render(const ProjectData& project, const CalculationResult* res
 
         float d0, d1, d2;
         DrawTri dt;
-        dt.s0 = project(v0, d0);
-        dt.s1 = project(v1, d1);
-        dt.s2 = project(v2, d2);
+        dt.s0 = project_pt(v0, d0);
+        dt.s1 = project_pt(v1, d1);
+        dt.s2 = project_pt(v2, d2);
         dt.depth = (d0 + d1 + d2) / 3.0f;
 
         if (color_mode == ColorMode3D::CutFill) {
@@ -298,10 +298,10 @@ void Viewport3D::render(const ProjectData& project, const CalculationResult* res
                 Vec3 p11 = to_norm(x1, y1, design_z_at(x1, y1));
                 Vec3 p01 = to_norm(x0, y1, design_z_at(x0, y1));
                 float d00, d10, d11, d01;
-                ImVec2 s00 = project(p00, d00);
-                ImVec2 s10 = project(p10, d10);
-                ImVec2 s11 = project(p11, d11);
-                ImVec2 s01 = project(p01, d01);
+                ImVec2 s00 = project_pt(p00, d00);
+                ImVec2 s10 = project_pt(p10, d10);
+                ImVec2 s11 = project_pt(p11, d11);
+                ImVec2 s01 = project_pt(p01, d01);
 
                 ImU32 dfill = dark_mode ? IM_COL32(0x38, 0xBD, 0xF8, 48) : IM_COL32(0x02, 0x84, 0xC7, 45);
                 ImU32 dline = dark_mode ? IM_COL32(0x7D, 0xD3, 0xFC, 130) : IM_COL32(0x03, 0x69, 0xA1, 140);
@@ -333,10 +333,10 @@ void Viewport3D::render(const ProjectData& project, const CalculationResult* res
         double zb = std::min(zmin, dmin);
         double zt = std::max(zmax, dmax);
         float dtmp = 0.0f;
-        ImVec2 o = project(to_norm(xmin, ymin, zb), dtmp);
-        ImVec2 ax = project(to_norm(xmax, ymin, zb), dtmp);
-        ImVec2 ay = project(to_norm(xmin, ymax, zb), dtmp);
-        ImVec2 az = project(to_norm(xmin, ymin, zt), dtmp);
+        ImVec2 o = project_pt(to_norm(xmin, ymin, zb), dtmp);
+        ImVec2 ax = project_pt(to_norm(xmax, ymin, zb), dtmp);
+        ImVec2 ay = project_pt(to_norm(xmin, ymax, zb), dtmp);
+        ImVec2 az = project_pt(to_norm(xmin, ymin, zt), dtmp);
 
         dl->AddLine(o, ax, IM_COL32(0xF8, 0x71, 0x71, 220), 1.8f);
         dl->AddLine(o, ay, IM_COL32(0x4A, 0xDE, 0x80, 220), 1.8f);

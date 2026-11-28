@@ -30,3 +30,4 @@ dist/
 
 # C++ 构建目录
 cpp/build/
+cpp/build*/

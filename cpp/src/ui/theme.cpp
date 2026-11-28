@@ -1,16 +1,24 @@
 #include "ui/theme.hpp"
+#ifdef _WIN32
 #include <dwmapi.h>
+#endif
+#include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <vector>
 
 namespace tin::ui {
 
-void configure_win32_dark_titlebar(HWND hwnd) {
+void configure_win32_dark_titlebar(NativeWindowHandle hwnd) {
+#ifdef _WIN32
     if (!hwnd) return;
     BOOL dark = TRUE;
     DwmSetWindowAttribute(hwnd, 20 /* DWMWA_USE_IMMERSIVE_DARK_MODE */, &dark, sizeof(dark));
     COLORREF caption = RGB(0x18, 0x1C, 0x22);
     DwmSetWindowAttribute(hwnd, 35 /* DWMWA_CAPTION_COLOR */, &caption, sizeof(caption));
+#else
+    (void)hwnd;
+#endif
 }
 
 namespace {
@@ -22,82 +30,27 @@ bool file_exists(const char* path) {
     return true;
 }
 
+double linearize_srgb(double c) {
+    return (c <= 0.03928) ? (c / 12.92) : std::pow((c + 0.055) / 1.055, 2.4);
+}
+
+double relative_luminance(const ImVec4& col) {
+    return 0.2126 * linearize_srgb(col.x) +
+           0.7152 * linearize_srgb(col.y) +
+           0.0722 * linearize_srgb(col.z);
+}
+
 } // namespace
 
-ThemeFonts setup_imgui_fonts_and_style(float dpi_scale) {
-    ImGuiIO& io = ImGui::GetIO();
-    io.IniFilename = nullptr; // 每次启动保持整洁的南方CASS布局
+double contrast_ratio(const ImVec4& fg, const ImVec4& bg) {
+    double l1 = relative_luminance(fg);
+    double l2 = relative_luminance(bg);
+    if (l1 < l2) std::swap(l1, l2);
+    return (l1 + 0.05) / (l2 + 0.05);
+}
 
-    // 构建汉字全集 + 工程上标/符号字形表
-    static ImVector<ImWchar> ranges;
-    if (ranges.empty()) {
-        ImFontGlyphRangesBuilder builder;
-        builder.AddRanges(io.Fonts->GetGlyphRangesChineseFull());
-        static const ImWchar extra_ranges[] = {
-            0x00A0, 0x00FF, // ° ± ² ³ × ÷ 等
-            0x0391, 0x03C9, // Δ Σ α β 等希腊字母
-            0x2000, 0x26FF, // — • ✓ ✕ ▲ ▼ ● ○ □ ■ ★ 等几何符号
-            0,
-        };
-        builder.AddRanges(extra_ranges);
-        builder.BuildRanges(&ranges);
-    }
-
-    const char* ui_font_candidates[] = {
-        "C:\\Windows\\Fonts\\msyh.ttc",
-        "C:\\Windows\\Fonts\\msyh.ttf",
-        "C:\\Windows\\Fonts\\simhei.ttf",
-        "C:\\Windows\\Fonts\\Deng.ttf",
-        "C:\\Windows\\Fonts\\simsun.ttc",
-    };
-    const char* chosen_ui = nullptr;
-    for (const char* p : ui_font_candidates) {
-        if (file_exists(p)) {
-            chosen_ui = p;
-            break;
-        }
-    }
-
-    const char* mono_candidates[] = {
-        "C:\\Windows\\Fonts\\consola.ttf",
-        "C:\\Windows\\Fonts\\simhei.ttf",
-    };
-    const char* chosen_mono = nullptr;
-    for (const char* p : mono_candidates) {
-        if (file_exists(p)) {
-            chosen_mono = p;
-            break;
-        }
-    }
-
-    ThemeFonts fonts;
-    float base_px = 16.0f * dpi_scale;
-    float kpi_px = 21.0f * dpi_scale;
-
-    if (chosen_ui) {
-        fonts.regular = io.Fonts->AddFontFromFileTTF(chosen_ui, base_px, nullptr, ranges.Data);
-        fonts.kpi = io.Fonts->AddFontFromFileTTF(chosen_ui, kpi_px, nullptr, ranges.Data);
-    } else {
-        fonts.regular = io.Fonts->AddFontDefault();
-        fonts.kpi = fonts.regular;
-    }
-
-    if (chosen_mono) {
-        ImFontConfig cfg{};
-        cfg.OversampleH = 2;
-        fonts.mono = io.Fonts->AddFontFromFileTTF(
-            chosen_mono, 15.0f * dpi_scale, &cfg, io.Fonts->GetGlyphRangesDefault());
-        if (chosen_ui && fonts.mono) {
-            ImFontConfig merge_cfg{};
-            merge_cfg.MergeMode = true;
-            merge_cfg.PixelSnapH = true;
-            io.Fonts->AddFontFromFileTTF(chosen_ui, 15.0f * dpi_scale, &merge_cfg, ranges.Data);
-        }
-    } else {
-        fonts.mono = fonts.regular;
-    }
-
-    // 南方CASS / AutoCAD 深灰工业主题配色
+void apply_cass_style(bool dark_mode, float dpi_scale) {
+    (void)dark_mode; // 工作区外壳保持南方CASS深灰工程工作站主题，画布在模型黑底/图纸白底间切换
     ImGuiStyle& st = ImGui::GetStyle();
     st.WindowRounding = 0.0f;
     st.ChildRounding = 2.0f;
@@ -175,6 +128,97 @@ ThemeFonts setup_imgui_fonts_and_style(float dpi_scale) {
     if (dpi_scale != 1.0f) {
         st.ScaleAllSizes(dpi_scale);
     }
+}
+
+ThemeFonts setup_imgui_fonts_and_style(float dpi_scale) {
+    ImGuiIO& io = ImGui::GetIO();
+    io.IniFilename = nullptr; // 每次启动保持整洁的南方CASS布局
+
+    // 构建汉字全集 + 工程上标/符号字形表
+    static ImVector<ImWchar> ranges;
+    if (ranges.empty()) {
+        ImFontGlyphRangesBuilder builder;
+        builder.AddRanges(io.Fonts->GetGlyphRangesChineseFull());
+        static const ImWchar extra_ranges[] = {
+            0x00A0, 0x00FF, // ° ± ² ³ × ÷ 等
+            0x0391, 0x03C9, // Δ Σ α β 等希腊字母
+            0x2000, 0x26FF, // — • ✓ ✕ ▲ ▼ ● ○ □ ■ ★ 等几何符号
+            0,
+        };
+        builder.AddRanges(extra_ranges);
+        builder.BuildRanges(&ranges);
+    }
+
+    const char* ui_font_candidates[] = {
+#ifdef _WIN32
+        "C:\\Windows\\Fonts\\msyh.ttc",
+        "C:\\Windows\\Fonts\\msyh.ttf",
+        "C:\\Windows\\Fonts\\simhei.ttf",
+        "C:\\Windows\\Fonts\\Deng.ttf",
+        "C:\\Windows\\Fonts\\simsun.ttc",
+#elif defined(__APPLE__)
+        "/System/Library/Fonts/PingFang.ttc",
+        "/System/Library/Fonts/STHeiti Medium.ttc",
+#else
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+#endif
+    };
+    const char* chosen_ui = nullptr;
+    for (const char* p : ui_font_candidates) {
+        if (file_exists(p)) {
+            chosen_ui = p;
+            break;
+        }
+    }
+
+    const char* mono_candidates[] = {
+#ifdef _WIN32
+        "C:\\Windows\\Fonts\\consola.ttf",
+        "C:\\Windows\\Fonts\\simhei.ttf",
+#elif defined(__APPLE__)
+        "/System/Library/Fonts/Menlo.ttc",
+#else
+        "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+#endif
+    };
+    const char* chosen_mono = nullptr;
+    for (const char* p : mono_candidates) {
+        if (file_exists(p)) {
+            chosen_mono = p;
+            break;
+        }
+    }
+
+    ThemeFonts fonts;
+    float base_px = 16.0f * dpi_scale;
+    float kpi_px = 21.0f * dpi_scale;
+
+    if (chosen_ui) {
+        fonts.regular = io.Fonts->AddFontFromFileTTF(chosen_ui, base_px, nullptr, ranges.Data);
+        fonts.kpi = io.Fonts->AddFontFromFileTTF(chosen_ui, kpi_px, nullptr, ranges.Data);
+    }
+    if (!fonts.regular) {
+        fonts.regular = io.Fonts->AddFontDefault();
+        fonts.kpi = fonts.regular;
+    }
+
+    if (chosen_mono) {
+        ImFontConfig cfg{};
+        cfg.OversampleH = 2;
+        fonts.mono = io.Fonts->AddFontFromFileTTF(
+            chosen_mono, 15.0f * dpi_scale, &cfg, io.Fonts->GetGlyphRangesDefault());
+        if (chosen_ui && fonts.mono) {
+            ImFontConfig merge_cfg{};
+            merge_cfg.MergeMode = true;
+            merge_cfg.PixelSnapH = true;
+            io.Fonts->AddFontFromFileTTF(chosen_ui, 15.0f * dpi_scale, &merge_cfg, ranges.Data);
+        }
+    }
+    if (!fonts.mono) {
+        fonts.mono = fonts.regular;
+    }
+
+    apply_cass_style(true, dpi_scale);
     return fonts;
 }
 

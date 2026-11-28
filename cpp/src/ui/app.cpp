@@ -4,7 +4,9 @@
 #include "io/io.hpp"
 #include "imgui.h"
 
+#ifdef _WIN32
 #include <commdlg.h>
+#endif
 
 #include <algorithm>
 #include <array>
@@ -129,7 +131,7 @@ int command_history_callback(ImGuiInputTextCallbackData* data) {
 
 } // namespace
 
-CassApp::CassApp(HWND hwnd, const ThemeFonts& fonts)
+CassApp::CassApp(NativeWindowHandle hwnd, const ThemeFonts& fonts)
     : hwnd_(hwnd), fonts_(fonts) {
     status_text_ = "就绪 — 请导入高程测点 (.xlsx/.csv/.dat) 或打开工程 (.tinproj.json)";
     sync_project_name_buffer();
@@ -934,6 +936,7 @@ void CassApp::execute_command(const std::string& raw_cmd) {
 }
 
 std::optional<std::string> CassApp::open_file_dialog(const wchar_t* title, const wchar_t* filter) const {
+#ifdef _WIN32
     wchar_t buf[1024] = {0};
     OPENFILENAMEW ofn{};
     ofn.lStructSize = sizeof(ofn);
@@ -946,12 +949,17 @@ std::optional<std::string> CassApp::open_file_dialog(const wchar_t* title, const
     if (GetOpenFileNameW(&ofn)) {
         return wide_to_utf8(buf);
     }
+#else
+    (void)title;
+    (void)filter;
+#endif
     return std::nullopt;
 }
 
 std::optional<std::string> CassApp::save_file_dialog(const wchar_t* title, const wchar_t* filter,
                                                      const wchar_t* default_ext,
                                                      const std::string& default_name) const {
+#ifdef _WIN32
     wchar_t buf[1024] = {0};
     std::wstring wdef = utf8_to_wide(default_name);
     if (!wdef.empty() && wdef.size() < std::size(buf) - 1) {
@@ -969,6 +977,12 @@ std::optional<std::string> CassApp::save_file_dialog(const wchar_t* title, const
     if (GetSaveFileNameW(&ofn)) {
         return wide_to_utf8(buf);
     }
+#else
+    (void)title;
+    (void)filter;
+    (void)default_ext;
+    (void)default_name;
+#endif
     return std::nullopt;
 }
 
@@ -1218,7 +1232,9 @@ void CassApp::render_menu_bar() {
         if (ImGui::MenuItem("工程另存为...")) action_save_project(true);
         ImGui::Separator();
         if (ImGui::MenuItem("退出工作站", "Alt+F4")) {
+#ifdef _WIN32
             if (hwnd_) PostMessageW(hwnd_, WM_CLOSE, 0, 0);
+#endif
         }
         ImGui::EndMenu();
     }
@@ -2046,6 +2062,59 @@ void CassApp::render_tab_boundary() {
             break;
         }
     }
+}
+
+void CassApp::render_tab_engineering() {
+    ImGui::BeginChild("##tab_eng_scroll", ImVec2(0, 0), ImGuiChildFlags_None);
+
+    draw_section_bar("分层土方统计 (Strata)");
+    ImGui::RadioButton("按绝对标高", &strata_mode_idx_, 0);
+    ImGui::SameLine();
+    ImGui::RadioButton("按开挖深度", &strata_mode_idx_, 1);
+    ImGui::InputText("分界值(逗号分隔)", strata_bounds_buf_, sizeof(strata_bounds_buf_));
+    if (colored_button("计算分层土方", rgba(0x2B, 0x4E, 0x7A), rgba(0x36, 0x62, 0x99), rgba(0x21, 0x3D, 0x60), ImVec2(-1, 0))) {
+        compute_strata_action();
+    }
+    if (strata_result_) {
+        for (const auto& l : strata_result_->layers) {
+            ImGui::BulletText("%s: 挖 %s m³ (%.1f%%) | 填 %s m³ (%.1f%%)",
+                              l.name.c_str(),
+                              format_num(l.cut_volume, 1).c_str(), l.cut_ratio * 100.0,
+                              format_num(l.fill_volume, 1).c_str(), l.fill_ratio * 100.0);
+        }
+    }
+
+    ImGui::Spacing();
+    draw_section_bar("土方调配优化 (Haul)");
+    ImGui::SliderInt("横向分区数", &haul_cols_, 2, 8);
+    ImGui::SliderInt("纵向分区数", &haul_rows_, 2, 8);
+    if (colored_button("计算最优土方调配", rgba(0x16, 0x7A, 0x55), rgba(0x1D, 0x99, 0x6B), rgba(0x12, 0x63, 0x45), ImVec2(-1, 0))) {
+        compute_haul_action();
+    }
+    if (haul_result_) {
+        ImGui::Text("区内平衡 %s m³ | 跨区调配 %s m³",
+                    format_num(haul_result_->internal_balanced, 1).c_str(),
+                    format_num(haul_result_->cross_zone_hauled, 1).c_str());
+        ImGui::Text("加权运距 %.2f m | 估算总费用 ¥%s",
+                    haul_result_->avg_haul_distance,
+                    format_num(haul_result_->estimated_cost, 0).c_str());
+    }
+
+    ImGui::Spacing();
+    draw_section_bar("场地周边放坡设计 (Slope)");
+    ImGui::InputDouble("挖方坡比 1:m", &slope_cut_ratio_, 0.1, 0.5, "%.2f");
+    ImGui::InputDouble("填方坡比 1:m", &slope_fill_ratio_, 0.1, 0.5, "%.2f");
+    if (colored_button("生成周边放坡与示坡线", rgba(0x4C, 0x2F, 0x7A), rgba(0x63, 0x3E, 0x9E), rgba(0x3B, 0x24, 0x60), ImVec2(-1, 0))) {
+        compute_slope_action();
+    }
+    if (slope_result_) {
+        ImGui::Text("周长 %.1f m | 最大坡宽 %.2f m | 边坡挖 %s / 填 %s m³",
+                    slope_result_->perimeter, slope_result_->max_slope_width,
+                    format_num(slope_result_->slope_cut_volume, 1).c_str(),
+                    format_num(slope_result_->slope_fill_volume, 1).c_str());
+    }
+
+    ImGui::EndChild();
 }
 
 void CassApp::render_command_console(float height) {
