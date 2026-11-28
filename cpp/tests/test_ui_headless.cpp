@@ -106,7 +106,7 @@ int main(int argc, char** argv) {
     app.set_dark_mode(true);
 
     app.set_3d_view(true);
-    check_true(render_one_frame(app) > 200, "3D viewport frame renders");
+    check_true(render_one_frame(app) > 200, "3D viewport with AI pins & legend renders");
     app.set_3d_view(false);
 
     // 命令行双语自然语言指令与 Tab 补全检查

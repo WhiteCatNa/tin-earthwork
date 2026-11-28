@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/ai_optimizer.hpp"
 #include "core/types.hpp"
 #include "imgui.h"
 
@@ -28,7 +29,10 @@ public:
     void set_top_view();
     void set_side_view();
 
-    void render(const ProjectData& project, const CalculationResult* result);
+    void render(const ProjectData& project,
+                const CalculationResult* result,
+                const SiteHealthReport* health = nullptr,
+                const UncertaintyReport* uncertainty = nullptr);
 
 private:
     ImVec2 pan_px_{0.0f, 0.0f};

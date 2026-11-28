@@ -757,6 +757,58 @@ int main(int argc, char** argv) {
         check_near(d_sloped.dominant_runoff_azimuth_deg, 270.0, 1.0, "runoff toward -X (270 deg)");
     });
 
+    // 29. AI 决策 HTML 报告、补测点 CSV 与 AI 专题 R12 DXF 导出往返校验
+    run_test("29_ai_exports_html_csv_dxf_roundtrip", [&]() {
+        auto pts = make_grid_points(8, 8, 20.0, [](double x, double y) {
+            return 20.0 + 0.03 * x - 0.015 * y + 0.7 * std::sin(0.04 * x);
+        });
+        pts[20].z += 4.5; // 注入一个异常点
+        tin::TINEarthworkCalculator calc(22.0);
+        calc.add_points(pts);
+        auto res = calc.run_full_calculation();
+        auto health = tin::detect_survey_anomalies(pts);
+        auto grade_opt = tin::optimize_grade_cost(calc);
+        auto uncert = tin::analyze_uncertainty_and_recommend(calc, 0.03, 6, 6);
+        auto sig = tin::analyze_change_significance(calc, 0.03);
+        auto drain = tin::analyze_drainage_and_ponding(res, 0.3, false);
+        auto haul = tin::compute_haul_plan(res, 3, 3);
+        auto slope = tin::compute_slope_grading(calc, 1.0, 1.5, 5.0);
+
+        tin::ProjectData proj;
+        proj.project_name = "AI_Export_Verify";
+        proj.points = pts;
+        auto diag = tin::generate_site_diagnosis(proj, &res, &health, &grade_opt, &uncert);
+
+        auto tmp = std::filesystem::temp_directory_path() / L"tin_earthwork_cpp_tests";
+        std::filesystem::create_directories(tmp);
+        std::string html_p = tin::wide_to_utf8((tmp / L"ai_report.html").wstring());
+        std::string rec_p = tin::wide_to_utf8((tmp / L"survey_rec.csv").wstring());
+        std::string dxf_p = tin::wide_to_utf8((tmp / L"ai_overlays.dxf").wstring());
+
+        tin::export_ai_report_html(proj, &res, &grade_opt, &health, &uncert, &sig, &drain, &diag, html_p);
+        tin::export_survey_recommendations_csv(uncert, rec_p);
+        tin::export_ai_overlays_dxf(&res, &health, &uncert, &haul, &slope, dxf_p);
+
+        auto read_all = [](const std::string& p) {
+            std::ifstream ifs(std::filesystem::path(tin::utf8_to_wide(p)), std::ios::binary);
+            return std::string((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
+        };
+        std::string html_s = read_all(html_p);
+        std::string rec_s = read_all(rec_p);
+        std::string dxf_s = read_all(dxf_p);
+
+        check_true(html_s.find("<svg") != std::string::npos && html_s.find("AI_Export_Verify") != std::string::npos,
+                   "HTML report contains SVG chart and project title");
+        check_true(rec_s.find("X(东坐标)") != std::string::npos && rec_s.size() > 150,
+                   "Survey recommendation CSV valid");
+        check_true(dxf_s.find("AI_ANOMALY") != std::string::npos &&
+                   dxf_s.find("AI_SURVEY_REC") != std::string::npos &&
+                   dxf_s.find("AI_HAUL_FLOW") != std::string::npos &&
+                   dxf_s.find("AI_SLOPE_DAYLIGHT") != std::string::npos &&
+                   dxf_s.find("EOF") != std::string::npos,
+                   "AI DXF contains all 4 AI overlay layers and EOF");
+    });
+
     std::cout << "=== Summary: PASSED " << g_passed << " / " << (g_passed + g_failed) << " ===\n";
     return g_failed == 0 ? 0 : 1;
 }

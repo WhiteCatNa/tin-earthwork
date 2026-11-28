@@ -88,7 +88,10 @@ void Viewport3D::set_side_view() {
     pan_px_ = {0.0f, 0.0f};
 }
 
-void Viewport3D::render(const ProjectData& project, const CalculationResult* result) {
+void Viewport3D::render(const ProjectData& project,
+                        const CalculationResult* result,
+                        const SiteHealthReport* health,
+                        const UncertaintyReport* uncertainty) {
     ImVec2 avail = ImGui::GetContentRegionAvail();
     if (avail.x < 40.0f || avail.y < 40.0f) return;
 
@@ -346,6 +349,63 @@ void Viewport3D::render(const ProjectData& project, const CalculationResult* res
         char zbuf[48];
         std::snprintf(zbuf, sizeof(zbuf), "Z(%.1f~%.1fm)", zmin, zmax);
         dl->AddText(ImVec2(az.x + 4, az.y - 12), IM_COL32(0x60, 0xA5, 0xFA, 240), zbuf);
+    }
+
+    // 4. 三维异常点与自适应补测推荐竖向靶标针
+    double pin_lift = std::max(0.5, z_span * 0.14);
+    if (health && !health->anomalies.empty()) {
+        ImU32 acol = IM_COL32(0xEF, 0x44, 0x44, 245);
+        for (const auto& a : health->anomalies) {
+            float d0 = 0.0f, d1 = 0.0f;
+            ImVec2 base = project_pt(to_norm(a.x, a.y, a.z), d0);
+            ImVec2 tip = project_pt(to_norm(a.x, a.y, a.z + pin_lift), d1);
+            dl->AddLine(base, tip, acol, 2.0f);
+            dl->AddCircleFilled(tip, 4.5f, acol);
+            dl->AddText(ImVec2(tip.x + 6, tip.y - 7), acol, a.point_id.c_str());
+        }
+    }
+    if (uncertainty && !uncertainty->recommendations.empty()) {
+        ImU32 rcol = IM_COL32(0xE8, 0x79, 0xF9, 245);
+        for (const auto& r : uncertainty->recommendations) {
+            float d0 = 0.0f, d1 = 0.0f;
+            ImVec2 base = project_pt(to_norm(r.x, r.y, r.estimated_z), d0);
+            ImVec2 tip = project_pt(to_norm(r.x, r.y, r.estimated_z + pin_lift), d1);
+            dl->AddLine(base, tip, rcol, 1.8f);
+            dl->AddCircle(tip, 4.5f, rcol, 12, 1.8f);
+            char rb[16];
+            std::snprintf(rb, sizeof(rb), "#%d", r.rank);
+            dl->AddText(ImVec2(tip.x + 6, tip.y - 7), rcol, rb);
+        }
+    }
+
+    // 5. 右上角高程/挖填三维色带图例
+    {
+        float lx = canvas_p1.x - 122.0f, ly = canvas_p0.y + 44.0f;
+        dl->AddRectFilled(ImVec2(lx, ly), ImVec2(lx + 110.0f, ly + 74.0f),
+                          dark_mode ? IM_COL32(0x12, 0x17, 0x20, 210) : IM_COL32(0xFF, 0xFF, 0xFF, 220), 4.0f);
+        if (color_mode == ColorMode3D::Elevation) {
+            for (int k = 0; k < 20; ++k) {
+                float frac = 1.0f - static_cast<float>(k) / 19.0f;
+                int rr = 0, gg = 0, bb = 0;
+                hypsometric_rgb(frac, rr, gg, bb);
+                dl->AddRectFilled(ImVec2(lx + 8, ly + 8 + k * 2.8f), ImVec2(lx + 22, ly + 11 + k * 2.8f),
+                                  IM_COL32(rr, gg, bb, 255));
+            }
+            char bmax[24], bmin[24];
+            std::snprintf(bmax, sizeof(bmax), "%.1fm", zmax);
+            std::snprintf(bmin, sizeof(bmin), "%.1fm", zmin);
+            ImU32 tc = dark_mode ? IM_COL32(0xE2, 0xE8, 0xF0, 255) : IM_COL32(0x0F, 0x17, 0x2A, 255);
+            dl->AddText(ImVec2(lx + 28, ly + 6), tc, bmax);
+            dl->AddText(ImVec2(lx + 28, ly + 50), tc, bmin);
+        } else {
+            ImU32 tc = dark_mode ? IM_COL32(0xE2, 0xE8, 0xF0, 255) : IM_COL32(0x0F, 0x17, 0x2A, 255);
+            dl->AddRectFilled(ImVec2(lx + 8, ly + 10), ImVec2(lx + 20, ly + 22), IM_COL32(0xDC, 0x5B, 0x4E, 255));
+            dl->AddText(ImVec2(lx + 26, ly + 8), tc, "挖方(Cut)");
+            dl->AddRectFilled(ImVec2(lx + 8, ly + 30), ImVec2(lx + 20, ly + 42), IM_COL32(0x2D, 0x9D, 0xA8, 255));
+            dl->AddText(ImVec2(lx + 26, ly + 28), tc, "填方(Fill)");
+            dl->AddRectFilled(ImVec2(lx + 8, ly + 50), ImVec2(lx + 20, ly + 62), IM_COL32(0xD9, 0x9B, 0x32, 255));
+            dl->AddText(ImVec2(lx + 26, ly + 48), tc, "挖填混合");
+        }
     }
 
     // 左下角操作提示胶囊

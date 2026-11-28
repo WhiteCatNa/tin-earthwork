@@ -1,5 +1,8 @@
 #pragma once
 
+#include "core/ai_assistant.hpp"
+#include "core/ai_optimizer.hpp"
+#include "core/engineering.hpp"
 #include "core/types.hpp"
 #include <cstdint>
 #include <string>
@@ -37,6 +40,24 @@ void export_dxf_r12(const CalculationResult& result, const std::string& utf8_pat
 void export_cass_dat(const std::vector<SurveyPoint>& points, const std::string& utf8_path,
                      const std::string& code = "");
 void export_sections_csv(const SectionMethodResult& sections, const std::string& utf8_path);
+void export_survey_recommendations_csv(const UncertaintyReport& uncertainty, const std::string& utf8_path);
+void export_ai_overlays_dxf(
+    const CalculationResult* result,
+    const SiteHealthReport* health,
+    const UncertaintyReport* uncertainty,
+    const HaulPlanResult* haul,
+    const SlopeGradingResult* slope,
+    const std::string& utf8_path);
+void export_ai_report_html(
+    const ProjectData& project,
+    const CalculationResult* result,
+    const GradeOptimizationResult* grade_opt,
+    const SiteHealthReport* health,
+    const UncertaintyReport* uncertainty,
+    const SignificanceReport* significance,
+    const DrainageReport* drainage,
+    const DiagnosisSummary* diagnosis,
+    const std::string& utf8_path);
 
 // 高清 PNG 保存（用于成果图导出与实机截图）
 void save_rgba_png(const std::uint8_t* rgba, int width, int height, const std::string& utf8_path);

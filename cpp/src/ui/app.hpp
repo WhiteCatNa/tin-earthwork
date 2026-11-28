@@ -128,6 +128,9 @@ private:
     void action_export_dxf();
     void action_export_cass_dat();
     void action_export_sections_csv();
+    void action_export_ai_report_html();
+    void action_export_survey_rec_csv();
+    void action_export_ai_dxf();
 
     [[maybe_unused]] NativeWindowHandle hwnd_ = nullptr;
     ThemeFonts fonts_;

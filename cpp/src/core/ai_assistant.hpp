@@ -43,6 +43,9 @@ enum class AssistantAction {
     SwapCompare,
     ExportDat,
     ExportDxf,
+    ExportHtmlReport,
+    ExportSurveyRecCsv,
+    ExportAiDxf,
     Undo,
     Redo,
     ClearConsole

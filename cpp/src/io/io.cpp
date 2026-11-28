@@ -1266,6 +1266,218 @@ void export_sections_csv(const SectionMethodResult& sections, const std::string&
     write_utf8_text(utf8_path, os.str(), true);
 }
 
+void export_survey_recommendations_csv(const UncertaintyReport& uncertainty, const std::string& utf8_path) {
+    if (uncertainty.recommendations.empty()) {
+        throw std::runtime_error("没有可导出的补测点推荐数据");
+    }
+    std::ostringstream os;
+    os << std::fixed << std::setprecision(3);
+    os << "序号,X(东坐标),Y(北坐标),预估高程Z(m),局部误差尺度(m3),预计降误差(m3),推荐原因\n";
+    for (const auto& r : uncertainty.recommendations) {
+        os << r.rank << "," << r.x << "," << r.y << "," << r.estimated_z << ","
+           << r.error_scale << "," << r.expected_error_drop << ",\"" << r.reason << "\"\n";
+    }
+    write_utf8_text(utf8_path, os.str(), true);
+}
+
+void export_ai_overlays_dxf(
+    const CalculationResult* result,
+    const SiteHealthReport* health,
+    const UncertaintyReport* uncertainty,
+    const HaulPlanResult* haul,
+    const SlopeGradingResult* slope,
+    const std::string& utf8_path) {
+    std::ostringstream os;
+    os << std::fixed << std::setprecision(4);
+    os << "0\nSECTION\n2\nHEADER\n0\nENDSEC\n"
+       << "0\nSECTION\n2\nENTITIES\n";
+
+    auto emit_point_cross = [&](double x, double y, double z, const char* layer, int color, double r, const std::string& label) {
+        os << "0\nLINE\n8\n" << layer << "\n62\n" << color << "\n"
+           << "10\n" << (x - r) << "\n20\n" << (y - r) << "\n30\n" << z << "\n"
+           << "11\n" << (x + r) << "\n21\n" << (y + r) << "\n31\n" << z << "\n";
+        os << "0\nLINE\n8\n" << layer << "\n62\n" << color << "\n"
+           << "10\n" << (x - r) << "\n20\n" << (y + r) << "\n30\n" << z << "\n"
+           << "11\n" << (x + r) << "\n21\n" << (y - r) << "\n31\n" << z << "\n";
+        os << "0\nCIRCLE\n8\n" << layer << "\n62\n" << color << "\n"
+           << "10\n" << x << "\n20\n" << y << "\n30\n" << z << "\n40\n" << r << "\n";
+        if (!label.empty()) {
+            os << "0\nTEXT\n8\n" << layer << "\n62\n" << color << "\n"
+               << "10\n" << (x + r * 1.2) << "\n20\n" << y << "\n30\n" << z << "\n"
+               << "40\n" << std::max(0.8, r * 0.8) << "\n1\n" << label << "\n";
+        }
+    };
+
+    if (result) {
+        for (const auto& t : result->triangles) {
+            if (t.is_boundary) continue;
+            for (const auto& seg : t.zero_segments) {
+                os << "0\nLINE\n8\nZERO_LINE\n62\n2\n"
+                   << "10\n" << seg.first.x << "\n20\n" << seg.first.y << "\n30\n0.0\n"
+                   << "11\n" << seg.second.x << "\n21\n" << seg.second.y << "\n31\n0.0\n";
+            }
+        }
+    }
+    if (health) {
+        for (const auto& a : health->anomalies) {
+            emit_point_cross(a.x, a.y, a.z, "AI_ANOMALY", 1, 2.5, a.point_id);
+        }
+    }
+    if (uncertainty) {
+        for (const auto& r : uncertainty->recommendations) {
+            emit_point_cross(r.x, r.y, r.estimated_z, "AI_SURVEY_REC", 6, 2.2, "REC#" + std::to_string(r.rank));
+        }
+    }
+    if (haul) {
+        for (const auto& fl : haul->flows) {
+            os << "0\nLINE\n8\nAI_HAUL_FLOW\n62\n3\n"
+               << "10\n" << fl.from_xy.x << "\n20\n" << fl.from_xy.y << "\n30\n0.0\n"
+               << "11\n" << fl.to_xy.x << "\n21\n" << fl.to_xy.y << "\n31\n0.0\n";
+        }
+    }
+    if (slope && slope->daylight_ring.size() >= 3) {
+        os << "0\nPOLYLINE\n8\nAI_SLOPE_DAYLIGHT\n62\n4\n66\n1\n70\n1\n";
+        for (const auto& p : slope->daylight_ring) {
+            os << "0\nVERTEX\n8\nAI_SLOPE_DAYLIGHT\n10\n" << p.x << "\n20\n" << p.y << "\n30\n0.0\n";
+        }
+        os << "0\nSEQEND\n";
+        for (const auto& tk : slope->slope_ticks) {
+            os << "0\nLINE\n8\nAI_SLOPE_DAYLIGHT\n62\n4\n"
+               << "10\n" << tk.first.x << "\n20\n" << tk.first.y << "\n30\n0.0\n"
+               << "11\n" << tk.second.x << "\n21\n" << tk.second.y << "\n31\n0.0\n";
+        }
+    }
+
+    os << "0\nENDSEC\n0\nEOF\n";
+    write_utf8_text(utf8_path, os.str(), false);
+}
+
+void export_ai_report_html(
+    const ProjectData& project,
+    const CalculationResult* result,
+    const GradeOptimizationResult* grade_opt,
+    const SiteHealthReport* health,
+    const UncertaintyReport* uncertainty,
+    const SignificanceReport* significance,
+    const DrainageReport* drainage,
+    const DiagnosisSummary* diagnosis,
+    const std::string& utf8_path) {
+    auto esc = [](const std::string& s) {
+        std::string r;
+        r.reserve(s.size());
+        for (char c : s) {
+            if (c == '&') r += "&amp;";
+            else if (c == '<') r += "&lt;";
+            else if (c == '>') r += "&gt;";
+            else r.push_back(c);
+        }
+        return r;
+    };
+
+    std::ostringstream os;
+    os << std::fixed << std::setprecision(2);
+    os << "<!DOCTYPE html><html lang=\"zh-CN\"><head><meta charset=\"UTF-8\">"
+       << "<title>" << esc(project.project_name) << " — AI 土方决策报告</title>"
+       << "<style>"
+       << "body{font-family:-apple-system,'Microsoft YaHei',sans-serif;background:#f8fafc;color:#0f172a;margin:32px auto;max-width:980px;line-height:1.55;}"
+       << "h1{border-bottom:3px solid #2563eb;padding-bottom:8px;font-size:24px;}"
+       << "h2{margin-top:26px;font-size:17px;border-left:4px solid #2563eb;padding-left:10px;}"
+       << ".grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin:14px 0;}"
+       << ".card{background:#fff;border:1px solid #cbd5e1;border-radius:8px;padding:12px 14px;}"
+       << ".card .k{font-size:12px;color:#475569;}.card .v{font-size:20px;font-weight:700;margin-top:4px;}"
+       << "table{width:100%;border-collapse:collapse;background:#fff;margin-top:8px;font-size:13px;}"
+       << "th,td{border:1px solid #cbd5e1;padding:7px 10px;text-align:left;}"
+       << "th{background:#e2e8f0;}"
+       << ".badge{display:inline-block;padding:2px 8px;border-radius:999px;font-size:12px;font-weight:600;background:#dbeafe;color:#1e40af;}"
+       << "@media print{body{margin:12px;background:#fff;}}"
+       << "</style></head><body>";
+
+    os << "<h1>" << esc(project.project_name) << " — 南方CASS AI 土方智能决策报告</h1>";
+    os << "<p>测点总数: <b>" << project.points.size() << "</b>";
+    if (health) os << " &nbsp;|&nbsp; 数据健康分: <span class=\"badge\">" << health->health_score << " / 100</span>";
+    os << "</p>";
+
+    if (result) {
+        os << "<div class=\"grid\">"
+           << "<div class=\"card\"><div class=\"k\">总挖方 (Cut)</div><div class=\"v\" style=\"color:#dc2626\">" << result->total_cut << " m³</div></div>"
+           << "<div class=\"card\"><div class=\"k\">总填方 (Fill)</div><div class=\"v\" style=\"color:#0284c7\">" << result->total_fill << " m³</div></div>"
+           << "<div class=\"card\"><div class=\"k\">挖填净方 (Net)</div><div class=\"v\">" << result->net_volume << " m³</div></div>"
+           << "<div class=\"card\"><div class=\"k\">计算面积 (Area)</div><div class=\"v\">" << result->computed_area << " m²</div></div>"
+           << "</div>";
+    }
+
+    if (grade_opt) {
+        double max_c = std::max({grade_opt->flat_balance.total_cost, grade_opt->best_fit.total_cost, grade_opt->optimized.total_cost, 1.0});
+        auto bar_w = [&](double c) { return 420.0 * (c / max_c); };
+        os << "<h2>1. 设计面-土方调配联合费用优化对照</h2>"
+           << "<svg width=\"660\" height=\"126\" viewBox=\"0 0 660 126\" xmlns=\"http://www.w3.org/2000/svg\" style=\"background:#fff;border:1px solid #cbd5e1;border-radius:8px;padding:6px\">"
+           << "<text x=\"10\" y=\"28\" font-size=\"12\" fill=\"#334155\">平场平衡</text>"
+           << "<rect x=\"120\" y=\"14\" width=\"" << bar_w(grade_opt->flat_balance.total_cost) << "\" height=\"20\" fill=\"#94a3b8\" rx=\"3\"/>"
+           << "<text x=\"" << (128 + bar_w(grade_opt->flat_balance.total_cost)) << "\" y=\"28\" font-size=\"12\">¥" << grade_opt->flat_balance.total_cost << "</text>"
+           << "<text x=\"10\" y=\"66\" font-size=\"12\" fill=\"#334155\">最小二乘</text>"
+           << "<rect x=\"120\" y=\"52\" width=\"" << bar_w(grade_opt->best_fit.total_cost) << "\" height=\"20\" fill=\"#3b82f6\" rx=\"3\"/>"
+           << "<text x=\"" << (128 + bar_w(grade_opt->best_fit.total_cost)) << "\" y=\"66\" font-size=\"12\">¥" << grade_opt->best_fit.total_cost << "</text>"
+           << "<text x=\"10\" y=\"104\" font-size=\"12\" font-weight=\"700\" fill=\"#15803d\">AI 联合最优</text>"
+           << "<rect x=\"120\" y=\"90\" width=\"" << bar_w(grade_opt->optimized.total_cost) << "\" height=\"20\" fill=\"#16a34a\" rx=\"3\"/>"
+           << "<text x=\"" << (128 + bar_w(grade_opt->optimized.total_cost)) << "\" y=\"104\" font-size=\"12\" font-weight=\"700\">¥" << grade_opt->optimized.total_cost << " (省 " << grade_opt->savings_pct_vs_flat << "%)</text>"
+           << "</svg>";
+
+        os << "<table><tr><th>方案</th><th>H0 (m)</th><th>ix / iy (%)</th><th>挖方 (m³)</th><th>填方 (m³)</th><th>总费用 (元)</th></tr>";
+        auto trow = [&](const GradePlanSummary& s) {
+            os << "<tr><td>" << esc(s.label) << "</td><td>" << s.plane.h0 << "</td><td>"
+               << s.plane.slope_x << " / " << s.plane.slope_y << "</td><td>"
+               << s.cut_volume << "</td><td>" << s.fill_volume << "</td><td><b>" << s.total_cost << "</b></td></tr>";
+        };
+        trow(grade_opt->flat_balance);
+        trow(grade_opt->best_fit);
+        trow(grade_opt->optimized);
+        os << "</table>";
+    }
+
+    if (health) {
+        os << "<h2>2. 测点质量与空间异常诊断</h2><p>" << esc(health->summary) << "</p>";
+        if (!health->anomalies.empty()) {
+            os << "<table><tr><th>点号</th><th>X</th><th>Y</th><th>实测Z</th><th>预测Z</th><th>残差</th><th>说明</th></tr>";
+            for (const auto& a : health->anomalies) {
+                os << "<tr><td>" << esc(a.point_id) << "</td><td>" << a.x << "</td><td>" << a.y
+                   << "</td><td>" << a.z << "</td><td>" << a.expected_z << "</td><td>" << a.residual
+                   << "</td><td>" << esc(a.reason) << "</td></tr>";
+            }
+            os << "</table>";
+        }
+    }
+
+    if (uncertainty) {
+        os << "<h2>3. 不确定度评定与补测推荐</h2><p>" << esc(uncertainty->summary) << "</p>";
+        if (!uncertainty->recommendations.empty()) {
+            os << "<table><tr><th>序号</th><th>X</th><th>Y</th><th>预估 Z</th><th>预计降误差</th><th>推荐理由</th></tr>";
+            for (const auto& r : uncertainty->recommendations) {
+                os << "<tr><td>#" << r.rank << "</td><td>" << r.x << "</td><td>" << r.y
+                   << "</td><td>" << r.estimated_z << "</td><td>" << r.expected_error_drop
+                   << "</td><td>" << esc(r.reason) << "</td></tr>";
+            }
+            os << "</table>";
+        }
+    }
+
+    if (significance || drainage) {
+        os << "<h2>4. 变化显著性 LoD 与场地排水风险</h2>";
+        if (significance) os << "<p><b>变化显著性：</b>" << esc(significance->summary) << "</p>";
+        if (drainage) os << "<p><b>排水积水：</b>" << esc(drainage->summary) << "</p>";
+    }
+
+    if (diagnosis && !diagnosis->items.empty()) {
+        os << "<h2>5. AI 工程综合建议</h2><ul>";
+        for (const auto& it : diagnosis->items) {
+            os << "<li><b>[" << esc(it.title) << "]</b> " << esc(it.detail) << "</li>";
+        }
+        os << "</ul>";
+    }
+
+    os << "</body></html>";
+    write_utf8_text(utf8_path, os.str(), false);
+}
+
 void save_rgba_png(const std::uint8_t* rgba, int width, int height, const std::string& utf8_path) {
     size_t png_len = 0;
     void* png_buf = tdefl_write_image_to_png_file_in_memory_ex(

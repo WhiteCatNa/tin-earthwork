@@ -216,6 +216,18 @@ AssistantIntent parse_engineering_intent(const std::string& raw_input) {
         out.action = AssistantAction::ExportDxf;
         return out;
     }
+    if (up == "HTMLRPT" || up == "REPORT") {
+        out.action = AssistantAction::ExportHtmlReport;
+        return out;
+    }
+    if (up == "EXP_REC" || up == "RECCSV") {
+        out.action = AssistantAction::ExportSurveyRecCsv;
+        return out;
+    }
+    if (up == "EXP_AIDXF" || up == "AIDXF") {
+        out.action = AssistantAction::ExportAiDxf;
+        return out;
+    }
     if (up == "UNDO" || up == "_UNDO" || up == "U") {
         out.action = AssistantAction::Undo;
         return out;
@@ -414,6 +426,14 @@ AssistantIntent parse_engineering_intent(const std::string& raw_input) {
         out.action = AssistantAction::ToggleContours;
         return out;
     }
+    if (contains_any(lo, {"html", "决策报告", "智能报告", "export report"})) {
+        out.action = AssistantAction::ExportHtmlReport;
+        return out;
+    }
+    if (contains_any(lo, {"导出补测", "补测点csv", "export survey"})) {
+        out.action = AssistantAction::ExportSurveyRecCsv;
+        return out;
+    }
     if (contains_any(lo, {"导出dxf", "输出dxf", "export dxf", "save dxf"})) {
         out.action = AssistantAction::ExportDxf;
         return out;
@@ -445,8 +465,8 @@ std::vector<std::string> suggest_command_completions(const std::string& prefix) 
     static const char* kCommands[] = {
         "AI", "AIOPT", "ANOMALY", "AREA", "AUTOB", "BALANCE", "BALPLANE",
         "CALC", "CLEAN", "CLEAR", "CLRBND", "CONTOUR", "DARK", "DAT",
-        "DIAG", "DIST", "DRAIN", "DXF", "FITPLANE", "GRID", "H0", "HAUL",
-        "HELP", "LIGHT", "MEASURE", "OPT", "OUTLINE", "PROFILE",
+        "DIAG", "DIST", "DRAIN", "DXF", "EXP_AIDXF", "EXP_REC", "FITPLANE", "GRID", "H0", "HAUL",
+        "HELP", "HTMLRPT", "LIGHT", "MEASURE", "OPT", "OUTLINE", "PROFILE",
         "REDO", "SECTIONS", "SIGNIF", "SLOPE", "STRATA", "SWAP", "THIN", "UNCERT",
         "UNDO", "ZE", "2D", "3D"
     };

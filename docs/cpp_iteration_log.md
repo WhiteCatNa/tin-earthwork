@@ -79,3 +79,12 @@ _以下各轮记录均由 `python3 tools/eval_cpp_goal.py` 真实编译、运行
 - **实测结果（`python3 tools/eval_cpp_goal.py`）**：
   - 综合评分：**`100.00 / 100.00`**（0 编译警告，CTest 3/3 + 28/28 核心单测全过，`tin_ms = 1.83 ms`）
 - **下一步持续迭代方向**：进入 `v3.6.0`（可打印 HTML 智能工程决策报告、AI 专题 R12 DXF 图层与 3D 视口高程图例/异常靶标升级）。
+
+## Iteration 6 — 智能决策报告与 3D 视口升级 (`v3.6.0`)
+- **版本升级**：
+  1. `cpp/src/io/io.hpp/.cpp`：新增 `export_ai_report_html`（内置 SVG 3 方案费用对比图、KPI 卡片、异常点/不确定度/显著性/排水与 AI 建议表，支持打印排版）、`export_survey_recommendations_csv` 与 `export_ai_overlays_dxf`（输出 `AI_ANOMALY`、`AI_SURVEY_REC`、`AI_HAUL_FLOW`、`AI_SLOPE_DAYLIGHT` 独立 CAD 图层）。
+  2. `cpp/src/ui/viewport_3d.hpp/.cpp`：新增 3D 高程/挖填色带图例浮窗，以及三维异常点与补测推荐点竖向靶标针。
+  3. 同步接入成果输出菜单、「AI智能」页签导出区与命令行（`HTMLRPT` / `EXP_REC` / `EXP_AIDXF`），并通过 Test 29 导出往返校验。
+- **实测结果（`python3 tools/eval_cpp_goal.py`）**：
+  - 综合评分：**`100.00 / 100.00`**（0 编译警告，CTest 3/3 + 29/29 核心单测全过）
+- **下一步持续迭代方向**：进入 `v3.7.0`（$O(N)$ 二维均匀空间网格加速、5000 点大规模压力测试与标高-方量/费用敏感性曲线）。

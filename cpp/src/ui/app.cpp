@@ -1235,6 +1235,15 @@ void CassApp::execute_command(const std::string& raw_cmd) {
     case AssistantAction::ExportDxf:
         action_export_dxf();
         break;
+    case AssistantAction::ExportHtmlReport:
+        action_export_ai_report_html();
+        break;
+    case AssistantAction::ExportSurveyRecCsv:
+        action_export_survey_rec_csv();
+        break;
+    case AssistantAction::ExportAiDxf:
+        action_export_ai_dxf();
+        break;
     case AssistantAction::Undo:
         undo();
         break;
@@ -1466,6 +1475,67 @@ void CassApp::action_export_sections_csv() {
     }
 }
 
+void CassApp::action_export_ai_report_html() {
+    static const wchar_t filter[] = L"HTML 决策报告 (*.html)\0*.html\0\0";
+    if (auto p = save_file_dialog(L"导出 AI 智能工程决策报告 (HTML)", filter, L"html", project_.project_name + "_AI决策报告.html")) {
+        try {
+            export_ai_report_html(
+                project_,
+                result_ ? &(*result_) : nullptr,
+                grade_opt_result_ ? &(*grade_opt_result_) : nullptr,
+                health_report_ ? &(*health_report_) : nullptr,
+                uncertainty_report_ ? &(*uncertainty_report_) : nullptr,
+                significance_report_ ? &(*significance_report_) : nullptr,
+                drainage_report_ ? &(*drainage_report_) : nullptr,
+                diagnosis_summary_ ? &(*diagnosis_summary_) : nullptr,
+                *p);
+            status_text_ = "已导出 HTML 智能决策报告: " + *p;
+            log_cmd("命令: HTMLRPT -> " + status_text_);
+        } catch (const std::exception& e) {
+            status_text_ = std::string("导出 HTML 报告失败: ") + e.what();
+            log_cmd("错误: " + status_text_);
+        }
+    }
+}
+
+void CassApp::action_export_survey_rec_csv() {
+    if (!uncertainty_report_ || uncertainty_report_->recommendations.empty()) {
+        status_text_ = "请先执行不确定度评定与补测点推荐";
+        return;
+    }
+    static const wchar_t filter[] = L"CSV 文件 (*.csv)\0*.csv\0\0";
+    if (auto p = save_file_dialog(L"导出补测推荐点位 (CSV)", filter, L"csv", project_.project_name + "_补测点推荐.csv")) {
+        try {
+            export_survey_recommendations_csv(*uncertainty_report_, *p);
+            status_text_ = "已导出补测推荐表: " + *p;
+            log_cmd("命令: EXP_REC -> " + status_text_);
+        } catch (const std::exception& e) {
+            status_text_ = std::string("导出补测点失败: ") + e.what();
+            log_cmd("错误: " + status_text_);
+        }
+    }
+}
+
+void CassApp::action_export_ai_dxf() {
+    static const wchar_t filter[] = L"AutoCAD R12 DXF (*.dxf)\0*.dxf\0\0";
+    if (auto p = save_file_dialog(L"导出 AI 专题 DXF 图层", filter, L"dxf", project_.project_name + "_AI专题图层.dxf")) {
+        try {
+            export_ai_overlays_dxf(
+                result_ ? &(*result_) : nullptr,
+                health_report_ ? &(*health_report_) : nullptr,
+                uncertainty_report_ ? &(*uncertainty_report_) : nullptr,
+                haul_result_ ? &(*haul_result_) : nullptr,
+                slope_result_ ? &(*slope_result_) : nullptr,
+                *p);
+            status_text_ = "已导出 AI 专题 DXF: " + *p;
+            log_cmd("命令: EXP_AIDXF -> " + status_text_);
+        } catch (const std::exception& e) {
+            status_text_ = std::string("导出 AI DXF 失败: ") + e.what();
+            log_cmd("错误: " + status_text_);
+        }
+    }
+}
+
 void CassApp::render() {
     // 全局快捷键处理
     if (!ImGui::GetIO().WantTextInput) {
@@ -1613,6 +1683,10 @@ void CassApp::render_menu_bar() {
         if (ImGui::MenuItem("导出工程计算报告 (TXT)...")) action_export_report_txt();
         if (ImGui::MenuItem("导出平行断面汇总表 (CSV)...")) action_export_sections_csv();
         if (ImGui::MenuItem("导出南方CASS 坐标点文件 (.dat)...")) action_export_cass_dat();
+        ImGui::Separator();
+        if (ImGui::MenuItem("导出 AI 智能决策报告 (HTML)...")) action_export_ai_report_html();
+        if (ImGui::MenuItem("导出补测推荐点表 (CSV)...")) action_export_survey_rec_csv();
+        if (ImGui::MenuItem("导出 AI 专题图层 (DXF)...")) action_export_ai_dxf();
         ImGui::EndMenu();
     }
 
@@ -1951,14 +2025,14 @@ void CassApp::render_center_viewport(float width, float height) {
     };
 
     const CalculationResult* res_ptr = result_ ? &(*result_) : nullptr;
+    const SiteHealthReport* health_ptr = health_report_ ? &(*health_report_) : nullptr;
+    const UncertaintyReport* uncert_ptr = uncertainty_report_ ? &(*uncertainty_report_) : nullptr;
     if (show_3d_view_) {
         viewport_3d_.dark_mode = canvas_.dark_mode;
-        viewport_3d_.render(project_, res_ptr);
+        viewport_3d_.render(project_, res_ptr, health_ptr, uncert_ptr);
     } else {
         const HaulPlanResult* haul_ptr = haul_result_ ? &(*haul_result_) : nullptr;
         const SlopeGradingResult* slope_ptr = slope_result_ ? &(*slope_result_) : nullptr;
-        const SiteHealthReport* health_ptr = health_report_ ? &(*health_report_) : nullptr;
-        const UncertaintyReport* uncert_ptr = uncertainty_report_ ? &(*uncertainty_report_) : nullptr;
         canvas_.render(project_, res_ptr, profile_line_, selected_tri_id_, callbacks,
                        haul_ptr, slope_ptr, health_ptr, uncert_ptr);
     }
@@ -2626,6 +2700,15 @@ void CassApp::render_tab_ai() {
     }
     if (drainage_report_) {
         ImGui::TextWrapped("%s", drainage_report_->summary.c_str());
+    }
+
+    ImGui::Spacing();
+    draw_section_bar("6. 智能决策报告与专题导出");
+    if (ImGui::Button("导出 HTML 决策报告", ImVec2(148, 0))) action_export_ai_report_html();
+    ImGui::SameLine();
+    if (ImGui::Button("导出补测 CSV", ImVec2(-1, 0))) action_export_survey_rec_csv();
+    if (ImGui::Button("导出 AI 专题 DXF 图层 (异常/补测/调配/放坡)", ImVec2(-1, 0))) {
+        action_export_ai_dxf();
     }
 
     ImGui::EndChild();
