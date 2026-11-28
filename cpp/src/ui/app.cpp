@@ -72,6 +72,8 @@ const char* tool_name_cn(CadToolMode mode) {
     case CadToolMode::DrawHole: return "绘制挖空区";
     case CadToolMode::DrawBreakline: return "绘制特征线";
     case CadToolMode::PickProfile: return "拾取纵断面";
+    case CadToolMode::MeasureDist: return "交互测距/坡度";
+    case CadToolMode::MeasureArea: return "测面积/局部方量";
     }
     return "选择/查询";
 }
@@ -98,17 +100,44 @@ void draw_section_bar(const char* title) {
 }
 
 int command_history_callback(ImGuiInputTextCallbackData* data) {
-    auto* hist = static_cast<std::vector<std::string>*>(data->UserData);
-    // Callback receives struct { vector*, int* pos }
     struct HistCtx {
         std::vector<std::string>* list;
         int* pos;
+        std::function<void(const std::string&)> on_log;
     };
     auto* ctx = static_cast<HistCtx*>(data->UserData);
-    (void)hist;
-    if (!ctx || !ctx->list || ctx->list->empty()) return 0;
+    if (!ctx) return 0;
 
-    if (data->EventFlag == ImGuiInputTextFlags_CallbackHistory) {
+    if (data->EventFlag == ImGuiInputTextFlags_CallbackCompletion) {
+        std::string cur(data->Buf, static_cast<size_t>(data->BufTextLen));
+        auto cands = suggest_command_completions(cur);
+        if (cands.size() == 1) {
+            data->DeleteChars(0, data->BufTextLen);
+            data->InsertChars(0, cands[0].c_str());
+        } else if (cands.size() > 1) {
+            // 计算最长公共前缀并输出候选清单
+            std::string lcp = cands[0];
+            for (size_t i = 1; i < cands.size(); ++i) {
+                size_t k = 0;
+                while (k < lcp.size() && k < cands[i].size() && lcp[k] == cands[i][k]) ++k;
+                lcp.resize(k);
+            }
+            if (lcp.size() > cur.size()) {
+                data->DeleteChars(0, data->BufTextLen);
+                data->InsertChars(0, lcp.c_str());
+            } else if (ctx->on_log) {
+                std::string hint = "补全候选: ";
+                for (size_t i = 0; i < std::min<size_t>(cands.size(), 10); ++i) {
+                    if (i > 0) hint += " | ";
+                    hint += cands[i];
+                }
+                ctx->on_log(hint);
+            }
+        }
+        return 0;
+    }
+
+    if (data->EventFlag == ImGuiInputTextFlags_CallbackHistory && ctx->list && !ctx->list->empty()) {
         int n = static_cast<int>(ctx->list->size());
         int prev = *ctx->pos;
         if (data->EventKey == ImGuiKey_UpArrow) {
@@ -288,7 +317,7 @@ bool CassApp::save_project_to_path(const std::string& utf8_path) {
 
 void CassApp::push_undo_snapshot() {
     undo_stack_.push_back(EditSnapshot{
-        project_.boundary, project_.holes, project_.breaklines, project_.settings
+        project_.boundary, project_.holes, project_.breaklines, project_.settings, std::nullopt
     });
     if (undo_stack_.size() > 50) {
         undo_stack_.erase(undo_stack_.begin());
@@ -301,15 +330,22 @@ bool CassApp::undo() {
         status_text_ = "没有可撤销的操作";
         return false;
     }
-    redo_stack_.push_back(EditSnapshot{
-        project_.boundary, project_.holes, project_.breaklines, project_.settings
-    });
     EditSnapshot prev = std::move(undo_stack_.back());
     undo_stack_.pop_back();
+    std::optional<std::vector<SurveyPoint>> cur_pts = prev.points.has_value()
+        ? std::optional<std::vector<SurveyPoint>>(project_.points)
+        : std::nullopt;
+    redo_stack_.push_back(EditSnapshot{
+        project_.boundary, project_.holes, project_.breaklines, project_.settings, std::move(cur_pts)
+    });
     project_.boundary = std::move(prev.boundary);
     project_.holes = std::move(prev.holes);
     project_.breaklines = std::move(prev.breaklines);
     project_.settings = std::move(prev.settings);
+    if (prev.points.has_value()) {
+        project_.points = std::move(*prev.points);
+        update_point_stats();
+    }
     status_text_ = "已撤销上一步编辑 (Ctrl+Z)";
     log_cmd("命令: _UNDO -> " + status_text_);
     if (result_) run_calculation();
@@ -321,15 +357,22 @@ bool CassApp::redo() {
         status_text_ = "没有可重做的操作";
         return false;
     }
-    undo_stack_.push_back(EditSnapshot{
-        project_.boundary, project_.holes, project_.breaklines, project_.settings
-    });
     EditSnapshot next = std::move(redo_stack_.back());
     redo_stack_.pop_back();
+    std::optional<std::vector<SurveyPoint>> cur_pts = next.points.has_value()
+        ? std::optional<std::vector<SurveyPoint>>(project_.points)
+        : std::nullopt;
+    undo_stack_.push_back(EditSnapshot{
+        project_.boundary, project_.holes, project_.breaklines, project_.settings, std::move(cur_pts)
+    });
     project_.boundary = std::move(next.boundary);
     project_.holes = std::move(next.holes);
     project_.breaklines = std::move(next.breaklines);
     project_.settings = std::move(next.settings);
+    if (next.points.has_value()) {
+        project_.points = std::move(*next.points);
+        update_point_stats();
+    }
     status_text_ = "已重做编辑 (Ctrl+Y)";
     log_cmd("命令: _REDO -> " + status_text_);
     if (result_) run_calculation();
@@ -711,6 +754,153 @@ void CassApp::set_3d_view(bool enabled) {
     status_text_ = enabled ? "已切换至 3D 实景地形与设计面透视视口" : "已返回 2D CAD 平面视口";
 }
 
+void CassApp::set_tool_mode(CadToolMode mode) {
+    canvas_.clear_draft();
+    canvas_.tool = mode;
+    status_text_ = std::string("已切换到工具: ") + tool_name_cn(mode);
+}
+
+bool CassApp::run_grade_optimization_action() {
+    if (project_.points.size() < 3) {
+        status_text_ = "测点不足，无法执行联合费用优化";
+        return false;
+    }
+    try {
+        TINEarthworkCalculator calc(project_.settings.design_elevation);
+        configure_calculator(calc);
+        calc.build_tin();
+        grade_opt_result_ = optimize_grade_cost(calc, cost_params_, opt_constraints_);
+        const auto& opt = grade_opt_result_->optimized;
+        std::ostringstream oss;
+        oss << "AI 联合费用优化完成（评估 " << grade_opt_result_->evaluations << " 次，"
+            << format_num(grade_opt_result_->elapsed_ms, 1) << " ms）：最优总成本 ¥"
+            << format_num(opt.total_cost, 0) << "（较平场平衡省 "
+            << format_num(grade_opt_result_->savings_pct_vs_flat, 1) << "%）";
+        status_text_ = oss.str();
+        log_cmd("命令: _AIOPT -> " + oss.str());
+        diagnosis_summary_ = generate_site_diagnosis(
+            project_, result_ ? &(*result_) : nullptr,
+            health_report_ ? &(*health_report_) : nullptr,
+            &(*grade_opt_result_),
+            uncertainty_report_ ? &(*uncertainty_report_) : nullptr);
+        return true;
+    } catch (const std::exception& e) {
+        status_text_ = std::string("联合费用优化失败: ") + e.what();
+        log_cmd("错误: " + status_text_);
+        return false;
+    }
+}
+
+bool CassApp::apply_optimized_plane_action() {
+    if (!grade_opt_result_) return false;
+    push_undo_snapshot();
+    project_.settings.design_mode = DesignMode::Plane;
+    project_.settings.design_plane = grade_opt_result_->optimized.plane;
+    bool ok = run_calculation();
+    if (ok) compute_haul_action();
+    status_text_ = "已将 AI 费用最优斜面写入工程参数并更新方量与调配";
+    log_cmd("命令: _APPLY_OPT -> " + status_text_);
+    return ok;
+}
+
+bool CassApp::run_anomaly_diagnosis_action() {
+    if (project_.points.empty()) {
+        status_text_ = "请先导入测点数据";
+        return false;
+    }
+    try {
+        health_report_ = detect_survey_anomalies(project_.points);
+        canvas_.layers.anomalies = true;
+        status_text_ = health_report_->summary;
+        log_cmd("命令: _DIAG -> " + health_report_->summary);
+        diagnosis_summary_ = generate_site_diagnosis(
+            project_, result_ ? &(*result_) : nullptr,
+            &(*health_report_),
+            grade_opt_result_ ? &(*grade_opt_result_) : nullptr,
+            uncertainty_report_ ? &(*uncertainty_report_) : nullptr);
+        return true;
+    } catch (const std::exception& e) {
+        status_text_ = std::string("测点异常诊断失败: ") + e.what();
+        log_cmd("错误: " + status_text_);
+        return false;
+    }
+}
+
+bool CassApp::clean_anomalies_action() {
+    if (!health_report_) {
+        if (!run_anomaly_diagnosis_action()) return false;
+    }
+    if (health_report_->anomalies.empty()) {
+        status_text_ = "未检出需要修复的异常点";
+        return true;
+    }
+    undo_stack_.push_back(EditSnapshot{
+        project_.boundary, project_.holes, project_.breaklines, project_.settings, project_.points
+    });
+    if (undo_stack_.size() > 50) undo_stack_.erase(undo_stack_.begin());
+    redo_stack_.clear();
+
+    auto cleaned = clean_survey_anomalies(project_.points, *health_report_, true);
+    project_.points = std::move(cleaned.points);
+    update_point_stats();
+    if (result_) run_calculation();
+    health_report_ = detect_survey_anomalies(project_.points);
+    std::ostringstream oss;
+    oss << "已局部插值修复 " << cleaned.repaired_count << " 个高程粗差、剔除 "
+        << cleaned.removed_count << " 个飞点/冲突点（健康分 -> " << health_report_->health_score << "/100）";
+    status_text_ = oss.str();
+    log_cmd("命令: _CLEAN -> " + status_text_);
+    return true;
+}
+
+bool CassApp::run_uncertainty_action() {
+    if (project_.points.size() < 4) {
+        status_text_ = "至少需要 4 个测点才能评定不确定度";
+        return false;
+    }
+    try {
+        TINEarthworkCalculator calc(project_.settings.design_elevation);
+        configure_calculator(calc);
+        calc.build_tin();
+        uncertainty_report_ = analyze_uncertainty_and_recommend(calc, measure_sigma_, recommend_count_, 8);
+        canvas_.layers.survey_recs = true;
+        status_text_ = uncertainty_report_->summary;
+        log_cmd("命令: _UNCERT -> " + uncertainty_report_->summary);
+        diagnosis_summary_ = generate_site_diagnosis(
+            project_, result_ ? &(*result_) : nullptr,
+            health_report_ ? &(*health_report_) : nullptr,
+            grade_opt_result_ ? &(*grade_opt_result_) : nullptr,
+            &(*uncertainty_report_));
+        return true;
+    } catch (const std::exception& e) {
+        status_text_ = std::string("不确定度评定失败: ") + e.what();
+        log_cmd("错误: " + status_text_);
+        return false;
+    }
+}
+
+bool CassApp::run_ai_full_workflow_action() {
+    if (project_.points.size() < 4) {
+        status_text_ = "请先导入不少于 4 个测点再运行一键 AI 全流程诊断";
+        return false;
+    }
+    if (!result_) run_calculation();
+    bool ok1 = run_anomaly_diagnosis_action();
+    bool ok2 = run_grade_optimization_action();
+    bool ok3 = run_uncertainty_action();
+    diagnosis_summary_ = generate_site_diagnosis(
+        project_, result_ ? &(*result_) : nullptr,
+        health_report_ ? &(*health_report_) : nullptr,
+        grade_opt_result_ ? &(*grade_opt_result_) : nullptr,
+        uncertainty_report_ ? &(*uncertainty_report_) : nullptr);
+    if (diagnosis_summary_) {
+        status_text_ = diagnosis_summary_->headline;
+        log_cmd("AI 全流程诊断完成 -> " + diagnosis_summary_->headline);
+    }
+    set_inspector_tab(6);
+    return ok1 && ok2 && ok3;
+}
+
 bool CassApp::generate_quick_profile(bool horizontal) {
     if (project_.points.size() < 3) {
         status_text_ = "测点不足，无法生成纵断面";
@@ -813,7 +1003,7 @@ void CassApp::handle_draft_committed(const std::vector<XY>& pts, CadToolMode too
 }
 
 void CassApp::set_inspector_tab(int idx) {
-    pending_tab_ = std::clamp(idx, 0, 5);
+    pending_tab_ = std::clamp(idx, 0, 6);
 }
 
 void CassApp::set_dark_mode(bool dark) {
@@ -851,58 +1041,120 @@ void CassApp::execute_command(const std::string& raw_cmd) {
     history_pos_ = -1;
     log_cmd("命令: " + cmd);
 
-    std::string up = upper_ascii(cmd);
-    if (up == "HELP" || up == "?") {
-        log_cmd("可用指令: AUTOB(矩形边界) | OUTLINE(自动轮廓) | CALC(开始计算) | BALANCE/H0(平衡标高)");
-        log_cmd("         GRID(方格网开关) | CONTOUR(等高线开关) | PROFILE(水平断面) | ZE(全图缩放)");
-        log_cmd("         DARK(黑底) | LIGHT(白底) | SWAP(互换对比两期) | DAT/DXF(快捷导出) | CLEAR(清屏)");
-    } else if (up == "AUTOB" || up == "_AUTOB" || up == "RECT") {
+    AssistantIntent intent = parse_engineering_intent(cmd);
+    if (!intent.reply.empty()) {
+        log_cmd(intent.reply);
+    }
+
+    switch (intent.action) {
+    case AssistantAction::Help:
+        log_cmd("CAD 经典指令: AUTOB | OUTLINE | CLRBND | CALC(F5) | BALANCE/H0 | FITPLANE | BALPLANE | SECTIONS");
+        log_cmd("专题与绘图   : STRATA | HAUL | SLOPE | GRID | CONTOUR | PROFILE | MEASURE | AREA | 3D | 2D | ZE");
+        log_cmd("AI 智能指令  : OPT/AIOPT(联合费用优化) | DIAG/ANOMALY(异常体检) | CLEAN(修复粗差) | UNCERT(补测推荐)");
+        log_cmd("自然语言示例 : \"把标高设为50.8\" | \"优化总费用\" | \"检查测点异常\" | \"推荐10个补测点\" | \"放坡 1:1.2 1:1.5\"");
+        log_cmd("视图与编辑   : DARK | LIGHT | SWAP | UNDO | REDO | DAT | DXF | CLEAR (支持 Tab 自动补全)");
+        break;
+    case AssistantAction::AutoRectBoundary:
         generate_rect_boundary();
-    } else if (up == "OUTLINE" || up == "_OUTLINE") {
+        break;
+    case AssistantAction::AutoOutline:
         generate_auto_outline();
-    } else if (up == "CLRBND" || up == "_CLRBND") {
+        break;
+    case AssistantAction::ClearBoundary:
         clear_boundary();
-    } else if (up == "CALC" || up == "_CALC" || up == "RUN") {
+        break;
+    case AssistantAction::Calculate:
         run_calculation();
-    } else if (up == "BALANCE" || up == "_BALANCE" || up == "H0") {
+        break;
+    case AssistantAction::BalanceH0:
         solve_balance_h0();
-    } else if (up == "FITPLANE" || up == "_FITPLANE") {
+        break;
+    case AssistantAction::BestFitPlane:
         solve_best_fit_plane_action();
-    } else if (up == "BALPLANE" || up == "_BALPLANE") {
+        break;
+    case AssistantAction::BalancePlane:
         solve_balance_plane_action();
-    } else if (up == "SECTIONS" || up == "_SECTIONS") {
+        break;
+    case AssistantAction::OptimizeGradeCost:
+        if (intent.has_param1) {
+            opt_constraints_.max_slope_x = intent.param1;
+            opt_constraints_.max_slope_y = intent.param1;
+        }
+        run_grade_optimization_action();
+        set_inspector_tab(6);
+        break;
+    case AssistantAction::RunSections:
+        if (intent.has_param1) section_spacing_ = intent.param1;
+        if (intent.has_param2) section_azimuth_ = intent.param2;
         run_sections_action(section_spacing_, section_azimuth_);
         set_inspector_tab(3);
-    } else if (up == "STRATA" || up == "_STRATA") {
+        break;
+    case AssistantAction::ComputeStrata:
         compute_strata_action();
         set_inspector_tab(5);
-    } else if (up == "HAUL" || up == "_HAUL") {
+        break;
+    case AssistantAction::ComputeHaul:
         compute_haul_action();
         set_inspector_tab(5);
-    } else if (up == "SLOPE" || up == "_SLOPE") {
+        break;
+    case AssistantAction::ComputeSlope:
+        if (intent.has_param1) slope_cut_ratio_ = std::max(0.1, intent.param1);
+        if (intent.has_param2) slope_fill_ratio_ = std::max(0.1, intent.param2);
         compute_slope_action();
         set_inspector_tab(5);
-    } else if (up == "3D") {
+        break;
+    case AssistantAction::RunDiagnostics:
+        run_anomaly_diagnosis_action();
+        set_inspector_tab(6);
+        break;
+    case AssistantAction::CleanAnomalies:
+        clean_anomalies_action();
+        set_inspector_tab(6);
+        break;
+    case AssistantAction::RunUncertainty:
+        recommend_count_ = intent.count_param;
+        run_uncertainty_action();
+        set_inspector_tab(6);
+        break;
+    case AssistantAction::MeasureDist:
+        set_tool_mode(CadToolMode::MeasureDist);
+        break;
+    case AssistantAction::MeasureArea:
+        set_tool_mode(CadToolMode::MeasureArea);
+        break;
+    case AssistantAction::SetElevation:
+        set_design_elevation(intent.param1);
+        run_calculation();
+        break;
+    case AssistantAction::SetView3D:
         set_3d_view(true);
-    } else if (up == "2D") {
+        break;
+    case AssistantAction::SetView2D:
         set_3d_view(false);
-    } else if (up == "GRID" || up == "_GRID") {
+        break;
+    case AssistantAction::ToggleGrid:
         enable_grid_check(!project_.settings.grid_enabled, project_.settings.grid_spacing);
         run_calculation();
-    } else if (up == "CONTOUR" || up == "_CONTOUR") {
+        break;
+    case AssistantAction::ToggleContours:
         enable_contours(!project_.settings.contours_enabled, project_.settings.contour_interval);
         run_calculation();
-    } else if (up == "PROFILE" || up == "_PROFILE") {
+        break;
+    case AssistantAction::QuickProfile:
         generate_quick_profile(true);
         set_inspector_tab(3);
-    } else if (up == "ZE" || up == "Z" || up == "ZOOM") {
+        break;
+    case AssistantAction::ZoomExtents:
         zoom_extents();
         log_cmd("视图已全图居中 (ZE)");
-    } else if (up == "DARK") {
+        break;
+    case AssistantAction::DarkMode:
         set_dark_mode(true);
-    } else if (up == "LIGHT") {
+        break;
+    case AssistantAction::LightMode:
         set_dark_mode(false);
-    } else if (up == "SWAP") {
+        break;
+    case AssistantAction::SwapCompare:
         if (!project_.compare_points.empty()) {
             std::swap(project_.points, project_.compare_points);
             compare_invert_ = 1 - compare_invert_;
@@ -911,27 +1163,25 @@ void CassApp::execute_command(const std::string& raw_cmd) {
         } else {
             log_cmd("提示: 当前未加载对比期测点");
         }
-    } else if (up == "DAT") {
+        break;
+    case AssistantAction::ExportDat:
         action_export_cass_dat();
-    } else if (up == "DXF") {
+        break;
+    case AssistantAction::ExportDxf:
         action_export_dxf();
-    } else if (up == "UNDO" || up == "_UNDO" || up == "U") {
+        break;
+    case AssistantAction::Undo:
         undo();
-    } else if (up == "REDO" || up == "_REDO") {
+        break;
+    case AssistantAction::Redo:
         redo();
-    } else if (up == "CLEAR" || up == "CLS") {
+        break;
+    case AssistantAction::ClearConsole:
         console_lines_.clear();
         log_cmd("命令行历史记录已清空");
-    } else if (up.rfind("H=", 0) == 0 || up.rfind("Z=", 0) == 0) {
-        try {
-            double h = std::stod(cmd.substr(2));
-            set_design_elevation(h);
-            run_calculation();
-        } catch (...) {
-            log_cmd("参数格式错误，示例: H=50.5");
-        }
-    } else {
-        log_cmd("未知指令 \"" + cmd + "\"，输入 HELP 查看命令清单");
+        break;
+    case AssistantAction::None:
+        break;
     }
 }
 
@@ -1357,6 +1607,10 @@ void CassApp::render_quick_toolbar() {
     tool_btn("特征线", CadToolMode::DrawBreakline);
     ImGui::SameLine();
     tool_btn("切断面", CadToolMode::PickProfile);
+    ImGui::SameLine();
+    tool_btn("测距", CadToolMode::MeasureDist);
+    ImGui::SameLine();
+    tool_btn("测面积", CadToolMode::MeasureArea);
 
     if (!canvas_.draft_points().empty()) {
         ImGui::SameLine();
@@ -1384,6 +1638,10 @@ void CassApp::render_quick_toolbar() {
     ImGui::SameLine();
     if (colored_button("平衡H0", rgba(0x2D, 0x4C, 0x73), rgba(0x3A, 0x62, 0x94), rgba(0x23, 0x3C, 0x5B))) {
         solve_balance_h0();
+    }
+    ImGui::SameLine();
+    if (colored_button("AI优化", rgba(0x6D, 0x28, 0xD9), rgba(0x7C, 0x3A, 0xED), rgba(0x5B, 0x21, 0xB6))) {
+        run_ai_full_workflow_action();
     }
     ImGui::SameLine();
     if (ImGui::Button("ZE全图")) zoom_extents();
@@ -1588,6 +1846,8 @@ void CassApp::render_layer_strip() {
     ImGui::SameLine(); ImGui::Checkbox("断面网", &canvas_.layers.sections);
     ImGui::SameLine(); ImGui::Checkbox("调配", &canvas_.layers.haul);
     ImGui::SameLine(); ImGui::Checkbox("放坡", &canvas_.layers.slope);
+    ImGui::SameLine(); ImGui::Checkbox("异常点", &canvas_.layers.anomalies);
+    ImGui::SameLine(); ImGui::Checkbox("补测点", &canvas_.layers.survey_recs);
     ImGui::SameLine(); ImGui::Checkbox("捕捉", &canvas_.osnap_enabled);
 
     ImGui::EndChild();
@@ -1632,7 +1892,10 @@ void CassApp::render_center_viewport(float width, float height) {
     } else {
         const HaulPlanResult* haul_ptr = haul_result_ ? &(*haul_result_) : nullptr;
         const SlopeGradingResult* slope_ptr = slope_result_ ? &(*slope_result_) : nullptr;
-        canvas_.render(project_, res_ptr, profile_line_, selected_tri_id_, callbacks, haul_ptr, slope_ptr);
+        const SiteHealthReport* health_ptr = health_report_ ? &(*health_report_) : nullptr;
+        const UncertaintyReport* uncert_ptr = uncertainty_report_ ? &(*uncertainty_report_) : nullptr;
+        canvas_.render(project_, res_ptr, profile_line_, selected_tri_id_, callbacks,
+                       haul_ptr, slope_ptr, health_ptr, uncert_ptr);
     }
 
     ImGui::EndChild();
@@ -1669,6 +1932,10 @@ void CassApp::render_right_inspector(float width, float height) {
         }
         if (ImGui::BeginTabItem("专题", nullptr, tab_flags(5))) {
             render_tab_engineering();
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("AI智能", nullptr, tab_flags(6))) {
+            render_tab_ai();
             ImGui::EndTabItem();
         }
         pending_tab_ = -1;
@@ -2117,6 +2384,158 @@ void CassApp::render_tab_engineering() {
     ImGui::EndChild();
 }
 
+void CassApp::render_tab_ai() {
+    ImGui::BeginChild("##tab_ai_scroll", ImVec2(0, 0), ImGuiChildFlags_None);
+
+    if (colored_button("一键 AI 全流程诊断与优化",
+                       rgba(0x6D, 0x28, 0xD9), rgba(0x7C, 0x3A, 0xED), rgba(0x5B, 0x21, 0xB6),
+                       ImVec2(-1, 30.0f))) {
+        run_ai_full_workflow_action();
+    }
+
+    if (health_report_) {
+        float frac = static_cast<float>(health_report_->health_score) / 100.0f;
+        ImVec4 bar_col = (health_report_->health_score >= 90) ? rgba(0x22, 0xC5, 0x5E)
+                       : (health_report_->health_score >= 70) ? rgba(0xF5, 0x9E, 0x0B)
+                                                              : rgba(0xEF, 0x44, 0x44);
+        ImGui::PushStyleColor(ImGuiCol_PlotHistogram, bar_col);
+        char hbuf[64];
+        std::snprintf(hbuf, sizeof(hbuf), "场地数据健康分: %d / 100", health_report_->health_score);
+        ImGui::ProgressBar(frac, ImVec2(-1, 18.0f), hbuf);
+        ImGui::PopStyleColor();
+    }
+
+    ImGui::Spacing();
+    draw_section_bar("1. 设计面-土方调配联合费用优化");
+    ImGui::InputDouble("挖方单价(元/m³)", &cost_params_.cut_unit_cost, 1.0, 5.0, "%.1f");
+    ImGui::InputDouble("填方单价(元/m³)", &cost_params_.fill_unit_cost, 1.0, 5.0, "%.1f");
+    ImGui::InputDouble("运距单价(元/100m)", &cost_params_.haul_per_m3_100m, 0.5, 2.0, "%.1f");
+    ImGui::InputDouble("外运单价(元/m³)", &cost_params_.export_unit_cost, 1.0, 5.0, "%.1f");
+    ImGui::InputDouble("借土单价(元/m³)", &cost_params_.borrow_unit_cost, 1.0, 5.0, "%.1f");
+    ImGui::InputDouble("最大坡度约束(%)", &opt_constraints_.max_slope_x, 0.5, 1.0, "%.1f");
+    opt_constraints_.max_slope_y = opt_constraints_.max_slope_x;
+
+    if (colored_button("开始联合费用优化", rgba(0x16, 0x7A, 0x55), rgba(0x1D, 0x99, 0x6B), rgba(0x12, 0x63, 0x45), ImVec2(-1, 0))) {
+        run_grade_optimization_action();
+    }
+    if (grade_opt_result_) {
+        const auto& g = *grade_opt_result_;
+        ImGuiTableFlags tf = ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp;
+        if (ImGui::BeginTable("##grade_cmp_tbl", 4, tf)) {
+            ImGui::TableSetupColumn("方案", ImGuiTableColumnFlags_WidthStretch);
+            ImGui::TableSetupColumn("总费用(元)", ImGuiTableColumnFlags_WidthFixed, 74.0f);
+            ImGui::TableSetupColumn("坡度ix/iy%", ImGuiTableColumnFlags_WidthFixed, 72.0f);
+            ImGui::TableSetupColumn("节费", ImGuiTableColumnFlags_WidthFixed, 46.0f);
+            ImGui::TableHeadersRow();
+            auto row = [&](const GradePlanSummary& s, const char* sav_str, bool hl) {
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0);
+                if (hl) ImGui::TextColored(rgba(0x4A, 0xDE, 0x80), "%s", s.label.c_str());
+                else ImGui::Text("%s", s.label.c_str());
+                ImGui::TableSetColumnIndex(1); ImGui::Text("%s", format_num(s.total_cost, 0).c_str());
+                ImGui::TableSetColumnIndex(2); ImGui::Text("%.2f/%.2f", s.plane.slope_x, s.plane.slope_y);
+                ImGui::TableSetColumnIndex(3); ImGui::Text("%s", sav_str);
+            };
+            row(g.flat_balance, "--", false);
+            row(g.best_fit, "--", false);
+            char sbuf[24];
+            std::snprintf(sbuf, sizeof(sbuf), "%.1f%%", g.savings_pct_vs_flat);
+            row(g.optimized, sbuf, true);
+            ImGui::EndTable();
+        }
+        if (colored_button("一键采纳 AI 最优斜面并重算", rgba(0x23, 0x5C, 0x9F), rgba(0x2E, 0x73, 0xC4), rgba(0x1C, 0x4B, 0x82), ImVec2(-1, 0))) {
+            apply_optimized_plane_action();
+        }
+    }
+
+    ImGui::Spacing();
+    draw_section_bar("2. 测点空间异常诊断 (点击定位)");
+    if (ImGui::Button("检测异常测点", ImVec2(148, 0))) run_anomaly_diagnosis_action();
+    ImGui::SameLine();
+    if (ImGui::Button("一键局部修复", ImVec2(-1, 0))) clean_anomalies_action();
+    if (health_report_) {
+        ImGui::TextWrapped("%s", health_report_->summary.c_str());
+        if (!health_report_->anomalies.empty()) {
+            ImGuiTableFlags tf = ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
+                                 ImGuiTableFlags_ScrollY | ImGuiTableFlags_SizingStretchProp;
+            if (ImGui::BeginTable("##anom_tbl", 3, tf, ImVec2(0, 96.0f))) {
+                ImGui::TableSetupScrollFreeze(0, 1);
+                ImGui::TableSetupColumn("点号", ImGuiTableColumnFlags_WidthFixed, 60.0f);
+                ImGui::TableSetupColumn("残差(m)", ImGuiTableColumnFlags_WidthFixed, 60.0f);
+                ImGui::TableSetupColumn("诊断说明", ImGuiTableColumnFlags_WidthStretch);
+                ImGui::TableHeadersRow();
+                for (int i = 0; i < static_cast<int>(health_report_->anomalies.size()); ++i) {
+                    const auto& a = health_report_->anomalies[i];
+                    ImGui::TableNextRow();
+                    ImGui::TableSetColumnIndex(0);
+                    std::string lbl = a.point_id + "##anom" + std::to_string(i);
+                    if (ImGui::Selectable(lbl.c_str(), false, ImGuiSelectableFlags_SpanAllColumns)) {
+                        canvas_.focus_point(a.x, a.y, 40.0);
+                        status_text_ = "已定位异常点 " + a.point_id + ": " + a.reason;
+                    }
+                    ImGui::TableSetColumnIndex(1);
+                    ImGui::TextColored(rgba(0xF8, 0x71, 0x71), "%+.2f", a.residual);
+                    ImGui::TableSetColumnIndex(2);
+                    ImGui::TextUnformatted(a.reason.c_str());
+                }
+                ImGui::EndTable();
+            }
+        }
+    }
+
+    ImGui::Spacing();
+    draw_section_bar("3. 不确定度评定 & 补测点推荐");
+    ImGui::InputDouble("测量中误差 σm(m)", &measure_sigma_, 0.01, 0.05, "%.3f");
+    ImGui::SliderInt("推荐补测点数", &recommend_count_, 3, 20);
+    if (ImGui::Button("评定不确定度并推荐补测点", ImVec2(-1, 0))) run_uncertainty_action();
+    if (uncertainty_report_) {
+        const auto& u = *uncertainty_report_;
+        ImGui::Text("挖方 95%%区间: %s ± %s m³ (±%.1f%%)",
+                    format_num(u.cut_corrected, 1).c_str(), format_num(u.cut_ci95, 1).c_str(), u.cut_rel_ci95_pct);
+        ImGui::Text("填方 95%%区间: %s ± %s m³ (±%.1f%%)",
+                    format_num(u.fill_corrected, 1).c_str(), format_num(u.fill_ci95, 1).c_str(), u.fill_rel_ci95_pct);
+        if (!u.recommendations.empty()) {
+            ImGuiTableFlags tf = ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
+                                 ImGuiTableFlags_ScrollY | ImGuiTableFlags_SizingStretchProp;
+            if (ImGui::BeginTable("##rec_tbl", 4, tf, ImVec2(0, 102.0f))) {
+                ImGui::TableSetupScrollFreeze(0, 1);
+                ImGui::TableSetupColumn("#", ImGuiTableColumnFlags_WidthFixed, 28.0f);
+                ImGui::TableSetupColumn("X", ImGuiTableColumnFlags_WidthStretch);
+                ImGui::TableSetupColumn("Y", ImGuiTableColumnFlags_WidthStretch);
+                ImGui::TableSetupColumn("估Z", ImGuiTableColumnFlags_WidthFixed, 54.0f);
+                ImGui::TableHeadersRow();
+                for (const auto& r : u.recommendations) {
+                    ImGui::TableNextRow();
+                    ImGui::TableSetColumnIndex(0);
+                    std::string lbl = "#" + std::to_string(r.rank);
+                    if (ImGui::Selectable(lbl.c_str(), false, ImGuiSelectableFlags_SpanAllColumns)) {
+                        canvas_.focus_point(r.x, r.y, 40.0);
+                        status_text_ = "已定位建议补测 #" + std::to_string(r.rank);
+                    }
+                    ImGui::TableSetColumnIndex(1); ImGui::Text("%.1f", r.x);
+                    ImGui::TableSetColumnIndex(2); ImGui::Text("%.1f", r.y);
+                    ImGui::TableSetColumnIndex(3); ImGui::Text("%.2f", r.estimated_z);
+                }
+                ImGui::EndTable();
+            }
+        }
+    }
+
+    if (diagnosis_summary_ && !diagnosis_summary_->items.empty()) {
+        ImGui::Spacing();
+        draw_section_bar("4. AI 工程综合建议清单");
+        for (const auto& it : diagnosis_summary_->items) {
+            ImVec4 col = (it.level == 1) ? rgba(0xF8, 0x71, 0x71)
+                       : (it.level == 2) ? rgba(0xFB, 0xBF, 0x24)
+                                         : rgba(0x4A, 0xDE, 0x80);
+            ImGui::TextColored(col, "• [%s]", it.title.c_str());
+            ImGui::TextWrapped("  %s", it.detail.c_str());
+        }
+    }
+
+    ImGui::EndChild();
+}
+
 void CassApp::render_command_console(float height) {
     ImGui::PushStyleColor(ImGuiCol_ChildBg, rgba(0x11, 0x15, 0x1B));
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(8.0f, 5.0f));
@@ -2152,12 +2571,16 @@ void CassApp::render_command_console(float height) {
     struct HistCtx {
         std::vector<std::string>* list;
         int* pos;
-    } hctx{&cmd_history_, &history_pos_};
+        std::function<void(const std::string&)> on_log;
+    } hctx{&cmd_history_, &history_pos_, [this](const std::string& m) { log_cmd(m); }};
 
     if (fonts_.mono) ImGui::PushFont(fonts_.mono);
     ImGui::SetNextItemWidth(-1.0f);
-    ImGuiInputTextFlags cflags = ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_CallbackHistory;
-    if (ImGui::InputTextWithHint("##cad_cmd_input", "输入 CAD 指令 (HELP / AUTOB / OUTLINE / CALC / H0 / ZE / DARK / LIGHT)...",
+    ImGuiInputTextFlags cflags = ImGuiInputTextFlags_EnterReturnsTrue |
+                                 ImGuiInputTextFlags_CallbackHistory |
+                                 ImGuiInputTextFlags_CallbackCompletion;
+    if (ImGui::InputTextWithHint("##cad_cmd_input",
+                                 "输入 CAD 指令或中文如 \"优化总费用\" / \"把标高设为50.5\" (Tab自动补全, HELP查看清单)...",
                                  cmd_buf_, sizeof(cmd_buf_), cflags, command_history_callback, &hctx)) {
         std::string entered = cmd_buf_;
         cmd_buf_[0] = '\0';
@@ -2194,6 +2617,9 @@ void CassApp::render_status_bar(float height) {
              << "  |  测点:" << project_.points.size();
     if (result_) {
         right_ss << " / 三角:" << result_->triangle_count;
+    }
+    if (health_report_) {
+        right_ss << " | 健康:" << health_report_->health_score << "分";
     }
 
     std::string right_str = right_ss.str();

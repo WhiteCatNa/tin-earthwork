@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/ai_optimizer.hpp"
 #include "core/engineering.hpp"
 #include "core/types.hpp"
 #include "imgui.h"
@@ -14,7 +15,9 @@ enum class CadToolMode {
     DrawBoundary,
     DrawHole,
     DrawBreakline,
-    PickProfile
+    PickProfile,
+    MeasureDist,
+    MeasureArea
 };
 
 struct LayerVisibility {
@@ -32,6 +35,8 @@ struct LayerVisibility {
     bool sections = true;
     bool haul = true;
     bool slope = true;
+    bool anomalies = true;
+    bool survey_recs = true;
 };
 
 struct CadCanvasCallbacks {
@@ -53,6 +58,7 @@ public:
                   const ImVec2& view_size = ImVec2(900.0f, 650.0f));
 
     void focus_triangle(const Triangle& tri);
+    void focus_point(double x, double y, double target_span_m = 45.0);
 
     void render(const ProjectData& project,
                 const CalculationResult* result,
@@ -60,12 +66,15 @@ public:
                 int& selected_tri_id,
                 const CadCanvasCallbacks& callbacks,
                 const HaulPlanResult* haul = nullptr,
-                const SlopeGradingResult* slope = nullptr);
+                const SlopeGradingResult* slope = nullptr,
+                const SiteHealthReport* health = nullptr,
+                const UncertaintyReport* uncertainty = nullptr);
 
     // 交互绘制草稿控制
     void clear_draft();
     void commit_draft(const CadCanvasCallbacks& callbacks);
     const std::vector<XY>& draft_points() const { return draft_; }
+    const std::vector<XY>& measure_points() const { return measure_pts_; }
 
     bool has_hover() const { return hover_valid_; }
     XY hover_world() const { return hover_world_; }
@@ -88,6 +97,7 @@ private:
     XY hover_world_{0.0, 0.0};
 
     std::vector<XY> draft_;
+    std::vector<XY> measure_pts_;
     std::optional<XY> profile_first_;
 
     bool panning_ = false;

@@ -77,14 +77,29 @@ int main(int argc, char** argv) {
     app.enable_contours(true, 0.0);
     check_true(app.run_calculation(), "run TIN calculation");
 
-    // 渲染所有 6 个基础标签页 + 深浅色模式 + 3D 视口
+    // 触发完整 AI 全流程诊断与优化 + 专题模块，确保所有叠加图层与 Tab 7 渲染有效
+    check_true(app.compute_haul_action(), "haul action");
+    check_true(app.compute_slope_action(), "slope action");
+    check_true(app.run_ai_full_workflow_action(), "AI full workflow action");
+    check_true(app.grade_opt_result() != nullptr, "grade opt populated");
+    check_true(app.health_report() != nullptr, "health report populated");
+    check_true(app.uncertainty_report() != nullptr, "uncertainty report populated");
+
+    // 渲染全部 7 个标签页（含新增「AI智能」页）
     int min_vtx = 1000000;
-    for (int tab = 0; tab < 6; ++tab) {
+    for (int tab = 0; tab < 7; ++tab) {
         app.set_inspector_tab(tab);
         int vtx = render_one_frame(app);
         min_vtx = std::min(min_vtx, vtx);
         check_true(vtx > 200, "non-empty draw list on tab " + std::to_string(tab));
     }
+
+    // 测试交互测距与测面积工具模式渲染
+    app.set_tool_mode(tin::ui::CadToolMode::MeasureDist);
+    check_true(render_one_frame(app) > 200, "MeasureDist frame renders");
+    app.set_tool_mode(tin::ui::CadToolMode::MeasureArea);
+    check_true(render_one_frame(app) > 200, "MeasureArea frame renders");
+    app.set_tool_mode(tin::ui::CadToolMode::Select);
 
     app.set_dark_mode(false);
     check_true(render_one_frame(app) > 200, "light mode frame renders");
@@ -94,9 +109,18 @@ int main(int argc, char** argv) {
     check_true(render_one_frame(app) > 200, "3D viewport frame renders");
     app.set_3d_view(false);
 
+    // 命令行双语自然语言指令与 Tab 补全检查
     app.execute_command("HELP");
-    app.execute_command("H=50.2");
-    check_true(app.result() != nullptr, "result valid after H=50.2 command");
+    app.execute_command("把标高设为50.2");
+    check_true(app.result() != nullptr, "result valid after Chinese elevation command");
+    app.execute_command("优化总费用");
+    check_true(app.grade_opt_result() != nullptr, "grade opt valid after Chinese command");
+    app.execute_command("检查测点异常");
+    app.execute_command("推荐6个补测点");
+    check_true(app.uncertainty_report() != nullptr && app.uncertainty_report()->recommendations.size() == 6,
+               "Chinese survey rec command sets count=6");
+    auto comps = tin::suggest_command_completions("AI");
+    check_true(comps.size() >= 2, "Tab completion returns AI commands");
 
     // WCAG 2.1 正文对比度校核
     const ImGuiStyle& st = ImGui::GetStyle();

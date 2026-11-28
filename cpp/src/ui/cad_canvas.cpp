@@ -1,4 +1,5 @@
 #include "ui/cad_canvas.hpp"
+#include "core/geometry.hpp"
 #include "ui/theme.hpp"
 #include <algorithm>
 #include <cmath>
@@ -180,6 +181,13 @@ void CadCanvas::focus_triangle(const Triangle& tri) {
     center_y_ = (tri.p0.y + tri.p1.y + tri.p2.y) / 3.0;
 }
 
+void CadCanvas::focus_point(double x, double y, double target_span_m) {
+    center_x_ = x;
+    center_y_ = y;
+    px_per_m_ = std::max(px_per_m_, 600.0 / std::max(5.0, target_span_m));
+    view_initialized_ = true;
+}
+
 std::optional<SurveyPoint> CadCanvas::find_snap_point(
     const ImVec2& mouse, const std::vector<SurveyPoint>& pts,
     const ImVec2& origin, const ImVec2& size, float radius_px) const {
@@ -200,6 +208,7 @@ std::optional<SurveyPoint> CadCanvas::find_snap_point(
 
 void CadCanvas::clear_draft() {
     draft_.clear();
+    measure_pts_.clear();
     profile_first_.reset();
 }
 
@@ -217,7 +226,9 @@ void CadCanvas::render(const ProjectData& project,
                        int& selected_tri_id,
                        const CadCanvasCallbacks& callbacks,
                        const HaulPlanResult* haul,
-                       const SlopeGradingResult* slope) {
+                       const SlopeGradingResult* slope,
+                       const SiteHealthReport* health,
+                       const UncertaintyReport* uncertainty) {
 
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
     ImGui::BeginChild("CadViewportHost", ImVec2(-1, -1), true,
@@ -322,7 +333,7 @@ void CadCanvas::render(const ProjectData& project,
         }
     }
 
-    // 绘图/剖面拾取左右键事件
+    // 绘图/剖面拾取/量测左右键事件
     if (hovered && mouse.x >= view_origin.x && mouse.y >= view_origin.y && tool != CadToolMode::Select) {
         if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
             XY pt = snapped.has_value() ? XY{snapped->x, snapped->y} : screen_to_world(mouse, view_origin, view_size);
@@ -339,12 +350,22 @@ void CadCanvas::render(const ProjectData& project,
                         callbacks.on_profile_picked(a, pt);
                     }
                 }
+            } else if (tool == CadToolMode::MeasureDist || tool == CadToolMode::MeasureArea) {
+                measure_pts_.push_back(pt);
+                if (callbacks.on_status_hint) {
+                    callbacks.on_status_hint(
+                        (tool == CadToolMode::MeasureDist)
+                            ? "测距模式: 左键续点，右键撤销/清空"
+                            : "测面积模式: 左键加顶点（≥3点自动统计闭合面积与区域方量），右键清空");
+                }
             } else {
                 draft_.push_back(pt);
             }
         } else if (ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
             if (tool == CadToolMode::PickProfile) {
                 profile_first_.reset();
+            } else if (tool == CadToolMode::MeasureDist || tool == CadToolMode::MeasureArea) {
+                if (!measure_pts_.empty()) measure_pts_.pop_back();
             } else if (!draft_.empty()) {
                 draft_.pop_back();
             }
@@ -690,6 +711,136 @@ void CadCanvas::render(const ProjectData& project,
         }
     }
 
+    // 10d. 空间异常测点醒目告警叠层
+    if (layers.anomalies && health != nullptr && !health->anomalies.empty()) {
+        ImU32 anom_col = col32(0xEF, 0x44, 0x44, 245);
+        ImU32 warn_col = col32(0xF5, 0x9E, 0x0B, 240);
+        for (const auto& a : health->anomalies) {
+            ImVec2 sp = world_to_screen(a.x, a.y, view_origin, view_size);
+            if (sp.x < view_origin.x - 16 || sp.x > view_end.x + 16 ||
+                sp.y < view_origin.y - 16 || sp.y > view_end.y + 16) continue;
+            ImU32 col = (a.severity >= 2) ? anom_col : warn_col;
+            dl->AddCircle(sp, 9.0f, col, 16, 2.2f);
+            dl->AddLine(ImVec2(sp.x - 5, sp.y - 5), ImVec2(sp.x + 5, sp.y + 5), col, 1.8f);
+            dl->AddLine(ImVec2(sp.x - 5, sp.y + 5), ImVec2(sp.x + 5, sp.y - 5), col, 1.8f);
+            dl->AddText(ImVec2(sp.x + 10.0f, sp.y - 12.0f), col, a.point_id.c_str());
+            if (hovered && std::hypot(mouse.x - sp.x, mouse.y - sp.y) <= 12.0f) {
+                ImGui::SetTooltip("异常点 %s\n实测 Z: %.2f m | 预测 Z: %.2f m\n残差: %+.2f m\n%s",
+                                  a.point_id.c_str(), a.z, a.expected_z, a.residual, a.reason.c_str());
+            }
+        }
+    }
+
+    // 10e. 自适应补测推荐靶标叠层
+    if (layers.survey_recs && uncertainty != nullptr && !uncertainty->recommendations.empty()) {
+        ImU32 rec_col = dark_mode ? col32(0xE8, 0x79, 0xF9, 245) : col32(0x93, 0x33, 0xEA, 245);
+        for (const auto& r : uncertainty->recommendations) {
+            ImVec2 sp = world_to_screen(r.x, r.y, view_origin, view_size);
+            if (sp.x < view_origin.x - 16 || sp.x > view_end.x + 16 ||
+                sp.y < view_origin.y - 16 || sp.y > view_end.y + 16) continue;
+            dl->AddCircle(sp, 8.0f, rec_col, 16, 1.8f);
+            dl->AddLine(ImVec2(sp.x - 10, sp.y), ImVec2(sp.x + 10, sp.y), rec_col, 1.4f);
+            dl->AddLine(ImVec2(sp.x, sp.y - 10), ImVec2(sp.x, sp.y + 10), rec_col, 1.4f);
+            char rtag[16];
+            std::snprintf(rtag, sizeof(rtag), "#%d", r.rank);
+            dl->AddText(ImVec2(sp.x + 9.0f, sp.y + 4.0f), rec_col, rtag);
+            if (hovered && std::hypot(mouse.x - sp.x, mouse.y - sp.y) <= 12.0f) {
+                ImGui::SetTooltip("建议补测 #%d\nX: %.2f  Y: %.2f\n预估 Z: %.2f m\n%s",
+                                  r.rank, r.x, r.y, r.estimated_z, r.reason.c_str());
+            }
+        }
+    }
+
+    // 11b. 交互式 CAD 测距 / 测面积叠层
+    if (!measure_pts_.empty() && (tool == CadToolMode::MeasureDist || tool == CadToolMode::MeasureArea)) {
+        ImU32 mcol = dark_mode ? col32(0xFA, 0xCC, 0x15, 245) : col32(0xB4, 0x53, 0x09, 245);
+        std::vector<XY> pts = measure_pts_;
+        if (hover_valid_) pts.push_back(hover_world_);
+
+        if (tool == CadToolMode::MeasureArea && pts.size() >= 3) {
+            std::vector<ImVec2> spts;
+            spts.reserve(pts.size());
+            for (const auto& q : pts) spts.push_back(world_to_screen(q.x, q.y, view_origin, view_size));
+            draw_polygon_filled(dl, spts, dark_mode ? col32(0xFA, 0xCC, 0x15, 42) : col32(0xD9, 0x77, 0x06, 42));
+        }
+
+        double total_len = 0.0;
+        for (size_t i = 0; i + 1 < pts.size(); ++i) {
+            ImVec2 a = world_to_screen(pts[i].x, pts[i].y, view_origin, view_size);
+            ImVec2 b = world_to_screen(pts[i + 1].x, pts[i + 1].y, view_origin, view_size);
+            draw_dashed_line(dl, a, b, mcol, 2.0f, 6.0f, 4.0f);
+            total_len += std::hypot(pts[i + 1].x - pts[i].x, pts[i + 1].y - pts[i].y);
+        }
+        if (tool == CadToolMode::MeasureArea && pts.size() >= 3) {
+            ImVec2 a = world_to_screen(pts.back().x, pts.back().y, view_origin, view_size);
+            ImVec2 b = world_to_screen(pts.front().x, pts.front().y, view_origin, view_size);
+            draw_dashed_line(dl, a, b, mcol, 1.8f, 6.0f, 4.0f);
+            total_len += std::hypot(pts.front().x - pts.back().x, pts.front().y - pts.back().y);
+        }
+        for (const auto& q : measure_pts_) {
+            dl->AddCircleFilled(world_to_screen(q.x, q.y, view_origin, view_size), 4.0f, mcol);
+        }
+
+        auto sample_z_quick = [&](const XY& q, double& out_z) -> bool {
+            if (result) {
+                for (const auto& t : result->triangles) {
+                    if (t.is_boundary) continue;
+                    if (point_in_tri_xy(q.x, q.y, t)) {
+                        double det = (t.p1.y - t.p2.y) * (t.p0.x - t.p2.x) + (t.p2.x - t.p1.x) * (t.p0.y - t.p2.y);
+                        if (std::abs(det) > 1e-12) {
+                            double l0 = ((t.p1.y - t.p2.y) * (q.x - t.p2.x) + (t.p2.x - t.p1.x) * (q.y - t.p2.y)) / det;
+                            double l1 = ((t.p2.y - t.p0.y) * (q.x - t.p2.x) + (t.p0.x - t.p2.x) * (q.y - t.p2.y)) / det;
+                            double l2 = 1.0 - l0 - l1;
+                            out_z = l0 * t.p0.z + l1 * t.p1.z + l2 * t.p2.z;
+                            return true;
+                        }
+                    }
+                }
+            }
+            return false;
+        };
+
+        char mbuf[160]{};
+        if (tool == CadToolMode::MeasureDist && pts.size() >= 2) {
+            double za = 0.0, zb = 0.0;
+            bool ok_a = sample_z_quick(pts.front(), za);
+            bool ok_b = sample_z_quick(pts.back(), zb);
+            double seg = std::hypot(pts.back().x - pts[pts.size() - 2].x, pts.back().y - pts[pts.size() - 2].y);
+            if (ok_a && ok_b && total_len > 1e-6) {
+                double dz = zb - za;
+                double slope_pct = dz / total_len * 100.0;
+                std::snprintf(mbuf, sizeof(mbuf), "总长 %.2f m (末段 %.2f m) | ΔZ=%+.2f m | 坡度 %+.2f%%",
+                              total_len, seg, dz, slope_pct);
+            } else {
+                std::snprintf(mbuf, sizeof(mbuf), "水平总长 %.2f m (末段 %.2f m)", total_len, seg);
+            }
+        } else if (tool == CadToolMode::MeasureArea && pts.size() >= 3) {
+            double area = std::abs(signed_area(pts));
+            double local_cut = 0.0, local_fill = 0.0;
+            if (result) {
+                for (const auto& t : result->triangles) {
+                    if (t.is_boundary) continue;
+                    XY tc{(t.p0.x + t.p1.x + t.p2.x) / 3.0, (t.p0.y + t.p1.y + t.p2.y) / 3.0};
+                    if (point_in_ring(tc, pts)) {
+                        local_cut += t.cut_volume;
+                        local_fill += t.fill_volume;
+                    }
+                }
+            }
+            std::snprintf(mbuf, sizeof(mbuf), "面积 %.1f m² (%.2f 亩) | 周长 %.1f m | 圈内挖 %.0f / 填 %.0f m³",
+                          area, area / 666.6667, total_len, local_cut, local_fill);
+        }
+        if (mbuf[0] != '\0') {
+            ImVec2 anchor = world_to_screen(pts.back().x, pts.back().y, view_origin, view_size);
+            ImVec2 tsz = ImGui::CalcTextSize(mbuf);
+            ImVec2 bx0(anchor.x + 12, anchor.y - 26);
+            ImVec2 bx1(bx0.x + tsz.x + 12, bx0.y + tsz.y + 8);
+            dl->AddRectFilled(bx0, bx1, col32(0x14, 0x18, 0x1F, 235), 3.0f);
+            dl->AddRect(bx0, bx1, mcol, 3.0f, 0, 1.4f);
+            dl->AddText(ImVec2(bx0.x + 6, bx0.y + 4), col32(0xFF, 0xFF, 0xFF), mbuf);
+        }
+    }
+
     // 11. 交互绘制草稿与橡皮筋预览
     if (!draft_.empty()) {
         ImU32 dcol = (tool == CadToolMode::DrawHole) ? hole_col : (tool == CadToolMode::DrawBreakline ? bl_col : bnd_col);
@@ -769,6 +920,8 @@ void CadCanvas::render(const ProjectData& project,
             {"等高线", c_major_col, layers.contours && result != nullptr},
             {"方格网", grid_line_col, layers.grid && result != nullptr && result->grid_check.has_value()},
             {"计算边界", bnd_col, layers.boundary && !project.boundary.empty()},
+            {"异常测点", col32(0xEF, 0x44, 0x44), layers.anomalies && health != nullptr && !health->anomalies.empty()},
+            {"补测推荐", col32(0xE8, 0x79, 0xF9), layers.survey_recs && uncertainty != nullptr && !uncertainty->recommendations.empty()},
         };
         int active_cnt = 0;
         for (const auto& it : items) if (it.show) ++active_cnt;
@@ -801,6 +954,21 @@ void CadCanvas::render(const ProjectData& project,
             char sbuf[32];
             std::snprintf(sbuf, sizeof(sbuf), "%.4g m", bar_world);
             dl->AddText(ImVec2(b0.x, b0.y - 20.0f), scol, sbuf);
+        }
+
+        // 左上角 CAD 指北针 (North Arrow)
+        {
+            ImVec2 nc(view_origin.x + 26.0f, view_origin.y + 34.0f);
+            ImU32 ncol = dark_mode ? col32(0x94, 0xA3, 0xB8, 220) : col32(0x33, 0x41, 0x55, 220);
+            ImU32 nfill = dark_mode ? col32(0x38, 0xBD, 0xF8, 220) : col32(0x02, 0x84, 0xC7, 220);
+            dl->AddCircle(nc, 14.0f, ncol, 20, 1.2f);
+            dl->AddTriangleFilled(ImVec2(nc.x, nc.y - 13.0f),
+                                  ImVec2(nc.x - 5.0f, nc.y + 4.0f),
+                                  ImVec2(nc.x, nc.y), nfill);
+            dl->AddTriangle(ImVec2(nc.x, nc.y - 13.0f),
+                            ImVec2(nc.x, nc.y),
+                            ImVec2(nc.x + 5.0f, nc.y + 4.0f), ncol, 1.2f);
+            dl->AddText(ImVec2(nc.x - 4.0f, nc.y - 28.0f), nfill, "N");
         }
     }
 

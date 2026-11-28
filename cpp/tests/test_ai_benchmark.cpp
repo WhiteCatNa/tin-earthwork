@@ -377,12 +377,28 @@ int main(int argc, char** argv) {
     app.generate_auto_outline();
     app.set_design_elevation(50.0);
     app.run_calculation();
-    io.DisplaySize = ImVec2(1440.0f, 900.0f);
-    io.DeltaTime = 1.0f / 60.0f;
-    ImGui::NewFrame();
-    app.render();
-    ImGui::Render();
-    bool ui_ok = ImGui::GetDrawData() != nullptr && ImGui::GetDrawData()->CmdListsCount > 0;
+    bool ai_wf_ok = app.run_ai_full_workflow_action();
+    app.set_tool_mode(tin::ui::CadToolMode::MeasureDist);
+    bool measure_ok = (tin::parse_engineering_intent("MEASURE").action == tin::AssistantAction::MeasureDist) &&
+                      (tin::parse_engineering_intent("AREA").action == tin::AssistantAction::MeasureArea);
+    bool tab_comp_ok = tin::suggest_command_completions("AI").size() >= 2 &&
+                       tin::suggest_command_completions("OPT").size() >= 1;
+    int ui_vtx_min = 1000000;
+    for (int tab = 0; tab < 7; ++tab) {
+        app.set_inspector_tab(tab);
+        io.DisplaySize = ImVec2(1440.0f, 900.0f);
+        io.DeltaTime = 1.0f / 60.0f;
+        ImGui::NewFrame();
+        app.render();
+        ImGui::Render();
+        ImDrawData* dd = ImGui::GetDrawData();
+        int vtx = 0;
+        if (dd) {
+            for (int i = 0; i < dd->CmdListsCount; ++i) vtx += dd->CmdLists[i]->VtxBuffer.Size;
+        }
+        ui_vtx_min = std::min(ui_vtx_min, vtx);
+    }
+    bool ui_ok = ai_wf_ok && (ui_vtx_min > 200);
     double contrast = tin::ui::contrast_ratio(
         ImGui::GetStyle().Colors[ImGuiCol_Text],
         ImGui::GetStyle().Colors[ImGuiCol_WindowBg]);
@@ -411,11 +427,11 @@ int main(int argc, char** argv) {
                   << "  \"nl_intent_acc\": " << nl_intent_acc << ",\n"
                   << "  \"robust_passed\": " << robust_passed << ",\n"
                   << "  \"robust_total\": " << robust_total << ",\n"
-                  << "  \"ui_tabs\": 6,\n"
+                  << "  \"ui_tabs\": 7,\n"
                   << "  \"ui_ok\": " << (ui_ok ? "true" : "false") << ",\n"
-                  << "  \"ui_has_ai_tab\": false,\n"
-                  << "  \"ui_has_measure_tool\": false,\n"
-                  << "  \"ui_has_tab_completion\": false,\n"
+                  << "  \"ui_has_ai_tab\": " << (ai_wf_ok ? "true" : "false") << ",\n"
+                  << "  \"ui_has_measure_tool\": " << (measure_ok ? "true" : "false") << ",\n"
+                  << "  \"ui_has_tab_completion\": " << (tab_comp_ok ? "true" : "false") << ",\n"
                   << "  \"ui_contrast\": " << contrast << "\n"
                   << "}\n";
     } else {

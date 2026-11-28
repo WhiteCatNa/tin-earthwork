@@ -1,5 +1,7 @@
 #pragma once
 
+#include "core/ai_assistant.hpp"
+#include "core/ai_optimizer.hpp"
 #include "core/analysis.hpp"
 #include "core/calculator.hpp"
 #include "core/engineering.hpp"
@@ -45,7 +47,14 @@ public:
     bool compute_strata_action();
     bool compute_haul_action();
     bool compute_slope_action();
+    bool run_grade_optimization_action();
+    bool apply_optimized_plane_action();
+    bool run_anomaly_diagnosis_action();
+    bool clean_anomalies_action();
+    bool run_uncertainty_action();
+    bool run_ai_full_workflow_action();
     void set_3d_view(bool enabled);
+    void set_tool_mode(CadToolMode mode);
     bool generate_quick_profile(bool horizontal = true);
 
     void set_inspector_tab(int idx);
@@ -55,6 +64,10 @@ public:
     void zoom_extents();
 
     const CalculationResult* result() const { return result_ ? &(*result_) : nullptr; }
+    const GradeOptimizationResult* grade_opt_result() const { return grade_opt_result_ ? &(*grade_opt_result_) : nullptr; }
+    const SiteHealthReport* health_report() const { return health_report_ ? &(*health_report_) : nullptr; }
+    const UncertaintyReport* uncertainty_report() const { return uncertainty_report_ ? &(*uncertainty_report_) : nullptr; }
+    const DiagnosisSummary* diagnosis_summary() const { return diagnosis_summary_ ? &(*diagnosis_summary_) : nullptr; }
     const ProjectData& project() const { return project_; }
     double min_z() const { return min_nat_z_; }
     double max_z() const { return max_nat_z_; }
@@ -78,6 +91,7 @@ private:
     void render_tab_profile();
     void render_tab_boundary();
     void render_tab_engineering();
+    void render_tab_ai();
     void render_command_console(float height);
     void render_status_bar(float height);
     void render_modals();
@@ -121,6 +135,10 @@ private:
     std::optional<StrataResult> strata_result_;
     std::optional<HaulPlanResult> haul_result_;
     std::optional<SlopeGradingResult> slope_result_;
+    std::optional<GradeOptimizationResult> grade_opt_result_;
+    std::optional<SiteHealthReport> health_report_;
+    std::optional<UncertaintyReport> uncertainty_report_;
+    std::optional<DiagnosisSummary> diagnosis_summary_;
     std::optional<std::string> current_project_path_;
 
     CadCanvas canvas_;
@@ -162,11 +180,17 @@ private:
     double slope_cut_ratio_ = 1.0;
     double slope_fill_ratio_ = 1.5;
 
+    HaulCostParams cost_params_;
+    GradeOptConstraints opt_constraints_;
+    int recommend_count_ = 8;
+    double measure_sigma_ = 0.03;
+
     struct EditSnapshot {
         std::vector<XY> boundary;
         std::vector<std::vector<XY>> holes;
         std::vector<Breakline> breaklines;
         CalculationSettings settings;
+        std::optional<std::vector<SurveyPoint>> points;
     };
     std::vector<EditSnapshot> undo_stack_;
     std::vector<EditSnapshot> redo_stack_;
