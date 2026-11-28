@@ -2,19 +2,36 @@
 
 基于 TIN（不规则三角网）的土方工程量自动计算桌面应用，适用于施工现场测量数据的土方挖填量精确计算。现同时提供 **Python 桌面版** 与 **原生 C++20 南方CASS 风格 CAD 工作站版（`cpp/`）**。
 
-## 原生 C++20 南方CASS 工作站版（`cpp/`）
+## 原生 C++20 南方CASS 工作站版（`cpp/`，v3.10.0）
 
-- **技术架构**：C++20 + Win32 + Direct3D 11 + Dear ImGui，单文件静态链接，无外部运行时依赖。
-- **界面风格**：仿照 **南方CASS 10/11** 深色工程 CAD 工作站布局（顶部菜单/工具栏 + 左侧可折叠屏幕菜单 + 中央黑底模型/白底布局交互画布 + 右侧五标签属性页 + 底部 CAD 命令控制台与状态栏）。
+- **技术架构**：C++20 + Dear ImGui（Windows 原生 Win32 + Direct3D 11 静态链接；macOS/Linux 原生支持无头/核心与 UI 回归编译测试）。
+- **界面风格**：仿照 **南方CASS 10/11** 深色工程 CAD 工作站布局（顶部菜单/快捷工具栏 + 左侧可折叠屏幕菜单 + 中央黑底模型/白底出图交互画布 + **3D 实景视口** + 右侧 **7 标签属性页含 `AI智能`** + 底部双语 CAD 命令控制台与状态栏）。
 - **核心算法对齐与性能实测**（`test_data_1000.xlsx`，1000 测点，设计高程 `50.0 m`）：
-  - **精度对齐**：C++ 版挖方 `3569.3644 m³` / 填方 `3876.4035 m³`，与 Python SciPy 核心版（`3569.3669 m³` / `3876.4042 m³`）相对偏差 `< 0.0001%`。
-  - **计算速度**：C++20 单次构网与算量约 `1.0 ~ 1.2 ms`，较 Python 版（`41 ~ 54 ms`）提速约 **40 倍**。
-- **快速构建（Windows MinGW-w64 / MSVC + CMake）**：
+  - **精度对齐**：C++ 版挖方 `3569.3644 m³` / 填方 `3876.4035 m³`，与 Python SciPy 核心版相对偏差 `< 0.0001%`。
+  - **构网与算量速度**：带 X-排序扫描剔除的 Bowyer-Watson TIN + 平板算量约 `1.9 ms`；SPFA 最小费用最大流土方调配约 `0.04 ~ 0.07 ms`。
+- **v3.x 新增 AI 工程智能与实用工具矩阵**（见 [cpp/ITERATION_GOAL.md](cpp/ITERATION_GOAL.md) 与 [docs/cpp_iteration_log.md](docs/cpp_iteration_log.md)）：
+  - **SPFA 精确土方调配 + 设计面联合费用优化**（`OPT` / `AIOPT`）：联合搜寻基准高程与双向排水坡度 $(H_0, i_x, i_y)$，融合挖填、跨区调配与弃/借土综合费用，较单平场显著降本。
+  - **$O(N)$ 空间网格测点异常诊断与自动修复**（`DIAG` / `CLEAN`）：2 遍 IRLS 局部最小二乘拟合检出高程突刺、深坑、坐标飞点与重合冲突点并支持一键局部修复（5,041 点规模扫描 `< 5 ms`）。
+  - **不确定度评定与自适应补测点推荐**（`UNCERT`）：Richardson 抽稀外推偏差修正 + 曲率-面积误差尺度贪心补测建议。
+  - **分裂共形变化显著性 LoD / 保精度点云抽稀 / 排水积水风险分析 / 标高敏感性曲线**（`SIGNIF` / `THIN` / `DRAIN` / `SENSITIVITY`）。
+  - **双级台阶斜坡平场优化 + 施工机械排班与工期台班估算**（`BENCH` / `FLEET`）：结合挡土墙/护坡造价自动比选两级台阶方案，并在 2D CAD 视口叠绘台阶分界线与标高徽标。
+  - **双语自然语言 CAD 控制台与 Tab 自动补全**（如 `"把标高设为50.8"`、`"优化总费用"`、`"推荐8个补测点"`、`"导出工程量清单报价表"`）。
+  - **完整成果交付导出**：`EXP_BOQ`（工程量清单报价表 CSV）、`HTMLRPT`（含内嵌 SVG 对照图与台阶/机械卡片的 HTML 决策报告）、`EXP_REC`（补测点 CSV）、`EXP_AIDXF`（AI 专题 R12 DXF 图层）。
+- **跨平台构建、全量测试与目标评分验证**：
+  ```bash
+  # macOS / Linux（核心库 + 33 项核心单元测试 + 无头 UI 回归 + AI 基准与评分）
+  python3 tools/eval_cpp_goal.py
+
+  # 地址/未定义行为消毒器 (ASan + UBSan) 审计
+  cmake -S cpp -B cpp/build_asan -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+    -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer" \
+    -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
+  cmake --build cpp/build_asan -j8
+  ctest --test-dir cpp/build_asan --output-on-failure
+  ```
   ```powershell
-  cmake -S cpp -B cpp/build -G Ninja -DCMAKE_BUILD_TYPE=Release
-  cmake --build cpp/build
-  ctest --test-dir cpp/build --output-on-failure
-  # 运行桌面端或命令行自动化演示截图：
+  # Windows (MinGW-w64 / MSVC + CMake 一键脚本)
+  .\cpp\build_windows.ps1
   .\cpp\build\tin_earthwork_cass.exe --demo test_data_1000.xlsx --capture-dir ./cpp_shots
   ```
 

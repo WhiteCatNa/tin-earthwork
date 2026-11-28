@@ -152,3 +152,31 @@ _以下各轮记录均由 `python3 tools/eval_cpp_goal.py` 真实编译、运行
 - CTest: **3/3 PASS** (Core 33/33 PASS)
 
 - **下一步持续迭代方向**：进入 `v3.10.0`（全量 ASan + UBSan 内存/未定义行为审计、Windows 跨平台构建配置复核、`README.md` 与 `v3.0.0-alpha → v3.10.0` 总览收尾）。
+
+---
+
+## Iteration 10 — 全量 ASan+UBSan 审计、跨平台构建复核与文档收尾 (v3.10.0)
+
+### 改动清单
+1. **AddressSanitizer + UndefinedBehaviorSanitizer 全量审计**
+   - 在 `cpp/build_asan` 使用 `-fsanitize=address,undefined -fno-omit-frame-pointer` 全量编译并通过 `ctest --test-dir cpp/build_asan --output-on-failure`（**3/3 PASS**，覆盖 33 项核心单元测试含 5,041 点压力测试、双级台阶/机械排班、BOQ/HTML/DXF 导出、无头 CAD/UI 渲染与 WCAG 对比度校验及 AI 基准评测；审计完毕已清理临时 `cpp/build_asan` 目录）。
+2. **Windows 跨平台构建守卫复核**
+   - 核查 `cpp/src/` 下全部 `#ifdef _WIN32` 平台守卫及 [cpp/build_windows.ps1](cpp/build_windows.ps1)，确认无未封装的 POSIX/macOS 专属系统调用，`tin_earthwork_cass` 通过 `tin_earthwork_core` + `tin_earthwork_ui_lib` 自动包含全部 v3.x 新增模块。
+3. **工程文档完善** (`README.md`, `docs/cpp_iteration_log.md`)
+   - 更新 `README.md` 补充 `v3.x` 原生 C++20 AI 智能工作站架构、工具指令矩阵、ASan/UBSan 及跨平台验证说明，并建立完整十轮迭代总表。
+
+### 完整递归迭代演进总表 (`v3.0.0-alpha → v3.10.0`)
+
+| 版本 | 迭代主题 | 核心交付物 | 评分 / 状态 |
+| --- | --- | --- | --- |
+| `v3.0.0-alpha` | 跨平台基线与北极星目标 | `#ifdef _WIN32` 守卫、`ITERATION_GOAL.md`、`eval_cpp_goal.py` | 33.00 / 100 |
+| `v3.1.0` | 算法核心与精确优化 | X-排序扫描 TIN、SPFA 最小费用流调配、联合费用优化器 `OPT` | 61.00 / 100 |
+| `v3.2.0` | 智能工程感知与助手 | 2-Pass IRLS 异常检测/修复、Richardson 不确定度与补测推荐、双语 NL 助手 | 89.00 / 100 |
+| `v3.3.0` | 南方CASS 工作站 UI/UX | Tab7 `AI智能`、测距/测面积工具、异常/补测图层与 Tooltip、Tab 补全 | 100.00 / 100 |
+| `v3.4.0` | 鲁棒性与首轮 ASan 审计 | Test 25 极端边界单价/退化几何用例、3 种子随机基线对比、ASan+UBSan Clean | 100.00 / 100 |
+| `v3.5.0` | 高级地形实用智能工具 | 分裂共形显著性 LoD、保精度抽稀、排水坡度与积水风险分析 | 100.00 / 100 |
+| `v3.6.0` | 专题交付与 3D 联动 | AI 专题 DXF/补测 CSV/HTML 决策报告导出、3D 视口图例与立体标柱 | 100.00 / 100 |
+| `v3.7.0` | 空间网格加速与敏感性曲线 | $O(N)$ `SpatialGrid2D` 加速 5,041 点扫描、17 档标高敏感性曲线及图表 | 100.00 / 100 |
+| `v3.8.0` | 台阶平场与施工排班估算 | 双级台阶含挡墙联合优化 `BENCH`、施工机械集群与工期台班估算 `FLEET` | 100.00 / 100 |
+| `v3.9.0` | 图表导出闭环升级 | 2D CAD 台阶分界线与徽标图层、BOQ 工程量报价清单导出 `EXP_BOQ` | 100.00 / 100 |
+| `v3.10.0` | 审计收尾与文档总览 | 全量 ASan+UBSan (3/3 PASS, 10.96s)、Win32 复核、`README.md` 完善 | **100.00 / 100** |
