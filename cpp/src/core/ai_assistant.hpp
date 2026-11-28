@@ -49,6 +49,7 @@ enum class AssistantAction {
     ExportHtmlReport,
     ExportSurveyRecCsv,
     ExportAiDxf,
+    ExportBoqCsv,
     Undo,
     Redo,
     ClearConsole

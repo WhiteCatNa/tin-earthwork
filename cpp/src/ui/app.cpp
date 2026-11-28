@@ -1164,6 +1164,7 @@ void CassApp::execute_command(const std::string& raw_cmd) {
         log_cmd("专题与绘图   : STRATA | HAUL | SLOPE | GRID | CONTOUR | PROFILE | MEASURE | AREA | 3D | 2D | ZE");
         log_cmd("AI 智能指令  : OPT/AIOPT(联合费用优化) | DIAG/ANOMALY(异常体检) | CLEAN(修复粗差) | UNCERT(补测推荐)");
         log_cmd("实用分析指令 : SIGNIF(共形LoD) | THIN(抽稀) | DRAIN(排水) | SENSITIVITY(敏感性) | BENCH(双级台阶) | FLEET(机械工期)");
+        log_cmd("智能成果导出 : HTMLRPT(决策报告) | EXP_REC(补测点CSV) | EXP_AIDXF(AI图层) | EXP_BOQ(工程量报价清单CSV)");
         log_cmd("自然语言示例 : \"把标高设为50.8\" | \"优化总费用\" | \"检查测点异常\" | \"推荐10个补测点\" | \"放坡 1:1.2 1:1.5\"");
         log_cmd("视图与编辑   : DARK | LIGHT | SWAP | UNDO | REDO | DAT | DXF | CLEAR (支持 Tab 自动补全)");
         break;
@@ -1315,6 +1316,9 @@ void CassApp::execute_command(const std::string& raw_cmd) {
         break;
     case AssistantAction::ExportAiDxf:
         action_export_ai_dxf();
+        break;
+    case AssistantAction::ExportBoqCsv:
+        action_export_boq_csv();
         break;
     case AssistantAction::Undo:
         undo();
@@ -1560,7 +1564,9 @@ void CassApp::action_export_ai_report_html() {
                 significance_report_ ? &(*significance_report_) : nullptr,
                 drainage_report_ ? &(*drainage_report_) : nullptr,
                 diagnosis_summary_ ? &(*diagnosis_summary_) : nullptr,
-                *p);
+                *p,
+                stepped_result_ ? &(*stepped_result_) : nullptr,
+                fleet_result_ ? &(*fleet_result_) : nullptr);
             status_text_ = "已导出 HTML 智能决策报告: " + *p;
             log_cmd("命令: HTMLRPT -> " + status_text_);
         } catch (const std::exception& e) {
@@ -1603,6 +1609,31 @@ void CassApp::action_export_ai_dxf() {
             log_cmd("命令: EXP_AIDXF -> " + status_text_);
         } catch (const std::exception& e) {
             status_text_ = std::string("导出 AI DXF 失败: ") + e.what();
+            log_cmd("错误: " + status_text_);
+        }
+    }
+}
+
+void CassApp::action_export_boq_csv() {
+    if (!result_) {
+        if (!run_calculation()) return;
+    }
+    static const wchar_t filter[] = L"CSV 文件 (*.csv)\0*.csv\0\0";
+    if (auto p = save_file_dialog(L"导出工程量清单报价表 (BOQ CSV)", filter, L"csv", project_.project_name + "_工程量报价清单.csv")) {
+        try {
+            export_boq_csv(
+                project_,
+                *result_,
+                haul_result_ ? &(*haul_result_) : nullptr,
+                cost_params_,
+                slope_result_ ? &(*slope_result_) : nullptr,
+                stepped_result_ ? &(*stepped_result_) : nullptr,
+                fleet_result_ ? &(*fleet_result_) : nullptr,
+                *p);
+            status_text_ = "已导出工程量清单报价表: " + *p;
+            log_cmd("命令: EXP_BOQ -> " + status_text_);
+        } catch (const std::exception& e) {
+            status_text_ = std::string("导出工程量报价表失败: ") + e.what();
             log_cmd("错误: " + status_text_);
         }
     }
@@ -1759,6 +1790,7 @@ void CassApp::render_menu_bar() {
         if (ImGui::MenuItem("导出 AI 智能决策报告 (HTML)...")) action_export_ai_report_html();
         if (ImGui::MenuItem("导出补测推荐点表 (CSV)...")) action_export_survey_rec_csv();
         if (ImGui::MenuItem("导出 AI 专题图层 (DXF)...")) action_export_ai_dxf();
+        if (ImGui::MenuItem("导出工程量清单报价表 (BOQ CSV)...")) action_export_boq_csv();
         ImGui::EndMenu();
     }
 
@@ -2059,6 +2091,7 @@ void CassApp::render_layer_strip() {
     ImGui::SameLine(); ImGui::Checkbox("放坡", &canvas_.layers.slope);
     ImGui::SameLine(); ImGui::Checkbox("异常点", &canvas_.layers.anomalies);
     ImGui::SameLine(); ImGui::Checkbox("补测点", &canvas_.layers.survey_recs);
+    ImGui::SameLine(); ImGui::Checkbox("台阶", &canvas_.layers.stepped);
     ImGui::SameLine(); ImGui::Checkbox("捕捉", &canvas_.osnap_enabled);
 
     ImGui::EndChild();
@@ -2105,8 +2138,9 @@ void CassApp::render_center_viewport(float width, float height) {
     } else {
         const HaulPlanResult* haul_ptr = haul_result_ ? &(*haul_result_) : nullptr;
         const SlopeGradingResult* slope_ptr = slope_result_ ? &(*slope_result_) : nullptr;
+        const SteppedPlatformResult* stepped_ptr = stepped_result_ ? &(*stepped_result_) : nullptr;
         canvas_.render(project_, res_ptr, profile_line_, selected_tri_id_, callbacks,
-                       haul_ptr, slope_ptr, health_ptr, uncert_ptr);
+                       haul_ptr, slope_ptr, health_ptr, uncert_ptr, stepped_ptr);
     }
 
     ImGui::EndChild();
@@ -2781,6 +2815,9 @@ void CassApp::render_tab_ai() {
     if (ImGui::Button("导出补测 CSV", ImVec2(-1, 0))) action_export_survey_rec_csv();
     if (ImGui::Button("导出 AI 专题 DXF 图层 (异常/补测/调配/放坡)", ImVec2(-1, 0))) {
         action_export_ai_dxf();
+    }
+    if (ImGui::Button("导出工程量报价表 CSV (BOQ)", ImVec2(-1, 0))) {
+        action_export_boq_csv();
     }
 
     ImGui::Spacing();

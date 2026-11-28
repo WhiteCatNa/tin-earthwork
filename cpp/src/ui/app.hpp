@@ -137,6 +137,7 @@ private:
     void action_export_ai_report_html();
     void action_export_survey_rec_csv();
     void action_export_ai_dxf();
+    void action_export_boq_csv();
 
     [[maybe_unused]] NativeWindowHandle hwnd_ = nullptr;
     ThemeFonts fonts_;

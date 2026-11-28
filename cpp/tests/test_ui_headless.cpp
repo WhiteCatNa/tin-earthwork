@@ -131,6 +131,8 @@ int main(int argc, char** argv) {
                "significance, thinning, drainage, sensitivity, stepped, fleet reports populated");
     app.set_inspector_tab(6);
     check_true(render_one_frame(app) > 200, "AI tab with sensitivity curve renders");
+    app.set_inspector_tab(0);
+    check_true(render_one_frame(app) > 200, "CAD viewport with stepped divider overlay renders");
     auto comps = tin::suggest_command_completions("AI");
     check_true(comps.size() >= 2, "Tab completion returns AI commands");
 

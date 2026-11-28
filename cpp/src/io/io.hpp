@@ -58,6 +58,17 @@ void export_ai_report_html(
     const SignificanceReport* significance,
     const DrainageReport* drainage,
     const DiagnosisSummary* diagnosis,
+    const std::string& utf8_path,
+    const SteppedPlatformResult* stepped = nullptr,
+    const FleetEstimateResult* fleet = nullptr);
+void export_boq_csv(
+    const ProjectData& project,
+    const CalculationResult& result,
+    const HaulPlanResult* haul,
+    const HaulCostParams& costs,
+    const SlopeGradingResult* slope,
+    const SteppedPlatformResult* stepped,
+    const FleetEstimateResult* fleet,
     const std::string& utf8_path);
 
 // 高清 PNG 保存（用于成果图导出与实机截图）

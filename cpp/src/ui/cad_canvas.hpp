@@ -37,6 +37,7 @@ struct LayerVisibility {
     bool slope = true;
     bool anomalies = true;
     bool survey_recs = true;
+    bool stepped = true;
 };
 
 struct CadCanvasCallbacks {
@@ -68,7 +69,8 @@ public:
                 const HaulPlanResult* haul = nullptr,
                 const SlopeGradingResult* slope = nullptr,
                 const SiteHealthReport* health = nullptr,
-                const UncertaintyReport* uncertainty = nullptr);
+                const UncertaintyReport* uncertainty = nullptr,
+                const SteppedPlatformResult* stepped = nullptr);
 
     // 交互绘制草稿控制
     void clear_draft();

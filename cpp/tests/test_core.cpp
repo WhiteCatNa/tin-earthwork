@@ -910,6 +910,52 @@ int main(int argc, char** argv) {
         check_true(f_long.trucks_needed >= f_short.trucks_needed, "longer haul requires >= trucks");
     });
 
+    // 33. BOQ 工程量清单报价表 CSV 与增强版 HTML 智能决策报告导出校验
+    run_test("33_boq_csv_and_enhanced_html_report_roundtrip", [&]() {
+        auto slope_pts = make_grid_points(10, 10, 12.0, [](double x, double y) {
+            return 15.0 + 0.12 * x + 0.015 * y + 0.5 * std::sin(0.04 * y);
+        });
+        tin::TINEarthworkCalculator calc(22.0);
+        calc.add_points(slope_pts);
+        auto res = calc.run_full_calculation();
+        auto haul = tin::compute_haul_plan(res, 4, 3);
+        auto slope = tin::compute_slope_grading(calc, 1.0, 1.5, 4.0);
+        auto stepped = tin::optimize_stepped_platform(calc, tin::HaulCostParams{}, 180.0);
+        auto fleet = tin::estimate_earthwork_fleet(res, &haul);
+
+        tin::ProjectData proj;
+        proj.project_name = "BOQ_Verify";
+        proj.points = slope_pts;
+
+        auto tmp = std::filesystem::temp_directory_path() / L"tin_earthwork_cpp_tests";
+        std::filesystem::create_directories(tmp);
+        std::string boq_p = tin::wide_to_utf8((tmp / L"boq.csv").wstring());
+        std::string html_p = tin::wide_to_utf8((tmp / L"ai_report_full.html").wstring());
+
+        tin::export_boq_csv(proj, res, &haul, tin::HaulCostParams{}, &slope, &stepped, &fleet, boq_p);
+        tin::export_ai_report_html(proj, &res, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+                                   html_p, &stepped, &fleet);
+
+        auto read_all = [](const std::string& p) {
+            std::ifstream ifs(std::filesystem::path(tin::utf8_to_wide(p)), std::ios::binary);
+            return std::string((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
+        };
+        std::string boq_s = read_all(boq_p);
+        std::string html_s = read_all(html_p);
+
+        check_true(boq_s.find("场地平整一般土方开挖") != std::string::npos &&
+                   boq_s.find("直接工程费用汇总") != std::string::npos &&
+                   boq_s.find("双级台阶") != std::string::npos &&
+                   boq_s.find("机械集群") != std::string::npos,
+                   "BOQ CSV contains earthwork items, totals, stepped & fleet references");
+        check_true(html_s.find("双级台阶斜坡平场对比") != std::string::npos &&
+                   html_s.find("施工机械排班与工期台班") != std::string::npos,
+                   "Enhanced HTML report includes stepped & fleet sections");
+
+        auto boq_intent = tin::parse_engineering_intent("导出工程量清单报价表");
+        check_true(boq_intent.action == tin::AssistantAction::ExportBoqCsv, "BOQ Chinese intent recognized");
+    });
+
     std::cout << "=== Summary: PASSED " << g_passed << " / " << (g_passed + g_failed) << " ===\n";
     return g_failed == 0 ? 0 : 1;
 }

@@ -1375,7 +1375,9 @@ void export_ai_report_html(
     const SignificanceReport* significance,
     const DrainageReport* drainage,
     const DiagnosisSummary* diagnosis,
-    const std::string& utf8_path) {
+    const std::string& utf8_path,
+    const SteppedPlatformResult* stepped,
+    const FleetEstimateResult* fleet) {
     auto esc = [](const std::string& s) {
         std::string r;
         r.reserve(s.size());
@@ -1488,8 +1490,101 @@ void export_ai_report_html(
         os << "</ul>";
     }
 
+    if (stepped) {
+        os << "<h2>6. 双级台阶斜坡平场对比</h2>"
+           << "<p>" << esc(stepped->summary) << "</p>"
+           << "<table><tr><th>指标</th><th>单平场平衡 H0</th><th>双级台阶最优</th></tr>"
+           << "<tr><td>设计标高 (m)</td><td>" << stepped->single_pad_elevation
+           << "</td><td>H1=" << stepped->bench1_elevation << " / H2=" << stepped->bench2_elevation << "</td></tr>"
+           << "<tr><td>土方及挡墙造价 (元)</td><td>" << stepped->single_pad_cost
+           << "</td><td><b>" << stepped->total_cost << "</b> (省 " << stepped->savings_pct << "%)</td></tr></table>";
+    }
+
+    if (fleet) {
+        os << "<h2>7. 施工机械排班与工期台班</h2>"
+           << "<p>" << esc(fleet->summary) << "</p>"
+           << "<table><tr><th>挖机 (台)</th><th>自卸车 (辆)</th><th>压实机组 (套)</th><th>平均运距 (m)</th><th>预计工期 (天)</th><th>机械台班费 (元)</th></tr>"
+           << "<tr><td>" << fleet->excavators_needed << "</td><td>" << fleet->trucks_needed
+           << "</td><td>" << fleet->compaction_sets << "</td><td>" << fleet->avg_haul_dist_m
+           << "</td><td>" << fleet->estimated_days << "</td><td><b>" << fleet->total_machine_cost
+           << "</b></td></tr></table>";
+    }
+
     os << "</body></html>";
     write_utf8_text(utf8_path, os.str(), false);
+}
+
+void export_boq_csv(
+    const ProjectData& project,
+    const CalculationResult& result,
+    const HaulPlanResult* haul,
+    const HaulCostParams& costs,
+    const SlopeGradingResult* slope,
+    const SteppedPlatformResult* stepped,
+    const FleetEstimateResult* fleet,
+    const std::string& utf8_path) {
+    std::ostringstream os;
+    os << std::fixed << std::setprecision(2);
+    os << "项号,分部分项工程及费用名称,单位,工程量,综合单价(元),合价(元),工程备注\n";
+
+    int idx = 1;
+    double grand_total = 0.0;
+    auto emit = [&](const std::string& name, const std::string& unit, double qty,
+                    double price, double amt, const std::string& note, bool add_total = true) {
+        os << idx++ << ",\"" << name << "\"," << unit << "," << qty << "," << price << "," << amt
+           << ",\"" << note << "\"\n";
+        if (add_total) grand_total += amt;
+    };
+
+    double cut_amt = result.total_cut * costs.cut_unit_cost;
+    double fill_amt = result.total_fill * costs.fill_unit_cost;
+    emit("场地平整一般土方开挖", "m3", result.total_cut, costs.cut_unit_cost, cut_amt,
+         "工程: " + project.project_name + " (TIN法计算面积 " + std::to_string(static_cast<long long>(result.computed_area)) + " m2)");
+    emit("场地土方回填分层碾压", "m3", result.total_fill, costs.fill_unit_cost, fill_amt,
+         "压实系数参考 " + std::to_string(result.soil_balance.factors.compact));
+
+    if (haul) {
+        if (haul->cross_zone_hauled > 1e-3) {
+            double haul_rate = (haul->avg_haul_distance / 100.0) * costs.haul_per_m3_100m;
+            double haul_amt = haul->cross_zone_hauled * haul_rate;
+            emit("场内跨区平衡土方转运", "m3", haul->cross_zone_hauled, haul_rate, haul_amt,
+                 "加权平均运距 " + std::to_string(static_cast<int>(std::llround(haul->avg_haul_distance))) + " m");
+        }
+        if (haul->export_surplus > 1e-3) {
+            double exp_amt = haul->export_surplus * costs.export_unit_cost;
+            emit("余土弃土外运消纳", "m3", haul->export_surplus, costs.export_unit_cost, exp_amt,
+                 "场内富余土方外运");
+        }
+        if (haul->borrow_deficit > 1e-3) {
+            double bor_amt = haul->borrow_deficit * costs.borrow_unit_cost;
+            emit("场外合格土源借土填筑", "m3", haul->borrow_deficit, costs.borrow_unit_cost, bor_amt,
+                 "场内亏缺土方外购/外借");
+        }
+    }
+
+    if (slope && (slope->slope_cut_volume > 1e-3 || slope->slope_fill_volume > 1e-3)) {
+        double sc_amt = slope->slope_cut_volume * costs.cut_unit_cost;
+        double sf_amt = slope->slope_fill_volume * costs.fill_unit_cost;
+        emit("周边边坡挖方修坡", "m3", slope->slope_cut_volume, costs.cut_unit_cost, sc_amt,
+             "边坡比 1:" + std::to_string(slope->cut_ratio));
+        emit("周边边坡填方刷坡压实", "m3", slope->slope_fill_volume, costs.fill_unit_cost, sf_amt,
+             "边坡比 1:" + std::to_string(slope->fill_ratio));
+    }
+
+    if (stepped && stepped->step_wall_cost > 1e-3) {
+        double wall_area = stepped->split_length * stepped->step_height;
+        emit("【比选参考】双级台阶挡墙/护坡支护", "m2", wall_area, stepped->wall_cost_per_m2,
+             stepped->step_wall_cost, stepped->summary, false);
+    }
+
+    if (fleet && fleet->total_machine_cost > 1e-3) {
+        double day_cost = fleet->total_machine_cost / std::max(0.5, fleet->estimated_days);
+        emit("【施工参考】土方机械集群台班租赁", "天", fleet->estimated_days, day_cost,
+             fleet->total_machine_cost, fleet->summary, false);
+    }
+
+    os << "合计,\"直接工程费用汇总\",元,,,," << grand_total << "\n";
+    write_utf8_text(utf8_path, os.str(), true);
 }
 
 void save_rgba_png(const std::uint8_t* rgba, int width, int height, const std::string& utf8_path) {

@@ -228,7 +228,8 @@ void CadCanvas::render(const ProjectData& project,
                        const HaulPlanResult* haul,
                        const SlopeGradingResult* slope,
                        const SiteHealthReport* health,
-                       const UncertaintyReport* uncertainty) {
+                       const UncertaintyReport* uncertainty,
+                       const SteppedPlatformResult* stepped) {
 
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
     ImGui::BeginChild("CadViewportHost", ImVec2(-1, -1), true,
@@ -751,6 +752,51 @@ void CadCanvas::render(const ProjectData& project,
         }
     }
 
+    // 10f. 双级台阶分界线及级差标高徽标
+    if (layers.stepped && stepped != nullptr && stepped->step_height > 1e-3 && !project.points.empty()) {
+        double bx0 = project.points[0].x, bx1 = bx0;
+        double by0 = project.points[0].y, by1 = by0;
+        for (const auto& p : project.points) {
+            bx0 = std::min(bx0, p.x); bx1 = std::max(bx1, p.x);
+            by0 = std::min(by0, p.y); by1 = std::max(by1, p.y);
+        }
+        ImVec2 a{}, b{}, b1p{}, b2p{};
+        if (stepped->split_axis == 0) {
+            a = world_to_screen(stepped->split_coord, by0, view_origin, view_size);
+            b = world_to_screen(stepped->split_coord, by1, view_origin, view_size);
+            b1p = world_to_screen(0.5 * (bx0 + stepped->split_coord), 0.5 * (by0 + by1), view_origin, view_size);
+            b2p = world_to_screen(0.5 * (stepped->split_coord + bx1), 0.5 * (by0 + by1), view_origin, view_size);
+        } else {
+            a = world_to_screen(bx0, stepped->split_coord, view_origin, view_size);
+            b = world_to_screen(bx1, stepped->split_coord, view_origin, view_size);
+            b1p = world_to_screen(0.5 * (bx0 + bx1), 0.5 * (by0 + stepped->split_coord), view_origin, view_size);
+            b2p = world_to_screen(0.5 * (bx0 + bx1), 0.5 * (stepped->split_coord + by1), view_origin, view_size);
+        }
+        ImU32 step_col = dark_mode ? col32(0xFA, 0xCC, 0x15, 245) : col32(0xD9, 0x77, 0x06, 245);
+        ImU32 badge_bg = dark_mode ? col32(0x14, 0x18, 0x1F, 225) : col32(0xFF, 0xFF, 0xFF, 235);
+        draw_dashed_line(dl, a, b, step_col, 2.6f, 12.0f, 6.0f);
+
+        char tbuf[64];
+        std::snprintf(tbuf, sizeof(tbuf), "台阶1 H1=%.2fm", stepped->bench1_elevation);
+        ImVec2 ts1 = ImGui::CalcTextSize(tbuf);
+        dl->AddRectFilled(ImVec2(b1p.x - ts1.x * 0.5f - 4, b1p.y - 10), ImVec2(b1p.x + ts1.x * 0.5f + 4, b1p.y + 8), badge_bg, 3.0f);
+        dl->AddRect(ImVec2(b1p.x - ts1.x * 0.5f - 4, b1p.y - 10), ImVec2(b1p.x + ts1.x * 0.5f + 4, b1p.y + 8), step_col, 3.0f);
+        dl->AddText(ImVec2(b1p.x - ts1.x * 0.5f, b1p.y - 8), step_col, tbuf);
+
+        std::snprintf(tbuf, sizeof(tbuf), "台阶2 H2=%.2fm", stepped->bench2_elevation);
+        ImVec2 ts2 = ImGui::CalcTextSize(tbuf);
+        dl->AddRectFilled(ImVec2(b2p.x - ts2.x * 0.5f - 4, b2p.y - 10), ImVec2(b2p.x + ts2.x * 0.5f + 4, b2p.y + 8), badge_bg, 3.0f);
+        dl->AddRect(ImVec2(b2p.x - ts2.x * 0.5f - 4, b2p.y - 10), ImVec2(b2p.x + ts2.x * 0.5f + 4, b2p.y + 8), step_col, 3.0f);
+        dl->AddText(ImVec2(b2p.x - ts2.x * 0.5f, b2p.y - 8), step_col, tbuf);
+
+        ImVec2 mid_ab(0.5f * (a.x + b.x), 0.5f * (a.y + b.y));
+        std::snprintf(tbuf, sizeof(tbuf), "台阶分界 ΔH=%.2fm", stepped->step_height);
+        ImVec2 tsm = ImGui::CalcTextSize(tbuf);
+        dl->AddRectFilled(ImVec2(mid_ab.x - tsm.x * 0.5f - 4, mid_ab.y - 10), ImVec2(mid_ab.x + tsm.x * 0.5f + 4, mid_ab.y + 8), badge_bg, 3.0f);
+        dl->AddRect(ImVec2(mid_ab.x - tsm.x * 0.5f - 4, mid_ab.y - 10), ImVec2(mid_ab.x + tsm.x * 0.5f + 4, mid_ab.y + 8), step_col, 3.0f);
+        dl->AddText(ImVec2(mid_ab.x - tsm.x * 0.5f, mid_ab.y - 8), step_col, tbuf);
+    }
+
     // 11b. 交互式 CAD 测距 / 测面积叠层
     if (!measure_pts_.empty() && (tool == CadToolMode::MeasureDist || tool == CadToolMode::MeasureArea)) {
         ImU32 mcol = dark_mode ? col32(0xFA, 0xCC, 0x15, 245) : col32(0xB4, 0x53, 0x09, 245);
@@ -922,6 +968,7 @@ void CadCanvas::render(const ProjectData& project,
             {"计算边界", bnd_col, layers.boundary && !project.boundary.empty()},
             {"异常测点", col32(0xEF, 0x44, 0x44), layers.anomalies && health != nullptr && !health->anomalies.empty()},
             {"补测推荐", col32(0xE8, 0x79, 0xF9), layers.survey_recs && uncertainty != nullptr && !uncertainty->recommendations.empty()},
+            {"台阶分界", col32(0xFA, 0xCC, 0x15), layers.stepped && stepped != nullptr && stepped->step_height > 1e-3},
         };
         int active_cnt = 0;
         for (const auto& it : items) if (it.show) ++active_cnt;

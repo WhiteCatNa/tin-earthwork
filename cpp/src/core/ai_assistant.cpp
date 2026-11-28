@@ -240,6 +240,10 @@ AssistantIntent parse_engineering_intent(const std::string& raw_input) {
         out.action = AssistantAction::ExportAiDxf;
         return out;
     }
+    if (up == "EXP_BOQ" || up == "BOQ") {
+        out.action = AssistantAction::ExportBoqCsv;
+        return out;
+    }
     if (up == "UNDO" || up == "_UNDO" || up == "U") {
         out.action = AssistantAction::Undo;
         return out;
@@ -328,6 +332,11 @@ AssistantIntent parse_engineering_intent(const std::string& raw_input) {
             out.has_param1 = true;
         }
         out.reply = "AI助手: 执行土方施工机械配置与工期台班估算";
+        return out;
+    }
+    if (contains_any(lo, {"工程量清单", "报价表", "清单", "boq", "bill of quantities"})) {
+        out.action = AssistantAction::ExportBoqCsv;
+        out.reply = "AI助手: 导出工程量清单报价表 (BOQ CSV)";
         return out;
     }
     if (contains_any(lo, {"积水", "排水", "drainage", "ponding"})) {
@@ -500,7 +509,7 @@ std::vector<std::string> suggest_command_completions(const std::string& prefix) 
     static const char* kCommands[] = {
         "AI", "AIOPT", "ANOMALY", "AREA", "AUTOB", "BALANCE", "BALPLANE", "BENCH",
         "CALC", "CLEAN", "CLEAR", "CLRBND", "CONTOUR", "DARK", "DAT",
-        "DIAG", "DIST", "DRAIN", "DXF", "EXP_AIDXF", "EXP_REC", "FITPLANE", "FLEET", "GRID", "H0", "HAUL",
+        "DIAG", "DIST", "DRAIN", "DXF", "EXP_AIDXF", "EXP_BOQ", "EXP_REC", "FITPLANE", "FLEET", "GRID", "H0", "HAUL",
         "HELP", "HTMLRPT", "LIGHT", "MEASURE", "OPT", "OUTLINE", "PROFILE",
         "REDO", "SECTIONS", "SENSITIVITY", "SIGNIF", "SLOPE", "STRATA", "SWAP", "THIN", "UNCERT",
         "UNDO", "ZE", "2D", "3D"

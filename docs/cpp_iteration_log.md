@@ -131,3 +131,24 @@ _以下各轮记录均由 `python3 tools/eval_cpp_goal.py` 真实编译、运行
 - CTest: **3/3 PASS** (Core 32/32 PASS)
 
 - **下一步持续迭代方向**：进入 `v3.9.0`（2D CAD 台阶分界可视化 + 工程量清单报价表 BOQ CSV 导出 + HTML 决策报告升级）。
+
+---
+
+## Iteration 9 — 台阶 CAD 可视化、BOQ 工程量清单导出与 HTML 报告升级 (v3.9.0)
+
+### 改动清单
+1. **2D CAD 台阶分界与高程徽标叠加图层** (`cpp/src/ui/cad_canvas.hpp/.cpp`, `cpp/src/ui/app.cpp`)
+   - `LayerVisibility` 新增 `stepped` 图层及图层条“台阶”复选开关；在 2D CAD 模型空间按最优分割轴绘出金色虚线分界线，标注 `台阶1 H1=...m`、`台阶2 H2=...m` 及 `台阶分界 ΔH=...m` 徽标与图例项。
+2. **BOQ 工程量清单报价表导出** (`cpp/src/io/io.hpp/.cpp`)
+   - 新增 `export_boq_csv(...)`，基于计算结果、跨区土方调配、周边放坡、双级台阶挡墙与机械台班参数导出带 UTF-8 BOM 的分部分项工程量清单与直接工程费用汇总表 CSV。
+3. **HTML 智能决策报告升级** (`cpp/src/io/io.hpp/.cpp`)
+   - `export_ai_report_html(...)` 新增第 6 节（双级台阶斜坡平场对比表）与第 7 节（施工机械排班与工期台班表）。
+4. **助手语义路由与测试验证** (`cpp/src/core/ai_assistant.hpp/.cpp`, `cpp/src/ui/app.hpp/.cpp`, `cpp/tests/test_core.cpp`, `cpp/tests/test_ui_headless.cpp`)
+   - 新增 `EXP_BOQ` / `BOQ` 指令及“工程量清单/报价表”自然语言意图识别、菜单项与 `AI智能` 标签页导出按钮；新增 Test 33 (`33_boq_csv_and_enhanced_html_report_roundtrip`) 与无头 CAD 台阶叠层渲染校验。
+
+### 门禁验证结果
+- `python3 tools/eval_cpp_goal.py`：**100.00 / 100.00**（`tin_ms=1.91ms`, `haul_ms=0.04ms`, `grade_ms=43.58ms`, `uncertainty_ms=10.10ms`, `anomaly_recall=1.00`, `anomaly_precision=0.9091`, `survey_rec_ratio=208.55x`, `nl_intent_acc=1.00`, `ui_contrast=13.52`）
+- Compiler warnings (project `src/` & `tests/`): **0**
+- CTest: **3/3 PASS** (Core 33/33 PASS)
+
+- **下一步持续迭代方向**：进入 `v3.10.0`（全量 ASan + UBSan 内存/未定义行为审计、Windows 跨平台构建配置复核、`README.md` 与 `v3.0.0-alpha → v3.10.0` 总览收尾）。
