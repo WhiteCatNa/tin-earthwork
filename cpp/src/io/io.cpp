@@ -1587,6 +1587,31 @@ void export_boq_csv(
     write_utf8_text(utf8_path, os.str(), true);
 }
 
+void export_pareto_csv(const GradeParetoResult& pareto, const std::string& utf8_path) {
+    if (pareto.plans.empty()) {
+        throw std::runtime_error("没有可导出的 Pareto 多目标方案");
+    }
+    std::ostringstream os;
+    os << std::fixed << std::setprecision(3);
+    os << "方案标签,H0(m),X坡度(%),Y坡度(%),合成坡度(%),挖方(m³),填方(m³),总土方量(m³),最大挖深(m),最大填高(m),外运余土(m³),借土缺方(m³),综合成本(元)\n";
+    for (const auto& p : pareto.plans) {
+        os << "\"" << p.tag << "\","
+           << p.summary.plane.h0 << ","
+           << p.summary.plane.slope_x << ","
+           << p.summary.plane.slope_y << ","
+           << p.slope_pct << ","
+           << p.summary.cut_volume << ","
+           << p.summary.fill_volume << ","
+           << p.total_moved_volume << ","
+           << p.max_cut_depth << ","
+           << p.max_fill_depth << ","
+           << p.summary.export_surplus << ","
+           << p.summary.borrow_deficit << ","
+           << p.summary.total_cost << "\n";
+    }
+    write_utf8_text(utf8_path, os.str(), true);
+}
+
 void save_rgba_png(const std::uint8_t* rgba, int width, int height, const std::string& utf8_path) {
     size_t png_len = 0;
     void* png_buf = tdefl_write_image_to_png_file_in_memory_ex(

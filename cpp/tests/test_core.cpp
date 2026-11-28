@@ -977,6 +977,59 @@ int main(int argc, char** argv) {
         check_true(ms < 25.0, "10,201 pts TIN+volume runs in < 25 ms");
     });
 
+    // 35. 最小排水坡度 + 控制点接边约束优化与多目标 Pareto 前沿校验
+    run_test("35_constrained_grade_opt_and_pareto_frontier", [&]() {
+        // 1) 几乎水平地形下强制 min_drain_slope_pct >= 0.6%
+        auto flat_pts = make_grid_points(8, 8, 20.0, [](double x, double y) {
+            return 20.0 + 0.0005 * x - 0.0004 * y + 0.12 * std::sin(0.05 * x);
+        });
+        tin::TINEarthworkCalculator fcalc(20.0);
+        fcalc.add_points(flat_pts);
+        fcalc.build_tin();
+
+        tin::GradeOptConstraints dc;
+        dc.max_slope_x = 3.0;
+        dc.max_slope_y = 3.0;
+        dc.min_drain_slope_pct = 0.6;
+        auto dr = tin::optimize_grade_cost(fcalc, tin::HaulCostParams{}, dc);
+        double drain_sp = std::hypot(dr.optimized.plane.slope_x, dr.optimized.plane.slope_y);
+        check_true(drain_sp >= 0.6 - 1e-4, "constrained opt satisfies min_drain_slope_pct >= 0.6%");
+
+        // 2) 控制点高程接边约束 <= 0.05 m
+        auto tilt_pts = make_grid_points(9, 9, 15.0, [](double x, double y) {
+            return 15.0 + 0.03 * x + 0.015 * y + 1.1 * std::sin(0.04 * x) * std::cos(0.04 * y);
+        });
+        tin::TINEarthworkCalculator tcalc(17.5);
+        tcalc.add_points(tilt_pts);
+        tcalc.build_tin();
+
+        tin::GradeOptConstraints cc;
+        cc.max_slope_x = 5.0;
+        cc.max_slope_y = 5.0;
+        tin::ControlPointConstraint cp{"道口1", 0.0, 60.0, 16.4, 0.05, 80000.0};
+        cc.control_points.push_back(cp);
+        auto cr = tin::optimize_grade_cost(tcalc, tin::HaulCostParams{}, cc);
+        double cp_err = std::abs(cr.optimized.plane.elevation(cp.x, cp.y) - cp.target_z);
+        check_true(cp_err <= 0.05 + 1e-4, "control point elevation error <= 0.05 m");
+
+        // 3) 多目标 Pareto 前沿（需生成 >= 3 组严格非支配方案并支持 CSV 导出）
+        tin::GradeOptConstraints pc;
+        pc.max_slope_x = 4.0;
+        pc.max_slope_y = 4.0;
+        auto pareto = tin::compute_grade_pareto_frontier(tcalc, tin::HaulCostParams{}, pc);
+        check_true(pareto.plans.size() >= 3, "Pareto frontier has >= 3 distinct non-dominated plans");
+        for (size_t i = 0; i + 1 < pareto.plans.size(); ++i) {
+            check_true(pareto.plans[i].summary.total_cost <= pareto.plans[i + 1].summary.total_cost + 1e-3,
+                       "Pareto frontier sorted ascending by total_cost");
+        }
+
+        auto tmp = std::filesystem::temp_directory_path() / L"tin_earthwork_cpp_tests";
+        std::filesystem::create_directories(tmp);
+        std::string p_csv = tin::wide_to_utf8((tmp / L"pareto.csv").wstring());
+        tin::export_pareto_csv(pareto, p_csv);
+        check_true(std::filesystem::file_size(tin::utf8_to_wide(p_csv)) > 200, "pareto csv non-empty");
+    });
+
     std::cout << "=== Summary: PASSED " << g_passed << " / " << (g_passed + g_failed) << " ===\n";
     return g_failed == 0 ? 0 : 1;
 }

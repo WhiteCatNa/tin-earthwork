@@ -42,6 +42,7 @@ void export_cass_dat(const std::vector<SurveyPoint>& points, const std::string& 
 void export_sections_csv(const SectionMethodResult& sections, const std::string& utf8_path);
 void export_survey_recommendations_csv(const UncertaintyReport& uncertainty, const std::string& utf8_path);
 void export_sensitivity_csv(const SensitivityCurveResult& curve, const std::string& utf8_path);
+void export_pareto_csv(const GradeParetoResult& pareto, const std::string& utf8_path);
 void export_ai_overlays_dxf(
     const CalculationResult* result,
     const SiteHealthReport* health,

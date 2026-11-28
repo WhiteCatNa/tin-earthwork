@@ -462,6 +462,10 @@ GradeOptimizationResult optimize_grade_cost(
 
     const double max_sx = std::max(0.0, std::abs(constraints.max_slope_x));
     const double max_sy = std::max(0.0, std::abs(constraints.max_slope_y));
+    const double min_drain = (constraints.min_drain_slope_pct > 1e-6)
+                                 ? std::min(std::abs(constraints.min_drain_slope_pct), std::hypot(max_sx, max_sy))
+                                 : 0.0;
+    const bool has_hard_constraints = (min_drain > 1e-6) || !constraints.control_points.empty();
     const int cols = std::clamp(constraints.haul_cols, 1, 8);
     const int rows = std::clamp(constraints.haul_rows, 1, 8);
     const int budget = std::max(24, constraints.max_evals);
@@ -504,6 +508,27 @@ GradeOptimizationResult optimize_grade_cost(
         return v;
     };
 
+    auto constraint_penalty = [&](const PlaneDesign& pl) -> double {
+        double pen = 0.0;
+        if (min_drain > 1e-6) {
+            double sp = std::hypot(pl.slope_x, pl.slope_y);
+            if (sp < min_drain) {
+                double def = min_drain - sp;
+                pen += 1e7 * def * def + 2e5 * def;
+            }
+        }
+        for (const auto& cp : constraints.control_points) {
+            double err = std::abs(pl.elevation(cp.x, cp.y) - cp.target_z);
+            double tol = std::max(0.0, cp.max_dev_m);
+            if (err > tol) {
+                double ex = err - tol;
+                double eff_w = std::max({cp.weight, 5e5, flat_summary.total_cost * 2.0});
+                pen += eff_w * (20.0 * ex * ex + 2.0 * ex);
+            }
+        }
+        return pen;
+    };
+
     int evals = 0;
     GradePlanSummary best_summary = (bf_summary.total_cost <= flat_summary.total_cost)
                                       ? bf_summary
@@ -512,12 +537,12 @@ GradeOptimizationResult optimize_grade_cost(
 
     FastPlaneCostEvaluator fast_eval(work_calc, costs, cols, rows);
     Vec3Param best_vec{best_summary.plane.h0, best_summary.plane.slope_x, best_summary.plane.slope_y};
-    double best_fast_cost = best_summary.total_cost;
+    double best_fast_cost = has_hard_constraints ? std::numeric_limits<double>::infinity() : best_summary.total_cost;
 
     auto eval_vec = [&](const Vec3Param& raw_v) -> double {
         Vec3Param v = clamp_param(raw_v);
         PlaneDesign pl{x0, y0, v.h0, v.sx, v.sy};
-        double c = fast_eval.eval(pl);
+        double c = fast_eval.eval(pl) + constraint_penalty(pl);
         ++evals;
         if (c < best_fast_cost) {
             best_fast_cost = c;
@@ -533,8 +558,38 @@ GradeOptimizationResult optimize_grade_cost(
         {bf_clamped.plane.h0 + 0.08 * h_span, bf_sx, bf_sy},
         {bf_clamped.plane.h0 - 0.08 * h_span, bf_sx, bf_sy},
     };
-    Vec3Param cur{best_summary.plane.h0, best_summary.plane.slope_x, best_summary.plane.slope_y};
-    double cur_cost = best_summary.total_cost;
+    if (min_drain > 1e-6) {
+        double h_ref = bf_clamped.plane.h0;
+        if (max_sx >= min_drain) {
+            starts.push_back({h_ref, min_drain, 0.0});
+            starts.push_back({h_ref, -min_drain, 0.0});
+        }
+        if (max_sy >= min_drain) {
+            starts.push_back({h_ref, 0.0, min_drain});
+            starts.push_back({h_ref, 0.0, -min_drain});
+        }
+        double bf_norm = std::hypot(bf_sx, bf_sy);
+        if (bf_norm > 1e-6) {
+            double sc = min_drain / bf_norm;
+            starts.push_back({h_ref, bf_sx * sc, bf_sy * sc});
+        } else if (max_sx > 1e-6 || max_sy > 1e-6) {
+            double diag = min_drain / std::sqrt(2.0);
+            starts.push_back({h_ref, std::min(diag, max_sx), std::min(diag, max_sy)});
+        }
+    }
+    if (!constraints.control_points.empty()) {
+        const auto& cp0 = constraints.control_points.front();
+        double h_cp_bf = cp0.target_z - (bf_sx / 100.0) * (cp0.x - x0) - (bf_sy / 100.0) * (cp0.y - y0);
+        starts.push_back({h_cp_bf, bf_sx, bf_sy});
+        starts.push_back({cp0.target_z, 0.0, 0.0});
+        if (min_drain > 1e-6 && max_sx >= min_drain) {
+            double h_cp_dx = cp0.target_z - (min_drain / 100.0) * (cp0.x - x0);
+            starts.push_back({h_cp_dx, min_drain, 0.0});
+        }
+    }
+
+    Vec3Param cur{best_vec.h0, best_vec.sx, best_vec.sy};
+    double cur_cost = std::numeric_limits<double>::infinity();
     for (const auto& st : starts) {
         if (evals >= budget) break;
         double c = eval_vec(st);
@@ -648,11 +703,33 @@ GradeOptimizationResult optimize_grade_cost(
         }
     }
 
+    if (min_drain > 1e-6 && std::hypot(best_vec.sx, best_vec.sy) < min_drain) {
+        double sp = std::hypot(best_vec.sx, best_vec.sy);
+        if (sp > 1e-6) {
+            double sc = (min_drain + 1e-4) / sp;
+            best_vec = clamp_param({best_vec.h0, best_vec.sx * sc, best_vec.sy * sc});
+        } else if (max_sx >= min_drain) {
+            best_vec.sx = min_drain + 1e-4;
+        } else if (max_sy >= min_drain) {
+            best_vec.sy = min_drain + 1e-4;
+        }
+    }
+    if (constraints.control_points.size() == 1) {
+        const auto& cp0 = constraints.control_points.front();
+        PlaneDesign tmp{x0, y0, best_vec.h0, best_vec.sx, best_vec.sy};
+        double diff = tmp.elevation(cp0.x, cp0.y) - cp0.target_z;
+        double tol = std::max(0.0, cp0.max_dev_m);
+        if (std::abs(diff) > tol) {
+            double shift = std::copysign(std::abs(diff) - tol * 0.95, diff);
+            best_vec = clamp_param({best_vec.h0 - shift, best_vec.sx, best_vec.sy});
+        }
+    }
+
     GradePlanSummary final_opt = evaluate_plane_plan(
         work_calc,
         PlaneDesign{x0, y0, best_vec.h0, best_vec.sx, best_vec.sy},
         costs, cols, rows, "AI 联合费用最优斜面");
-    if (final_opt.total_cost <= best_summary.total_cost) {
+    if (has_hard_constraints || final_opt.total_cost <= best_summary.total_cost) {
         best_summary = final_opt;
     }
 
@@ -1787,6 +1864,176 @@ FleetEstimateResult estimate_earthwork_fleet(
         << std::setprecision(0) << out.avg_haul_dist_m << " m，预计工期 "
         << std::setprecision(1) << out.estimated_days << " 天，机械台班费约 ¥"
         << std::setprecision(0) << out.total_machine_cost;
+    out.summary = oss.str();
+    return out;
+}
+
+GradeParetoResult compute_grade_pareto_frontier(
+    const TINEarthworkCalculator& base_calc,
+    const HaulCostParams& costs,
+    const GradeOptConstraints& constraints) {
+    if (base_calc.points().size() < 3) {
+        throw std::runtime_error("至少需要 3 个测量点才能生成多目标 Pareto 前沿");
+    }
+
+    TINEarthworkCalculator work = base_calc;
+    if (!work.has_tin()) work.build_tin();
+
+    GradeOptConstraints sub_cons = constraints;
+    sub_cons.max_evals = std::clamp(constraints.max_evals, 40, 80);
+    const int cols = std::clamp(constraints.haul_cols, 1, 8);
+    const int rows = std::clamp(constraints.haul_rows, 1, 8);
+
+    std::vector<std::pair<std::string, PlaneDesign>> cands;
+
+    // 1. 成本最优
+    auto r_cost = optimize_grade_cost(work, costs, sub_cons);
+    cands.push_back({"成本最优", r_cost.optimized.plane});
+
+    // 2. 最小总方量（弱化运距与外运偏差，专注削减挖填总量）
+    HaulCostParams vol_costs{100.0, 100.0, 0.0, 0.0, 0.0};
+    auto r_vol = optimize_grade_cost(work, vol_costs, sub_cons);
+    cands.push_back({"最小总方量", r_vol.optimized.plane});
+
+    // 3. 零外运/借土严格自平衡
+    HaulCostParams bal_costs = costs;
+    bal_costs.export_unit_cost = std::max(costs.export_unit_cost * 12.0, 450.0);
+    bal_costs.borrow_unit_cost = std::max(costs.borrow_unit_cost * 12.0, 500.0);
+    auto r_bal = optimize_grade_cost(work, bal_costs, sub_cons);
+    cands.push_back({"严格自平衡", r_bal.optimized.plane});
+
+    // 4. 最短场内运距优先
+    HaulCostParams haul_costs = costs;
+    haul_costs.haul_per_m3_100m = std::max(costs.haul_per_m3_100m * 15.0, 60.0);
+    auto r_haul = optimize_grade_cost(work, haul_costs, sub_cons);
+    cands.push_back({"短距低运功", r_haul.optimized.plane});
+
+    // 5. 平场平衡 & 最小二乘基线（以及折中插值候选，丰富前沿权衡点）
+    cands.push_back({"最小二乘斜面", r_cost.best_fit.plane});
+    cands.push_back({"平场零平衡", r_cost.flat_balance.plane});
+
+    const PlaneDesign& pc = r_cost.optimized.plane;
+    const PlaneDesign& pv = r_vol.optimized.plane;
+    for (double a : {0.25, 0.50, 0.75}) {
+        PlaneDesign blend{
+            pc.x0, pc.y0,
+            (1.0 - a) * pc.h0 + a * pv.h0,
+            (1.0 - a) * pc.slope_x + a * pv.slope_x,
+            (1.0 - a) * pc.slope_y + a * pv.slope_y
+        };
+        cands.push_back({"均衡过渡", blend});
+    }
+    const PlaneDesign& pb = r_bal.optimized.plane;
+    for (double a : {0.35, 0.70}) {
+        PlaneDesign blend{
+            pc.x0, pc.y0,
+            (1.0 - a) * pc.h0 + a * pb.h0,
+            (1.0 - a) * pc.slope_x + a * pb.slope_x,
+            (1.0 - a) * pc.slope_y + a * pb.slope_y
+        };
+        cands.push_back({"费用平衡折中", blend});
+    }
+
+    auto is_feasible = [&](const PlaneDesign& pl) -> bool {
+        if (std::abs(pl.slope_x) > std::abs(constraints.max_slope_x) + 1e-4 ||
+            std::abs(pl.slope_y) > std::abs(constraints.max_slope_y) + 1e-4) {
+            return false;
+        }
+        if (constraints.min_drain_slope_pct > 1e-6 &&
+            std::hypot(pl.slope_x, pl.slope_y) + 1e-4 < constraints.min_drain_slope_pct) {
+            return false;
+        }
+        for (const auto& cp : constraints.control_points) {
+            if (std::abs(pl.elevation(cp.x, cp.y) - cp.target_z) > cp.max_dev_m + 1e-3) {
+                return false;
+            }
+        }
+        return true;
+    };
+
+    std::vector<ParetoPlan> evaled;
+    evaled.reserve(cands.size());
+    for (const auto& [tag, pl] : cands) {
+        if (!is_feasible(pl)) continue;
+        work.set_design_plane(pl);
+        CalculationResult res = work.calculate_volumes();
+        HaulPlanResult haul = compute_haul_plan(res, cols, rows, costs);
+
+        double max_c = 0.0, max_f = 0.0;
+        for (const auto& t : res.triangles) {
+            if (t.is_boundary) continue;
+            max_c = std::max({max_c, t.p0.delta_z, t.p1.delta_z, t.p2.delta_z});
+            max_f = std::max({max_f, -t.p0.delta_z, -t.p1.delta_z, -t.p2.delta_z});
+        }
+
+        ParetoPlan pp;
+        pp.tag = tag;
+        pp.summary.label = tag;
+        pp.summary.plane = pl;
+        pp.summary.cut_volume = res.total_cut;
+        pp.summary.fill_volume = res.total_fill;
+        pp.summary.haul_work_m3_m = haul.total_work_m3_m;
+        pp.summary.export_surplus = haul.export_surplus;
+        pp.summary.borrow_deficit = haul.borrow_deficit;
+        pp.summary.total_cost = haul.estimated_cost;
+        pp.total_moved_volume = res.total_cut + res.total_fill;
+        pp.max_cut_depth = max_c;
+        pp.max_fill_depth = max_f;
+        pp.slope_pct = std::hypot(pl.slope_x, pl.slope_y);
+        evaled.push_back(std::move(pp));
+    }
+
+    // 在三维目标 (total_cost, total_moved_volume, max(max_cut_depth, max_fill_depth)) 上筛选非支配解
+    std::vector<ParetoPlan> frontier;
+    for (size_t i = 0; i < evaled.size(); ++i) {
+        bool dominated = false;
+        double dmax_i = std::max(evaled[i].max_cut_depth, evaled[i].max_fill_depth);
+        for (size_t j = 0; j < evaled.size(); ++j) {
+            if (i == j) continue;
+            double dmax_j = std::max(evaled[j].max_cut_depth, evaled[j].max_fill_depth);
+            bool le = (evaled[j].summary.total_cost <= evaled[i].summary.total_cost + 1e-6) &&
+                      (evaled[j].total_moved_volume <= evaled[i].total_moved_volume + 1e-6) &&
+                      (dmax_j <= dmax_i + 1e-6);
+            bool lt = (evaled[j].summary.total_cost < evaled[i].summary.total_cost - 1e-3) ||
+                      (evaled[j].total_moved_volume < evaled[i].total_moved_volume - 1e-3) ||
+                      (dmax_j < dmax_i - 1e-4);
+            if (le && lt) {
+                dominated = true;
+                break;
+            }
+        }
+        if (!dominated) {
+            bool dup = false;
+            for (const auto& ex : frontier) {
+                if (std::abs(ex.summary.total_cost - evaled[i].summary.total_cost) < 1e-2 &&
+                    std::abs(ex.total_moved_volume - evaled[i].total_moved_volume) < 1e-2) {
+                    dup = true;
+                    break;
+                }
+            }
+            if (!dup) frontier.push_back(evaled[i]);
+        }
+    }
+
+    std::sort(frontier.begin(), frontier.end(), [](const ParetoPlan& a, const ParetoPlan& b) {
+        if (std::abs(a.summary.total_cost - b.summary.total_cost) > 1e-3) {
+            return a.summary.total_cost < b.summary.total_cost;
+        }
+        return a.total_moved_volume < b.total_moved_volume;
+    });
+
+    GradeParetoResult out;
+    out.plans = std::move(frontier);
+    std::ostringstream oss;
+    oss << "已生成 " << out.plans.size() << " 组多目标非支配 Pareto 设计方案";
+    if (!out.plans.empty()) {
+        oss << std::fixed << std::setprecision(0)
+            << "（最低造价 ¥" << out.plans.front().summary.total_cost
+            << " / 最小总方量 " << std::min_element(out.plans.begin(), out.plans.end(),
+                   [](const ParetoPlan& a, const ParetoPlan& b) {
+                       return a.total_moved_volume < b.total_moved_volume;
+                   })->total_moved_volume << " m³）";
+    }
     out.summary = oss.str();
     return out;
 }

@@ -213,3 +213,21 @@ _以下各轮记录均由 `python3 tools/eval_cpp_goal.py` 真实编译、运行
 - **关键实测性能**：`tin_10k_ms` 从 `116.70 ms` 降至 **8.83 ms**（提速 **13.2 倍**）；千点构网算量 `tin_ms = 1.41 ms`
 
 - **下一步持续迭代方向**：进入 `v4.2.0`（最小排水坡度/控制点接边约束优化与多目标 Pareto 前沿计算）。
+
+---
+
+## Iteration 13 — 多约束联合设计面优化与三维多目标 Pareto 前沿 (v4.2.0)
+
+### 改动清单
+1. **工程硬约束设计面优化** (`cpp/src/core/ai_optimizer.hpp/.cpp`)
+   - 扩展 `GradeOptConstraints` 新增 `min_drain_slope_pct`（最小合成排水坡度 $\sqrt{i_x^2 + i_y^2}$）与 `std::vector<ControlPointConstraint>`（道路/市政接口接边高程容差约束），引入平滑二次障碍惩罚、可行圆环方向种子启动及单控制点精确可行域投影。
+2. **三维目标 Pareto 非支配解前沿与导出** (`cpp/src/core/ai_optimizer.hpp/.cpp`, `cpp/src/io/io.hpp/.cpp`, `cpp/src/core/ai_assistant.hpp/.cpp`)
+   - 新增 `compute_grade_pareto_frontier(...)`，统筹「成本最优 / 最小总方量 / 严格自平衡 / 短距低运功 / 最小二乘 / 平场平衡 / 均衡过渡」策略组，在三维目标 $(\text{综合费用}, \text{总挖填体积}, \max(\text{挖深},\text{填高}))$ 上筛选严格非支配前沿，并新增 `export_pareto_csv(...)` 与 `PARETO` 双语命令映射。
+3. **单元与基准测试扩展** (`cpp/tests/test_core.cpp`, `cpp/tests/test_ai_benchmark.cpp`)
+   - 新增 Test 35 (`35_constrained_grade_opt_and_pareto_frontier`) 验证 `min_drain_slope_pct >= 0.6%`、控制点接边误差 `<= 0.05 m` 及 Pareto 前沿导出；AI 基准实测输出 5 组非支配权衡方案。
+
+### 门禁验证结果
+- **v3.0 回归保护分**：**100.00 / 100.00**（0 告警，CTest 3/3 PASS，35/35 核心测试全过）
+- **v4.0 北极星评分**：`61.00` → **80.00 / 100.00**（第 2 维 `Constrained Pareto AI` 升至 **25.00 / 25.00**；`pareto_count = 5`, `tin_ms = 1.35 ms`, `tin_10k_ms = 8.91 ms`）
+
+- **下一步持续迭代方向**：进入 `v4.3.0`（主坡向对齐 `K=2..4` 精确动态规划多级台阶平场优化）。

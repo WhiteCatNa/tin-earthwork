@@ -168,6 +168,10 @@ AssistantIntent parse_engineering_intent(const std::string& raw_input) {
         out.action = AssistantAction::RunSensitivity;
         return out;
     }
+    if (up == "PARETO" || up == "MULTIOBJ") {
+        out.action = AssistantAction::RunPareto;
+        return out;
+    }
     if (up == "BENCH" || up == "STEPPED" || up == "TERRACE") {
         out.action = AssistantAction::OptimizeStepped;
         return out;
@@ -314,6 +318,11 @@ AssistantIntent parse_engineering_intent(const std::string& raw_input) {
     if (contains_any(lo, {"敏感性", "标高曲线", "sensitivity", "elevation curve"})) {
         out.action = AssistantAction::RunSensitivity;
         out.reply = "AI助手: 生成设计标高-方量/综合费用敏感性曲线";
+        return out;
+    }
+    if (contains_any(lo, {"帕累托", "多目标", "方案比选", "pareto", "tradeoff"})) {
+        out.action = AssistantAction::RunPareto;
+        out.reply = "AI助手: 生成设计面多目标 Pareto 非支配方案前沿";
         return out;
     }
     if (contains_any(lo, {"台阶", "阶梯", "二级平场", "双级", "stepped", "terrace", "bench"})) {
@@ -510,7 +519,7 @@ std::vector<std::string> suggest_command_completions(const std::string& prefix) 
         "AI", "AIOPT", "ANOMALY", "AREA", "AUTOB", "BALANCE", "BALPLANE", "BENCH",
         "CALC", "CLEAN", "CLEAR", "CLRBND", "CONTOUR", "DARK", "DAT",
         "DIAG", "DIST", "DRAIN", "DXF", "EXP_AIDXF", "EXP_BOQ", "EXP_REC", "FITPLANE", "FLEET", "GRID", "H0", "HAUL",
-        "HELP", "HTMLRPT", "LIGHT", "MEASURE", "OPT", "OUTLINE", "PROFILE",
+        "HELP", "HTMLRPT", "LIGHT", "MEASURE", "OPT", "OUTLINE", "PARETO", "PROFILE",
         "REDO", "SECTIONS", "SENSITIVITY", "SIGNIF", "SLOPE", "STRATA", "SWAP", "THIN", "UNCERT",
         "UNDO", "ZE", "2D", "3D"
     };

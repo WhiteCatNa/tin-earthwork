@@ -8,13 +8,24 @@
 
 namespace tin {
 
-// ---------- 1. 设计面-土方调配联合费用优化 ----------
+// ---------- 1. 设计面-土方调配联合费用优化与多约束多目标 Pareto ----------
+struct ControlPointConstraint {
+    std::string label;
+    double x = 0.0;
+    double y = 0.0;
+    double target_z = 0.0;
+    double max_dev_m = 0.10;   // 允许接边最大高差 (m)
+    double weight = 80000.0;   // 超限惩罚系数 (元/m)
+};
+
 struct GradeOptConstraints {
-    double max_slope_x = 5.0; // 最大允许 X 坡度绝对值 (%)
-    double max_slope_y = 5.0; // 最大允许 Y 坡度绝对值 (%)
+    double max_slope_x = 5.0;        // 最大允许 X 坡度绝对值 (%)
+    double max_slope_y = 5.0;        // 最大允许 Y 坡度绝对值 (%)
+    double min_drain_slope_pct = 0.0; // 最小合成排水坡度 (%)，0 表示不限
     int haul_cols = 4;
     int haul_rows = 3;
     int max_evals = 120;
+    std::vector<ControlPointConstraint> control_points;
 };
 
 struct GradePlanSummary {
@@ -42,6 +53,25 @@ struct GradeOptimizationResult {
 };
 
 GradeOptimizationResult optimize_grade_cost(
+    const TINEarthworkCalculator& base_calc,
+    const HaulCostParams& costs = HaulCostParams{},
+    const GradeOptConstraints& constraints = GradeOptConstraints{});
+
+struct ParetoPlan {
+    std::string tag;
+    GradePlanSummary summary;
+    double total_moved_volume = 0.0; // 总挖填体积 cut + fill (m³)
+    double max_cut_depth = 0.0;      // 最大挖深 (m)
+    double max_fill_depth = 0.0;     // 最大填高 (m)
+    double slope_pct = 0.0;          // 合成坡度 (%)
+};
+
+struct GradeParetoResult {
+    std::vector<ParetoPlan> plans;   // 按总造价升序排列的非支配方案集
+    std::string summary;
+};
+
+GradeParetoResult compute_grade_pareto_frontier(
     const TINEarthworkCalculator& base_calc,
     const HaulCostParams& costs = HaulCostParams{},
     const GradeOptConstraints& constraints = GradeOptConstraints{});

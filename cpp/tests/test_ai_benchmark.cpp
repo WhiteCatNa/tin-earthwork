@@ -227,6 +227,19 @@ int main(int argc, char** argv) {
     double grade_savings_pct = opt_slope.savings_pct_vs_flat;
     double grade_ms = opt_real.elapsed_ms;
 
+    // v4.0 多约束优化（最小排水坡度 + 控制点接边）与 Pareto 前沿基准
+    tin::GradeOptConstraints v4_cons;
+    v4_cons.max_slope_x = 4.0;
+    v4_cons.max_slope_y = 4.0;
+    v4_cons.min_drain_slope_pct = 0.55;
+    tin::ControlPointConstraint v4_cp{"Gate1", 10.0, 50.0, slope_calc.points()[0].z + 0.4, 0.05, 80000.0};
+    v4_cons.control_points.push_back(v4_cp);
+    auto opt_v4 = tin::optimize_grade_cost(slope_calc, tin::HaulCostParams{}, v4_cons);
+    bool constrained_drain_ok = std::hypot(opt_v4.optimized.plane.slope_x, opt_v4.optimized.plane.slope_y) >= 0.55 - 1e-4;
+    bool constrained_ctrl_ok = std::abs(opt_v4.optimized.plane.elevation(v4_cp.x, v4_cp.y) - v4_cp.target_z) <= 0.05 + 1e-4;
+    auto pareto_res = tin::compute_grade_pareto_frontier(slope_calc, tin::HaulCostParams{}, gcons);
+    int pareto_count = static_cast<int>(pareto_res.plans.size());
+
     // Iteration 2 基准：1) 不确定度评定 + 自适应补测推荐（含真值覆盖与 10% 补测比随机对比）
     auto u0 = std::chrono::steady_clock::now();
     auto uncert_real = tin::analyze_uncertainty_and_recommend(calc, 0.03, 8, 8);
@@ -450,10 +463,10 @@ int main(int argc, char** argv) {
                   << "  \"ui_has_tab_completion\": " << (tab_comp_ok ? "true" : "false") << ",\n"
                   << "  \"ui_contrast\": " << contrast << ",\n"
                   << "  \"tin_10k_ms\": " << tin_10k_ms << ",\n"
-                  << "  \"has_constrained_grade\": false,\n"
-                  << "  \"constrained_drain_ok\": false,\n"
-                  << "  \"constrained_ctrl_ok\": false,\n"
-                  << "  \"pareto_count\": 0,\n"
+                  << "  \"has_constrained_grade\": true,\n"
+                  << "  \"constrained_drain_ok\": " << (constrained_drain_ok ? "true" : "false") << ",\n"
+                  << "  \"constrained_ctrl_ok\": " << (constrained_ctrl_ok ? "true" : "false") << ",\n"
+                  << "  \"pareto_count\": " << pareto_count << ",\n"
                   << "  \"has_multi_bench_dp\": false,\n"
                   << "  \"multi_bench_vs_flat_pct\": 0.0,\n"
                   << "  \"multi_bench_vs_2axis_pct\": 0.0,\n"

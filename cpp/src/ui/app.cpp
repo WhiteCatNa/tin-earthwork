@@ -1246,6 +1246,9 @@ void CassApp::execute_command(const std::string& raw_cmd) {
         run_sensitivity_action();
         set_inspector_tab(6);
         break;
+    case AssistantAction::RunPareto:
+        log_cmd("命令: _PARETO -> Pareto 多目标方案计算将在界面模块启用");
+        break;
     case AssistantAction::OptimizeStepped:
         run_stepped_platform_action(intent.has_param1 ? intent.param1 : -1.0);
         set_inspector_tab(6);
