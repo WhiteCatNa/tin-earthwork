@@ -1,3 +1,4 @@
+#include "core/ai_optimizer.hpp"
 #include "core/analysis.hpp"
 #include "core/calculator.hpp"
 #include "core/engineering.hpp"
@@ -96,9 +97,10 @@ bool haul_plan_has_negative_cycle(const tin::HaulPlanResult& plan, double compac
         }
     }
 
-    // 构造二分残余网络 (0..ns-1 为挖方区, ns..ns+nd-1 为填方区, ns+nd 为虚拟源汇外运借土平衡点)
-    const int V = static_cast<int>(ns + nd + 1);
-    const int W = static_cast<int>(ns + nd);
+    // 构造精确最小费用最大流残余网络 (0..ns-1 为挖方区, ns..ns+nd-1 为填方区, SRC, SNK)
+    const int SRC = static_cast<int>(ns + nd);
+    const int SNK = SRC + 1;
+    const int V = SNK + 1;
     struct Edge { int u, v; double w; };
     std::vector<Edge> edges;
     for (size_t s = 0; s < ns; ++s) {
@@ -108,20 +110,20 @@ bool haul_plan_has_negative_cycle(const tin::HaulPlanResult& plan, double compac
                 edges.push_back({static_cast<int>(ns + d), static_cast<int>(s), -cost[s][d]});
             }
         }
-        // 未调出余土 <-> 虚拟节点 W (cost 0)
+        // SRC <-> s 残余边（SRC 与 SNK 分离，保证最大流守恒下的负权圈检验）
         if (sup_cap[s] - sup_used[s] > 1e-5) {
-            edges.push_back({static_cast<int>(s), W, 0.0});
+            edges.push_back({SRC, static_cast<int>(s), 0.0});
         }
         if (sup_used[s] > 1e-5) {
-            edges.push_back({W, static_cast<int>(s), 0.0});
+            edges.push_back({static_cast<int>(s), SRC, 0.0});
         }
     }
     for (size_t d = 0; d < nd; ++d) {
         if (dem_cap[d] - dem_used[d] > 1e-5) {
-            edges.push_back({W, static_cast<int>(ns + d), 0.0});
+            edges.push_back({static_cast<int>(ns + d), SNK, 0.0});
         }
         if (dem_used[d] > 1e-5) {
-            edges.push_back({static_cast<int>(ns + d), W, 0.0});
+            edges.push_back({SNK, static_cast<int>(ns + d), 0.0});
         }
     }
 
@@ -188,6 +190,30 @@ int main(int argc, char** argv) {
         if (!haul_plan_has_negative_cycle(hplan)) ++haul_optimal_cases;
     }
 
+    // 联合设计面费用优化基准（含真实数据对拍 + 倾斜起伏场地综合节费测算）
+    calc.build_tin();
+    auto opt_real = tin::optimize_grade_cost(calc, tin::HaulCostParams{}, tin::GradeOptConstraints{});
+
+    auto slope_pts = make_grid_points(8, 8, 25.0, [](double x, double y) {
+        return 30.0 + 0.025 * x - 0.015 * y + 0.8 * std::sin(0.04 * x) * std::cos(0.04 * y);
+    });
+    tin::TINEarthworkCalculator slope_calc(30.0);
+    slope_calc.add_points(slope_pts);
+    slope_calc.build_tin();
+    tin::GradeOptConstraints gcons;
+    gcons.max_slope_x = 3.0;
+    gcons.max_slope_y = 3.0;
+    gcons.max_evals = 120;
+    auto opt_slope = tin::optimize_grade_cost(slope_calc, tin::HaulCostParams{}, gcons);
+
+    bool grade_beats_bf =
+        (opt_real.optimized.total_cost <= opt_real.best_fit.total_cost + 1e-6) &&
+        (opt_slope.optimized.total_cost <= opt_slope.best_fit.total_cost + 1e-6) &&
+        (std::abs(opt_slope.optimized.plane.slope_x) <= gcons.max_slope_x + 1e-9) &&
+        (std::abs(opt_slope.optimized.plane.slope_y) <= gcons.max_slope_y + 1e-9);
+    double grade_savings_pct = opt_slope.savings_pct_vs_flat;
+    double grade_ms = opt_real.elapsed_ms;
+
     // 边界鲁棒性检查
     int robust_passed = 0;
     const int robust_total = 4;
@@ -253,9 +279,10 @@ int main(int argc, char** argv) {
                   << "  \"haul_ms\": " << haul_ms << ",\n"
                   << "  \"haul_optimal_cases\": " << haul_optimal_cases << ",\n"
                   << "  \"haul_total_cases\": " << haul_total_cases << ",\n"
-                  << "  \"has_grade_optimizer\": false,\n"
-                  << "  \"grade_savings_pct\": 0.0,\n"
-                  << "  \"grade_ms\": 0.0,\n"
+                  << "  \"has_grade_optimizer\": true,\n"
+                  << "  \"grade_beats_best_fit\": " << (grade_beats_bf ? "true" : "false") << ",\n"
+                  << "  \"grade_savings_pct\": " << grade_savings_pct << ",\n"
+                  << "  \"grade_ms\": " << grade_ms << ",\n"
                   << "  \"has_uncertainty\": false,\n"
                   << "  \"uncertainty_coverage_ok\": false,\n"
                   << "  \"survey_rec_ratio\": 0.0,\n"

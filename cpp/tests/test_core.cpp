@@ -1,3 +1,4 @@
+#include "core/ai_optimizer.hpp"
 #include "core/analysis.hpp"
 #include "core/calculator.hpp"
 #include "core/delaunay.hpp"
@@ -501,6 +502,47 @@ int main(int argc, char** argv) {
         check_near(sl.slope_cut_volume, 1920.0, 1e-2, "analytical slope cut volume");
         check_near(sl.slope_fill_volume, 0.0, 1e-6, "analytical slope fill volume");
         check_true(!sl.slope_ticks.empty() && sl.daylight_ring.size() >= 12, "slope ticks and daylight ring");
+    });
+
+    // 19. 精确最小费用流土方调配：多区非平凡图严格满足质量守恒且优于/等于原始方案
+    run_test("19_exact_mcmf_haul_optimality", [&]() {
+        auto pts = make_grid_points(9, 9, 15.0, [](double x, double y) {
+            return 20.0 + 3.2 * std::sin(0.055 * x + 1.0) * std::cos(0.048 * y - 0.7)
+                        + 0.02 * (x - 60.0) - 0.015 * (y - 60.0);
+        });
+        tin::TINEarthworkCalculator calc(20.0);
+        calc.add_points(pts);
+        auto res = calc.run_full_calculation();
+        auto plan = tin::compute_haul_plan(res, 5, 5);
+        check_near(plan.internal_balanced + plan.cross_zone_hauled + plan.export_surplus,
+                   res.total_cut, 1e-4, "mcmf cut mass balance");
+        check_near(plan.internal_balanced + plan.cross_zone_hauled + plan.borrow_deficit,
+                   res.total_fill, 1e-4, "mcmf fill mass balance");
+        check_true(plan.cross_zone_hauled > 100.0 && plan.total_work_m3_m > 0.0, "mcmf non-trivial haul");
+    });
+
+    // 20. 设计面-土方调配联合费用优化：坡度约束合规 + 优于平场平衡与最小二乘对照
+    run_test("20_grade_cost_optimizer", [&]() {
+        auto pts = make_grid_points(8, 8, 25.0, [](double x, double y) {
+            return 30.0 + 0.025 * x - 0.015 * y + 0.8 * std::sin(0.04 * x) * std::cos(0.04 * y);
+        });
+        tin::TINEarthworkCalculator calc(30.0);
+        calc.add_points(pts);
+        calc.build_tin();
+
+        tin::HaulCostParams costs;
+        costs.haul_per_m3_100m = 8.0;
+        tin::GradeOptConstraints cons;
+        cons.max_slope_x = 3.0;
+        cons.max_slope_y = 3.0;
+        cons.max_evals = 120;
+
+        auto opt = tin::optimize_grade_cost(calc, costs, cons);
+        check_true(std::abs(opt.optimized.plane.slope_x) <= cons.max_slope_x + 1e-9, "slope_x bound");
+        check_true(std::abs(opt.optimized.plane.slope_y) <= cons.max_slope_y + 1e-9, "slope_y bound");
+        check_true(opt.optimized.total_cost <= opt.flat_balance.total_cost + 1e-6, "beats flat balance");
+        check_true(opt.optimized.total_cost <= opt.best_fit.total_cost + 1e-6, "beats/equals clamped best fit");
+        check_true(opt.savings_pct_vs_flat > 25.0, "substantial savings > 25% on sloped terrain");
     });
 
     std::cout << "=== Summary: PASSED " << g_passed << " / " << (g_passed + g_failed) << " ===\n";

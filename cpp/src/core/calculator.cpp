@@ -757,16 +757,45 @@ void TINEarthworkCalculator::subtract_holes(Triangle& tri) {
 }
 
 void TINEarthworkCalculator::calculate_triangle(Triangle& tri) {
+    const double dz0 = tri.p0.delta_z;
+    const double dz1 = tri.p1.delta_z;
+    const double dz2 = tri.p2.delta_z;
+
+    const bool has_regions = !regions_.empty();
+    auto reg_it = has_regions ? regions_.find(tri.id) : regions_.end();
+    if (reg_it == regions_.end()) {
+        const bool has_cut = (dz0 > 0.0 || dz1 > 0.0 || dz2 > 0.0);
+        const bool has_fill = (dz0 < 0.0 || dz1 < 0.0 || dz2 < 0.0);
+        if (!(has_cut && has_fill)) {
+            tri.area = std::abs(
+                (tri.p0.x * (tri.p1.y - tri.p2.y) +
+                 tri.p1.x * (tri.p2.y - tri.p0.y) +
+                 tri.p2.x * (tri.p0.y - tri.p1.y)) * 0.5);
+            tri.volume = tri.area * (dz0 + dz1 + dz2) / 3.0;
+            if (tri.volume > 0.0) {
+                tri.cut_volume = tri.volume;
+                tri.cut_area = tri.area;
+            } else if (tri.volume < 0.0) {
+                tri.fill_volume = -tri.volume;
+                tri.fill_area = tri.area;
+            }
+            tri.avg_delta_z = (tri.area > 0.0) ? (tri.volume / tri.area) : 0.0;
+            if (!hole_regions_.empty()) {
+                subtract_holes(tri);
+            }
+            return;
+        }
+    }
+
     std::vector<XY> verts = {
         {tri.p0.x - origin_.x, tri.p0.y - origin_.y},
         {tri.p1.x - origin_.x, tri.p1.y - origin_.y},
         {tri.p2.x - origin_.x, tri.p2.y - origin_.y}
     };
-    std::vector<double> dz = {tri.p0.delta_z, tri.p1.delta_z, tri.p2.delta_z};
+    std::vector<double> dz = {dz0, dz1, dz2};
 
     std::vector<XY> poly;
     std::vector<double> values;
-    auto reg_it = regions_.find(tri.id);
     if (reg_it != regions_.end()) {
         poly = reg_it->second;
         values.resize(poly.size());
@@ -816,7 +845,7 @@ void TINEarthworkCalculator::calculate_triangle(Triangle& tri) {
             for (const auto& p : poly) target.push_back(to_global(p));
         }
         tri.avg_delta_z = (tri.area > 0.0) ? (tri.volume / tri.area) : 0.0;
-        subtract_holes(tri);
+        if (!hole_regions_.empty()) subtract_holes(tri);
         return;
     }
 
@@ -843,7 +872,7 @@ void TINEarthworkCalculator::calculate_triangle(Triangle& tri) {
     if (zero.size() == 2) {
         tri.zero_segments = clip_to_region(tri.id, to_global(zero[0]), to_global(zero[1]));
     }
-    subtract_holes(tri);
+    if (!hole_regions_.empty()) subtract_holes(tri);
 }
 
 CalculationResult TINEarthworkCalculator::calculate_volumes() {

@@ -6,6 +6,7 @@
 #include <iomanip>
 #include <limits>
 #include <map>
+#include <queue>
 #include <sstream>
 #include <stdexcept>
 
@@ -304,57 +305,114 @@ HaulPlanResult compute_haul_plan(
     std::vector<std::vector<double>> dist(ns, std::vector<double>(nd, 0.0));
     std::vector<std::vector<double>> alloc(ns, std::vector<double>(nd, 0.0));
 
-    struct PairDist { size_t s, d; double dist; };
-    std::vector<PairDist> pairs;
-    pairs.reserve(ns * nd);
     for (size_t s = 0; s < ns; ++s) {
         const auto& zs = out.zones[sup_ids[s]];
         for (size_t d = 0; d < nd; ++d) {
             const auto& zd = out.zones[dem_ids[d]];
-            double dd = std::hypot(zs.cut_centroid.x - zd.fill_centroid.x,
-                                   zs.cut_centroid.y - zd.fill_centroid.y);
-            dist[s][d] = dd;
-            pairs.push_back({s, d, dd});
-        }
-    }
-    std::sort(pairs.begin(), pairs.end(), [](const PairDist& a, const PairDist& b) {
-        return a.dist < b.dist;
-    });
-
-    // 第一阶段：最近运距贪心初始可行解
-    for (const auto& pd : pairs) {
-        double v = std::min(sup_rem[pd.s], dem_rem[pd.d]);
-        if (v > 1e-9) {
-            alloc[pd.s][pd.d] += v;
-            sup_rem[pd.s] -= v;
-            dem_rem[pd.d] -= v;
+            dist[s][d] = std::hypot(zs.cut_centroid.x - zd.fill_centroid.x,
+                                    zs.cut_centroid.y - zd.fill_centroid.y);
         }
     }
 
-    // 第二阶段：2-opt 交叉路线优化（严格单调降低总运距功 ∑ V_ij * d_ij）
-    for (int iter = 0; iter < 64; ++iter) {
-        bool improved = false;
-        for (size_t s1 = 0; s1 < ns; ++s1) {
-            for (size_t d1 = 0; d1 < nd; ++d1) {
-                if (alloc[s1][d1] <= 1e-9) continue;
-                for (size_t s2 = s1 + 1; s2 < ns; ++s2) {
-                    for (size_t d2 = 0; d2 < nd; ++d2) {
-                        if (d2 == d1 || alloc[s2][d2] <= 1e-9) continue;
-                        double cur_cost = dist[s1][d1] + dist[s2][d2];
-                        double alt_cost = dist[s1][d2] + dist[s2][d1];
-                        if (alt_cost + 1e-7 < cur_cost) {
-                            double mv = std::min(alloc[s1][d1], alloc[s2][d2]);
-                            alloc[s1][d1] -= mv;
-                            alloc[s2][d2] -= mv;
-                            alloc[s1][d2] += mv;
-                            alloc[s2][d1] += mv;
-                            improved = true;
+    // 精确最小费用最大流（Successive Shortest Path + SPFA），保证全局 LP 最优且零负权增广圈
+    if (ns > 0 && nd > 0) {
+        const int SRC = static_cast<int>(ns + nd);
+        const int SNK = SRC + 1;
+        const int V = SNK + 1;
+        constexpr double FLOW_EPS = 1e-10;
+        constexpr double COST_EPS = 1e-10;
+        constexpr double INF_CAP = 1e30;
+
+        struct FlowEdge {
+            int to = 0;
+            int rev = 0;
+            double cap = 0.0;
+            double cost = 0.0;
+        };
+        std::vector<std::vector<FlowEdge>> graph(V);
+        auto add_edge = [&](int u, int v, double cap, double cost) {
+            int ru = static_cast<int>(graph[v].size());
+            int rv = static_cast<int>(graph[u].size());
+            graph[u].push_back({v, ru, cap, cost});
+            graph[v].push_back({u, rv, 0.0, -cost});
+        };
+
+        for (size_t s = 0; s < ns; ++s) {
+            add_edge(SRC, static_cast<int>(s), sup_rem[s], 0.0);
+        }
+        std::vector<std::vector<int>> pair_edge_idx(ns, std::vector<int>(nd, -1));
+        for (size_t s = 0; s < ns; ++s) {
+            for (size_t d = 0; d < nd; ++d) {
+                pair_edge_idx[s][d] = static_cast<int>(graph[s].size());
+                add_edge(static_cast<int>(s), static_cast<int>(ns + d), INF_CAP, dist[s][d]);
+            }
+        }
+        for (size_t d = 0; d < nd; ++d) {
+            add_edge(static_cast<int>(ns + d), SNK, dem_rem[d], 0.0);
+        }
+
+        std::vector<double> dvec(V);
+        std::vector<int> prev_v(V), prev_e(V);
+        std::vector<bool> in_q(V);
+        std::queue<int> q;
+
+        while (true) {
+            std::fill(dvec.begin(), dvec.end(), std::numeric_limits<double>::infinity());
+            std::fill(prev_v.begin(), prev_v.end(), -1);
+            std::fill(in_q.begin(), in_q.end(), false);
+            while (!q.empty()) q.pop();
+
+            dvec[SRC] = 0.0;
+            q.push(SRC);
+            in_q[SRC] = true;
+
+            while (!q.empty()) {
+                int u = q.front();
+                q.pop();
+                in_q[u] = false;
+                for (int ei = 0; ei < static_cast<int>(graph[u].size()); ++ei) {
+                    const auto& e = graph[u][ei];
+                    if (e.cap <= FLOW_EPS) continue;
+                    double ndist = dvec[u] + e.cost;
+                    if (ndist + COST_EPS < dvec[e.to]) {
+                        dvec[e.to] = ndist;
+                        prev_v[e.to] = u;
+                        prev_e[e.to] = ei;
+                        if (!in_q[e.to]) {
+                            q.push(e.to);
+                            in_q[e.to] = true;
                         }
                     }
                 }
             }
+
+            if (!std::isfinite(dvec[SNK]) || prev_v[SNK] == -1) break;
+
+            double push = INF_CAP;
+            for (int v = SNK; v != SRC; v = prev_v[v]) {
+                const auto& e = graph[prev_v[v]][prev_e[v]];
+                push = std::min(push, e.cap);
+            }
+            if (push <= FLOW_EPS) break;
+
+            for (int v = SNK; v != SRC; v = prev_v[v]) {
+                auto& e = graph[prev_v[v]][prev_e[v]];
+                e.cap -= push;
+                graph[v][e.rev].cap += push;
+            }
         }
-        if (!improved) break;
+
+        for (size_t s = 0; s < ns; ++s) {
+            for (size_t d = 0; d < nd; ++d) {
+                const auto& fwd = graph[s][pair_edge_idx[s][d]];
+                double sent = graph[ns + d][fwd.rev].cap;
+                if (sent > 1e-9) {
+                    alloc[s][d] = sent;
+                    sup_rem[s] = std::max(0.0, sup_rem[s] - sent);
+                    dem_rem[d] = std::max(0.0, dem_rem[d] - sent);
+                }
+            }
+        }
     }
 
     for (size_t s = 0; s < ns; ++s) {

@@ -31,8 +31,7 @@ double in_circle_ccw(const XY& a, const XY& b, const XY& c, const XY& d) {
 
 struct BWCircle {
     int a, b, c;
-    double cx, cy, r2;
-    bool valid = true;
+    double cx, cy, r2, max_x;
 };
 
 BWCircle make_bw_tri(const std::vector<XY>& pts, int a, int b, int c) {
@@ -45,7 +44,7 @@ BWCircle make_bw_tri(const std::vector<XY>& pts, int a, int b, int c) {
     double ax = pb.x - pa.x, ay = pb.y - pa.y;
     double bx = pc.x - pa.x, by = pc.y - pa.y;
     double d = 2.0 * (ax * by - ay * bx);
-    BWCircle tri{a, b, c, 0.0, 0.0, 0.0, true};
+    BWCircle tri{a, b, c, 0.0, 0.0, 0.0, std::numeric_limits<double>::infinity()};
     if (std::abs(d) < 1e-18) {
         tri.cx = (pa.x + pb.x + pc.x) / 3.0;
         tri.cy = (pa.y + pb.y + pc.y) / 3.0;
@@ -59,6 +58,7 @@ BWCircle make_bw_tri(const std::vector<XY>& pts, int a, int b, int c) {
     tri.cx = pa.x + ux;
     tri.cy = pa.y + uy;
     tri.r2 = ux * ux + uy * uy;
+    tri.max_x = tri.cx + std::sqrt(tri.r2);
     return tri;
 }
 
@@ -100,41 +100,48 @@ std::vector<TriIndex> build_delaunay(const std::vector<XY>& points) {
         return norm[i].y < norm[j].y;
     });
 
-    std::vector<BWCircle> tris;
-    tris.reserve(n * 2 + 8);
-    tris.push_back(make_bw_tri(norm, s0, s1, s2));
+    std::vector<BWCircle> active_tris;
+    std::vector<BWCircle> finished_tris;
+    active_tris.reserve(256);
+    finished_tris.reserve(n * 2 + 8);
+    active_tris.push_back(make_bw_tri(norm, s0, s1, s2));
 
     struct Edge {
         int u, v;
-        bool operator==(const Edge& o) const { return u == o.u && v == o.v; }
     };
+
+    std::vector<Edge> edges;
+    std::vector<Edge> polygon;
+    edges.reserve(48);
+    polygon.reserve(24);
 
     for (int p : order) {
         const XY& pt = norm[p];
-        std::vector<Edge> polygon;
-        polygon.reserve(16);
-        std::vector<int> bad_indices;
-        bad_indices.reserve(16);
+        edges.clear();
+        polygon.clear();
 
-        for (int ti = 0; ti < static_cast<int>(tris.size()); ++ti) {
-            const auto& t = tris[ti];
-            if (!t.valid) continue;
+        size_t ti = 0;
+        while (ti < active_tris.size()) {
+            const BWCircle& t = active_tris[ti];
+            if (t.max_x < pt.x - 1e-10) {
+                if (t.a < n && t.b < n && t.c < n) {
+                    finished_tris.push_back(t);
+                }
+                active_tris[ti] = active_tris.back();
+                active_tris.pop_back();
+                continue;
+            }
             double dx = pt.x - t.cx;
             double dy = pt.y - t.cy;
             if (dx * dx + dy * dy <= t.r2 * (1.0 + 1e-12) + 1e-15) {
-                bad_indices.push_back(ti);
+                edges.push_back({t.a, t.b});
+                edges.push_back({t.b, t.c});
+                edges.push_back({t.c, t.a});
+                active_tris[ti] = active_tris.back();
+                active_tris.pop_back();
+                continue;
             }
-        }
-
-        // 记录空腔所有有向边，反向边相互抵消即为边界环
-        std::vector<Edge> edges;
-        edges.reserve(bad_indices.size() * 3);
-        for (int ti : bad_indices) {
-            const auto& t = tris[ti];
-            edges.push_back({t.a, t.b});
-            edges.push_back({t.b, t.c});
-            edges.push_back({t.c, t.a});
-            tris[ti].valid = false;
+            ++ti;
         }
 
         for (size_t i = 0; i < edges.size(); ++i) {
@@ -155,24 +162,24 @@ std::vector<TriIndex> build_delaunay(const std::vector<XY>& points) {
             if (std::abs(orient2d(norm[e.u], norm[e.v], pt)) <= 1e-16) {
                 continue; // 避免退化零面积三角形
             }
-            tris.push_back(make_bw_tri(norm, e.u, e.v, p));
+            active_tris.push_back(make_bw_tri(norm, e.u, e.v, p));
         }
     }
 
     std::vector<TriIndex> result;
-    result.reserve(tris.size());
-    for (const auto& t : tris) {
-        if (!t.valid) continue;
-        if (t.a >= n || t.b >= n || t.c >= n) continue;
-        if (std::abs(orient2d(points[t.a], points[t.b], points[t.c])) <= 1e-12 * scale * scale) {
-            continue;
-        }
-        if (orient2d(points[t.a], points[t.b], points[t.c]) < 0.0) {
+    result.reserve(finished_tris.size() + active_tris.size());
+    auto emit_if_valid = [&](const BWCircle& t) {
+        if (t.a >= n || t.b >= n || t.c >= n) return;
+        double area2 = orient2d(points[t.a], points[t.b], points[t.c]);
+        if (std::abs(area2) <= 1e-12 * scale * scale) return;
+        if (area2 < 0.0) {
             result.push_back({t.a, t.c, t.b});
         } else {
             result.push_back({t.a, t.b, t.c});
         }
-    }
+    };
+    for (const auto& t : finished_tris) emit_if_valid(t);
+    for (const auto& t : active_tris) emit_if_valid(t);
 
     if (result.empty()) {
         throw std::runtime_error("无法构建三角网：测量点全部共线或重复");

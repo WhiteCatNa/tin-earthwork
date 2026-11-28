@@ -12,6 +12,7 @@ add_library(tin_earthwork_core STATIC
     src/core/calculator.cpp
     src/core/analysis.cpp
     src/core/engineering.cpp
+    src/core/ai_optimizer.cpp
     src/io/io.cpp
     third_party/miniz/miniz.c
 )
