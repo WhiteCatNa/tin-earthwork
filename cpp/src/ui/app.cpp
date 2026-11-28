@@ -929,6 +929,26 @@ bool CassApp::run_drainage_action(double min_slope_pct) {
     return true;
 }
 
+bool CassApp::run_sensitivity_action() {
+    if (project_.points.size() < 3) {
+        status_text_ = "测点不足，无法计算标高敏感性曲线";
+        return false;
+    }
+    try {
+        TINEarthworkCalculator calc(project_.settings.design_elevation);
+        configure_calculator(calc);
+        calc.build_tin();
+        sensitivity_result_ = run_elevation_sensitivity_curve(calc, cost_params_, 17, 0.0);
+        status_text_ = sensitivity_result_->summary;
+        log_cmd("命令: _SENSITIVITY -> " + sensitivity_result_->summary);
+        return true;
+    } catch (const std::exception& e) {
+        status_text_ = std::string("敏感性曲线计算失败: ") + e.what();
+        log_cmd("错误: " + status_text_);
+        return false;
+    }
+}
+
 bool CassApp::run_ai_full_workflow_action() {
     if (project_.points.size() < 4) {
         status_text_ = "请先导入不少于 4 个测点再运行一键 AI 全流程诊断";
@@ -1179,6 +1199,10 @@ void CassApp::execute_command(const std::string& raw_cmd) {
         break;
     case AssistantAction::CheckDrainage:
         run_drainage_action(intent.has_param1 ? intent.param1 : drain_min_slope_);
+        set_inspector_tab(6);
+        break;
+    case AssistantAction::RunSensitivity:
+        run_sensitivity_action();
         set_inspector_tab(6);
         break;
     case AssistantAction::MeasureDist:
@@ -2709,6 +2733,60 @@ void CassApp::render_tab_ai() {
     if (ImGui::Button("导出补测 CSV", ImVec2(-1, 0))) action_export_survey_rec_csv();
     if (ImGui::Button("导出 AI 专题 DXF 图层 (异常/补测/调配/放坡)", ImVec2(-1, 0))) {
         action_export_ai_dxf();
+    }
+
+    ImGui::Spacing();
+    draw_section_bar("7. 标高-方量/综合费用敏感性曲线");
+    if (ImGui::Button("生成标高敏感性曲线 (17档)", ImVec2(-1, 0))) {
+        run_sensitivity_action();
+    }
+    if (sensitivity_result_ && sensitivity_result_->points.size() >= 2) {
+        const auto& pts = sensitivity_result_->points;
+        ImGui::TextWrapped("%s", sensitivity_result_->summary.c_str());
+
+        ImVec2 avail = ImGui::GetContentRegionAvail();
+        float cw = std::max(180.0f, avail.x);
+        float ch = 128.0f;
+        ImVec2 p0 = ImGui::GetCursorScreenPos();
+        ImVec2 p1(p0.x + cw, p0.y + ch);
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        dl->AddRectFilled(p0, p1, IM_COL32(0x11, 0x15, 0x1C, 255), 3.0f);
+        dl->AddRect(p0, p1, IM_COL32(0x33, 0x3D, 0x4E, 255), 3.0f);
+
+        double max_vol = 1.0, max_cost = 1.0, min_cost = pts[0].total_cost;
+        for (const auto& sp : pts) {
+            max_vol = std::max({max_vol, sp.cut_volume, sp.fill_volume});
+            max_cost = std::max(max_cost, sp.total_cost);
+            min_cost = std::min(min_cost, sp.total_cost);
+        }
+        double cost_span = std::max(1.0, max_cost - min_cost);
+        double h0 = pts.front().elevation;
+        double h1 = std::max(h0 + 1e-6, pts.back().elevation);
+        auto map_x = [&](double h) {
+            return p0.x + 8.0f + static_cast<float>((h - h0) / (h1 - h0)) * (cw - 16.0f);
+        };
+        auto map_yv = [&](double v) {
+            return p1.y - 10.0f - static_cast<float>(v / max_vol) * (ch - 28.0f);
+        };
+        auto map_yc = [&](double c) {
+            return p1.y - 10.0f - static_cast<float>((c - min_cost) / cost_span) * (ch - 28.0f);
+        };
+
+        for (size_t i = 0; i + 1 < pts.size(); ++i) {
+            float x0s = map_x(pts[i].elevation), x1s = map_x(pts[i + 1].elevation);
+            dl->AddLine(ImVec2(x0s, map_yv(pts[i].cut_volume)), ImVec2(x1s, map_yv(pts[i + 1].cut_volume)),
+                        IM_COL32(0xF8, 0x71, 0x71, 230), 1.8f);
+            dl->AddLine(ImVec2(x0s, map_yv(pts[i].fill_volume)), ImVec2(x1s, map_yv(pts[i + 1].fill_volume)),
+                        IM_COL32(0x38, 0xBD, 0xF8, 230), 1.8f);
+            dl->AddLine(ImVec2(x0s, map_yc(pts[i].total_cost)), ImVec2(x1s, map_yc(pts[i + 1].total_cost)),
+                        IM_COL32(0x4A, 0xDE, 0x80, 240), 2.2f);
+        }
+        float bx = map_x(sensitivity_result_->best_cost_elevation);
+        dl->AddLine(ImVec2(bx, p0.y + 6), ImVec2(bx, p1.y - 6), IM_COL32(0xFA, 0xCC, 0x15, 200), 1.4f);
+        dl->AddText(ImVec2(p0.x + 8, p0.y + 4), IM_COL32(0xF8, 0x71, 0x71, 240), "挖方");
+        dl->AddText(ImVec2(p0.x + 42, p0.y + 4), IM_COL32(0x38, 0xBD, 0xF8, 240), "填方");
+        dl->AddText(ImVec2(p0.x + 76, p0.y + 4), IM_COL32(0x4A, 0xDE, 0x80, 240), "总费用");
+        ImGui::Dummy(ImVec2(cw, ch + 4.0f));
     }
 
     ImGui::EndChild();

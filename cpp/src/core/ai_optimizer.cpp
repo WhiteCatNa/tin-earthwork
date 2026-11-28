@@ -329,6 +329,120 @@ std::vector<int> convex_hull_indices(const std::vector<SurveyPoint>& pts) {
     return hull;
 }
 
+// 二维均匀空间网格加速索引（将 k-NN 与最近邻查询从 O(N²) 降至均摊 O(N)）
+class SpatialGrid2D {
+public:
+    explicit SpatialGrid2D(const std::vector<SurveyPoint>& pts) : pts_(pts) {
+        const size_t n = pts.size();
+        if (n == 0) return;
+        xmin_ = xmax_ = pts[0].x;
+        ymin_ = ymax_ = pts[0].y;
+        for (const auto& p : pts) {
+            xmin_ = std::min(xmin_, p.x);
+            xmax_ = std::max(xmax_, p.x);
+            ymin_ = std::min(ymin_, p.y);
+            ymax_ = std::max(ymax_, p.y);
+        }
+        int dim = static_cast<int>(std::clamp(std::sqrt(static_cast<double>(n) / 4.0), 4.0, 96.0));
+        gx_ = dim;
+        gy_ = dim;
+        double span_x = std::max(xmax_ - xmin_, 1.0);
+        double span_y = std::max(ymax_ - ymin_, 1.0);
+        cw_ = span_x / static_cast<double>(gx_);
+        ch_ = span_y / static_cast<double>(gy_);
+        min_cell_ = std::min(cw_, ch_);
+        cells_.resize(static_cast<size_t>(gx_ * gy_));
+        for (size_t i = 0; i < n; ++i) {
+            int cx = std::clamp(static_cast<int>((pts[i].x - xmin_) / cw_), 0, gx_ - 1);
+            int cy = std::clamp(static_cast<int>((pts[i].y - ymin_) / ch_), 0, gy_ - 1);
+            cells_[static_cast<size_t>(cy * gx_ + cx)].push_back(i);
+        }
+    }
+
+    void query_knn(
+        size_t target_idx,
+        size_t k,
+        std::vector<std::pair<double, size_t>>& out_knn,
+        double& out_nn_dist,
+        bool* out_dup_conflict = nullptr,
+        double* out_dup_ref_z = nullptr) const {
+        out_knn.clear();
+        const auto& pi = pts_[target_idx];
+        double min_nonzero_d2 = std::numeric_limits<double>::infinity();
+        if (out_dup_conflict) *out_dup_conflict = false;
+
+        int cx0 = std::clamp(static_cast<int>((pi.x - xmin_) / cw_), 0, gx_ - 1);
+        int cy0 = std::clamp(static_cast<int>((pi.y - ymin_) / ch_), 0, gy_ - 1);
+        int max_r = std::max({cx0, gx_ - 1 - cx0, cy0, gy_ - 1 - cy0});
+
+        auto scan_cell = [&](int cx, int cy) {
+            for (size_t j : cells_[static_cast<size_t>(cy * gx_ + cx)]) {
+                if (j == target_idx) continue;
+                double dx = pts_[j].x - pi.x;
+                double dy = pts_[j].y - pi.y;
+                double d2 = dx * dx + dy * dy;
+                if (d2 < 1e-6) {
+                    if (out_dup_conflict && out_dup_ref_z &&
+                        std::abs(pts_[j].z - pi.z) > 0.05 && j < target_idx) {
+                        *out_dup_conflict = true;
+                        *out_dup_ref_z = pts_[j].z;
+                    }
+                    continue;
+                }
+                min_nonzero_d2 = std::min(min_nonzero_d2, d2);
+                out_knn.push_back({d2, j});
+            }
+        };
+
+        for (int r = 0; r <= max_r; ++r) {
+            if (r == 0) {
+                scan_cell(cx0, cy0);
+            } else {
+                int x_lo = std::max(0, cx0 - r);
+                int x_hi = std::min(gx_ - 1, cx0 + r);
+                int y_lo = std::max(0, cy0 - r);
+                int y_hi = std::min(gy_ - 1, cy0 + r);
+                for (int cx = x_lo; cx <= x_hi; ++cx) {
+                    if (cy0 - r >= 0) scan_cell(cx, cy0 - r);
+                    if (cy0 + r <= gy_ - 1) scan_cell(cx, cy0 + r);
+                }
+                for (int cy = y_lo + 1; cy <= y_hi - 1; ++cy) {
+                    if (cx0 - r >= 0) scan_cell(cx0 - r, cy);
+                    if (cx0 + r <= gx_ - 1) scan_cell(cx0 + r, cy);
+                }
+            }
+            if (r >= 1 && out_knn.size() >= k && std::isfinite(min_nonzero_d2)) {
+                std::nth_element(out_knn.begin(),
+                                 out_knn.begin() + static_cast<ptrdiff_t>(k - 1),
+                                 out_knn.end(),
+                                 [](const auto& a, const auto& b) { return a.first < b.first; });
+                double kth_d2 = out_knn[k - 1].first;
+                double next_min_d = static_cast<double>(r) * min_cell_;
+                if (next_min_d * next_min_d > kth_d2 + 1e-9) {
+                    break;
+                }
+            }
+        }
+
+        out_nn_dist = std::isfinite(min_nonzero_d2) ? std::sqrt(min_nonzero_d2) : 0.0;
+        if (out_knn.size() > k) {
+            std::partial_sort(out_knn.begin(), out_knn.begin() + static_cast<ptrdiff_t>(k), out_knn.end(),
+                              [](const auto& a, const auto& b) { return a.first < b.first; });
+            out_knn.resize(k);
+        } else {
+            std::sort(out_knn.begin(), out_knn.end(),
+                      [](const auto& a, const auto& b) { return a.first < b.first; });
+        }
+    }
+
+private:
+    const std::vector<SurveyPoint>& pts_;
+    double xmin_ = 0.0, xmax_ = 0.0, ymin_ = 0.0, ymax_ = 0.0;
+    double cw_ = 1.0, ch_ = 1.0, min_cell_ = 1.0;
+    int gx_ = 1, gy_ = 1;
+    std::vector<std::vector<size_t>> cells_;
+};
+
 } // namespace
 
 GradeOptimizationResult optimize_grade_cost(
@@ -601,40 +715,24 @@ SiteHealthReport detect_survey_anomalies(const std::vector<SurveyPoint>& points)
     std::vector<bool> dup_conflict(n, false);
     std::vector<double> dup_ref_z(n, 0.0);
 
+    SpatialGrid2D grid(points);
     std::vector<std::pair<double, size_t>> buf;
-    buf.reserve(n);
+    buf.reserve(32);
 
     for (size_t i = 0; i < n; ++i) {
         const auto& pi = points[i];
-        buf.clear();
-        double min_nonzero_d2 = std::numeric_limits<double>::infinity();
-        for (size_t j = 0; j < n; ++j) {
-            if (i == j) continue;
-            double dx = points[j].x - pi.x;
-            double dy = points[j].y - pi.y;
-            double d2 = dx * dx + dy * dy;
-            if (d2 < 1e-6) {
-                if (std::abs(points[j].z - pi.z) > 0.05 && j < i) {
-                    dup_conflict[i] = true;
-                    dup_ref_z[i] = points[j].z;
-                }
-                continue;
-            }
-            min_nonzero_d2 = std::min(min_nonzero_d2, d2);
-            buf.push_back({d2, j});
+        bool dc = false;
+        double dref = 0.0;
+        grid.query_knn(i, K, buf, nn_dist[i], &dc, &dref);
+        if (dc) {
+            dup_conflict[i] = true;
+            dup_ref_z[i] = dref;
         }
-        nn_dist[i] = std::isfinite(min_nonzero_d2) ? std::sqrt(min_nonzero_d2) : 0.0;
-
         if (buf.empty()) {
             expected_z[i] = pi.z;
             residuals[i] = 0.0;
             continue;
         }
-        size_t take = std::min(K, buf.size());
-        std::partial_sort(buf.begin(), buf.begin() + static_cast<ptrdiff_t>(take), buf.end(),
-                          [](const auto& a, const auto& b) { return a.first < b.first; });
-        buf.resize(take);
-
         expected_z[i] = predict_local_elevation_robust(points, i, buf);
         residuals[i] = pi.z - expected_z[i];
     }
@@ -890,17 +988,25 @@ UncertaintyReport analyze_uncertainty_and_recommend(
     }
     double var_meas = rep.measure_sigma * rep.measure_sigma * sum_w2;
 
-    // 规则布点 vs 不规则布点偏差不确定度因子 c
+    // 规则布点 vs 不规则布点偏差不确定度因子 c，并复用 O(N) 空间网格估计局部曲率 κ
+    SpatialGrid2D grid(pts);
+    std::unordered_map<long long, double> vertex_kappa;
+    vertex_kappa.reserve(n * 2);
+    std::vector<std::pair<double, size_t>> knn_buf;
+    knn_buf.reserve(16);
+
     for (size_t i = 0; i < n; ++i) {
-        double best = std::numeric_limits<double>::infinity();
-        for (size_t j = 0; j < n; ++j) {
-            if (i == j) continue;
-            double dx = pts[j].x - pts[i].x;
-            double dy = pts[j].y - pts[i].y;
-            double d2 = dx * dx + dy * dy;
-            if (d2 > 1e-8) best = std::min(best, d2);
+        grid.query_knn(i, 6, knn_buf, nn_d[i]);
+        if (knn_buf.empty()) {
+            vertex_kappa[pt_key(pts[i].x, pts[i].y)] = 1e-4;
+            continue;
         }
-        nn_d[i] = std::isfinite(best) ? std::sqrt(best) : 0.0;
+        double pred = predict_local_elevation_robust(pts, i, knn_buf);
+        double mean_l2 = 0.0;
+        for (const auto& kv : knn_buf) mean_l2 += kv.first;
+        mean_l2 /= static_cast<double>(knn_buf.size());
+        double kappa = std::abs(pts[i].z - pred) / std::max(mean_l2, 1.0);
+        vertex_kappa[pt_key(pts[i].x, pts[i].y)] = std::max(kappa, 1e-5);
     }
     auto [nn_mean, nn_sd] = mean_sd(nn_d);
     double nn_cv = (nn_mean > 1e-9) ? (nn_sd / nn_mean) : 1.0;
@@ -922,36 +1028,6 @@ UncertaintyReport analyze_uncertainty_and_recommend(
 
     rep.cut_rel_ci95_pct = (rep.cut_corrected > 1e-6) ? (rep.cut_ci95 / rep.cut_corrected * 100.0) : 0.0;
     rep.fill_rel_ci95_pct = (rep.fill_corrected > 1e-6) ? (rep.fill_ci95 / rep.fill_corrected * 100.0) : 0.0;
-
-    // 3. 局部弯曲程度 κ 估计 + 贪心最大误差缩减补测点推荐
-    std::unordered_map<long long, double> vertex_kappa;
-    vertex_kappa.reserve(n * 2);
-    std::vector<std::pair<double, size_t>> knn_buf;
-    knn_buf.reserve(n);
-    for (size_t i = 0; i < n; ++i) {
-        knn_buf.clear();
-        for (size_t j = 0; j < n; ++j) {
-            if (i == j) continue;
-            double dx = pts[j].x - pts[i].x;
-            double dy = pts[j].y - pts[i].y;
-            double d2 = dx * dx + dy * dy;
-            if (d2 > 1e-6) knn_buf.push_back({d2, j});
-        }
-        size_t take = std::min<size_t>(6, knn_buf.size());
-        if (take == 0) {
-            vertex_kappa[pt_key(pts[i].x, pts[i].y)] = 1e-4;
-            continue;
-        }
-        std::partial_sort(knn_buf.begin(), knn_buf.begin() + static_cast<ptrdiff_t>(take), knn_buf.end(),
-                          [](const auto& a, const auto& b) { return a.first < b.first; });
-        knn_buf.resize(take);
-        double pred = predict_local_elevation_robust(pts, i, knn_buf);
-        double mean_l2 = 0.0;
-        for (const auto& kv : knn_buf) mean_l2 += kv.first;
-        mean_l2 /= static_cast<double>(take);
-        double kappa = std::abs(pts[i].z - pred) / std::max(mean_l2, 1.0);
-        vertex_kappa[pt_key(pts[i].x, pts[i].y)] = std::max(kappa, 1e-5);
-    }
 
     struct CandTri {
         double score;
@@ -1348,6 +1424,52 @@ DrainageReport analyze_drainage_and_ponding(
         << "°；低于 " << std::setprecision(2) << out.min_required_slope_pct
         << "% 积水风险区占比 " << std::setprecision(1) << out.ponding_ratio_pct
         << "%（" << out.ponding_triangle_ids.size() << " 个三角形）";
+    out.summary = oss.str();
+    return out;
+}
+
+SensitivityCurveResult run_elevation_sensitivity_curve(
+    const TINEarthworkCalculator& base_calc,
+    const HaulCostParams& costs,
+    int steps,
+    double half_span_m) {
+    if (base_calc.points().size() < 3) {
+        throw std::runtime_error("至少需要 3 个测量点才能生成标高敏感性曲线");
+    }
+
+    TINEarthworkCalculator work = base_calc;
+    if (!work.has_tin()) work.build_tin();
+
+    BalanceResult bal = solve_balance_elevation(work, work.soil_factors());
+    double z_span = std::max(1.0, bal.natural_max - bal.natural_min);
+    double span = (half_span_m > 1e-6) ? half_span_m : std::max(1.0, 0.55 * z_span);
+    int n_steps = std::clamp(steps, 5, 41);
+
+    SensitivityCurveResult out;
+    out.center_elevation = bal.elevation;
+    out.min_total_cost = std::numeric_limits<double>::infinity();
+    out.points.reserve(static_cast<size_t>(n_steps));
+
+    for (int i = 0; i < n_steps; ++i) {
+        double frac = static_cast<double>(i) / static_cast<double>(n_steps - 1);
+        double h = (bal.elevation - span) + frac * (2.0 * span);
+        work.set_design_elevation(h);
+        CalculationResult res = work.calculate_volumes();
+        HaulPlanResult haul = compute_haul_plan(res, 4, 3, costs);
+
+        SensitivityPoint pt{h, res.total_cut, res.total_fill, res.net_volume, haul.estimated_cost};
+        if (pt.total_cost < out.min_total_cost) {
+            out.min_total_cost = pt.total_cost;
+            out.best_cost_elevation = h;
+        }
+        out.points.push_back(pt);
+    }
+
+    std::ostringstream oss;
+    oss << std::fixed << std::setprecision(2)
+        << "平场经济最优标高 " << out.best_cost_elevation << " m（综合成本 ¥"
+        << std::setprecision(0) << out.min_total_cost << "，平衡标高 H0="
+        << std::setprecision(2) << out.center_elevation << " m）";
     out.summary = oss.str();
     return out;
 }

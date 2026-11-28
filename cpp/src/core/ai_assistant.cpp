@@ -164,6 +164,10 @@ AssistantIntent parse_engineering_intent(const std::string& raw_input) {
         out.action = AssistantAction::CheckDrainage;
         return out;
     }
+    if (up == "SENSITIVITY" || up == "CURVE") {
+        out.action = AssistantAction::RunSensitivity;
+        return out;
+    }
     if (up == "MEASURE" || up == "DIST" || up == "DI") {
         out.action = AssistantAction::MeasureDist;
         return out;
@@ -293,6 +297,11 @@ AssistantIntent parse_engineering_intent(const std::string& raw_input) {
             out.has_param1 = true;
         }
         out.reply = "AI助手: 执行保精度点云抽稀";
+        return out;
+    }
+    if (contains_any(lo, {"敏感性", "标高曲线", "sensitivity", "elevation curve"})) {
+        out.action = AssistantAction::RunSensitivity;
+        out.reply = "AI助手: 生成设计标高-方量/综合费用敏感性曲线";
         return out;
     }
     if (contains_any(lo, {"积水", "排水", "drainage", "ponding"})) {
@@ -467,7 +476,7 @@ std::vector<std::string> suggest_command_completions(const std::string& prefix) 
         "CALC", "CLEAN", "CLEAR", "CLRBND", "CONTOUR", "DARK", "DAT",
         "DIAG", "DIST", "DRAIN", "DXF", "EXP_AIDXF", "EXP_REC", "FITPLANE", "GRID", "H0", "HAUL",
         "HELP", "HTMLRPT", "LIGHT", "MEASURE", "OPT", "OUTLINE", "PROFILE",
-        "REDO", "SECTIONS", "SIGNIF", "SLOPE", "STRATA", "SWAP", "THIN", "UNCERT",
+        "REDO", "SECTIONS", "SENSITIVITY", "SIGNIF", "SLOPE", "STRATA", "SWAP", "THIN", "UNCERT",
         "UNDO", "ZE", "2D", "3D"
     };
     std::string up = upper_str(trim_str(prefix));

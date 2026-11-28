@@ -7,6 +7,7 @@
 #include "core/geometry.hpp"
 #include "io/io.hpp"
 
+#include <chrono>
 #include <cmath>
 #include <filesystem>
 #include <fstream>
@@ -807,6 +808,54 @@ int main(int argc, char** argv) {
                    dxf_s.find("AI_SLOPE_DAYLIGHT") != std::string::npos &&
                    dxf_s.find("EOF") != std::string::npos,
                    "AI DXF contains all 4 AI overlay layers and EOF");
+    });
+
+    // 30. O(N) 空间网格 5000 点异常检测压力测试与标高敏感性曲线校验
+    run_test("30_spatial_grid_5000pts_stress_and_sensitivity_curve", [&]() {
+        auto pts5k = make_grid_points(71, 71, 5.0, [](double x, double y) {
+            return 30.0 + 0.02 * x - 0.015 * y + 0.9 * std::sin(0.035 * x) * std::cos(0.03 * y);
+        }); // 5041 points
+        std::vector<int> inj;
+        for (int idx = 150; idx < 4800; idx += 450) {
+            pts5k[idx].z += ((inj.size() % 2 == 0) ? 4.5 : -4.2);
+            inj.push_back(idx);
+        }
+        auto t0 = std::chrono::steady_clock::now();
+        auto rep5k = tin::detect_survey_anomalies(pts5k);
+        auto t1 = std::chrono::steady_clock::now();
+        double ms5k = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        std::cout << "  [STRESS 5041 pts spatial-grid anomaly scan] ms=" << std::fixed << std::setprecision(2) << ms5k
+                  << " found=" << rep5k.anomalies.size() << "\n";
+        int tp = 0;
+        for (const auto& a : rep5k.anomalies) {
+            if (std::find(inj.begin(), inj.end(), a.point_index) != inj.end()) ++tp;
+        }
+        check_true(tp == static_cast<int>(inj.size()), "100% recall on 5041 pts");
+        check_true(rep5k.anomalies.size() <= inj.size() + 2, "high precision on 5041 pts");
+        check_true(ms5k < 150.0, "5000-pt O(N) spatial grid anomaly scan < 150 ms");
+
+        // 标高敏感性曲线单调性与 CSV 导出验证
+        auto pts = make_grid_points(7, 7, 20.0, [](double x, double y) {
+            return 20.0 + 0.04 * x - 0.02 * y;
+        });
+        tin::TINEarthworkCalculator calc(22.0);
+        calc.add_points(pts);
+        calc.build_tin();
+        auto curve = tin::run_elevation_sensitivity_curve(calc, tin::HaulCostParams{}, 15, 3.0);
+        check_true(curve.points.size() == 15, "15 sensitivity samples");
+        for (size_t i = 0; i + 1 < curve.points.size(); ++i) {
+            check_true(curve.points[i + 1].cut_volume <= curve.points[i].cut_volume + 1e-6, "cut non-increasing");
+            check_true(curve.points[i + 1].fill_volume >= curve.points[i].fill_volume - 1e-6, "fill non-decreasing");
+        }
+        check_true(curve.min_total_cost <= curve.points.front().total_cost + 1e-6 &&
+                   curve.min_total_cost <= curve.points.back().total_cost + 1e-6,
+                   "best cost <= endpoints");
+
+        auto tmp = std::filesystem::temp_directory_path() / L"tin_earthwork_cpp_tests";
+        std::filesystem::create_directories(tmp);
+        std::string sens_csv = tin::wide_to_utf8((tmp / L"sensitivity.csv").wstring());
+        tin::export_sensitivity_csv(curve, sens_csv);
+        check_true(std::filesystem::file_size(tin::utf8_to_wide(sens_csv)) > 200, "sensitivity csv non-empty");
     });
 
     std::cout << "=== Summary: PASSED " << g_passed << " / " << (g_passed + g_failed) << " ===\n";

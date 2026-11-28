@@ -180,4 +180,27 @@ DrainageReport analyze_drainage_and_ponding(
     double min_slope_pct = 0.3,
     bool use_design_surface = true);
 
+// ---------- 7. 设计标高-方量/综合费用敏感性曲线 ----------
+struct SensitivityPoint {
+    double elevation = 0.0;
+    double cut_volume = 0.0;
+    double fill_volume = 0.0;
+    double net_volume = 0.0;
+    double total_cost = 0.0;
+};
+
+struct SensitivityCurveResult {
+    double center_elevation = 0.0;
+    double best_cost_elevation = 0.0;
+    double min_total_cost = 0.0;
+    std::vector<SensitivityPoint> points;
+    std::string summary;
+};
+
+SensitivityCurveResult run_elevation_sensitivity_curve(
+    const TINEarthworkCalculator& base_calc,
+    const HaulCostParams& costs = HaulCostParams{},
+    int steps = 17,
+    double half_span_m = 0.0);
+
 } // namespace tin

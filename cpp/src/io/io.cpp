@@ -1280,6 +1280,20 @@ void export_survey_recommendations_csv(const UncertaintyReport& uncertainty, con
     write_utf8_text(utf8_path, os.str(), true);
 }
 
+void export_sensitivity_csv(const SensitivityCurveResult& curve, const std::string& utf8_path) {
+    if (curve.points.empty()) {
+        throw std::runtime_error("没有可导出的标高敏感性曲线数据");
+    }
+    std::ostringstream os;
+    os << std::fixed << std::setprecision(3);
+    os << "设计标高(m),挖方量(m³),填方量(m³),净方量(m³),估算综合费用(元)\n";
+    for (const auto& p : curve.points) {
+        os << p.elevation << "," << p.cut_volume << "," << p.fill_volume << ","
+           << p.net_volume << "," << p.total_cost << "\n";
+    }
+    write_utf8_text(utf8_path, os.str(), true);
+}
+
 void export_ai_overlays_dxf(
     const CalculationResult* result,
     const SiteHealthReport* health,

@@ -88,3 +88,25 @@ _以下各轮记录均由 `python3 tools/eval_cpp_goal.py` 真实编译、运行
 - **实测结果（`python3 tools/eval_cpp_goal.py`）**：
   - 综合评分：**`100.00 / 100.00`**（0 编译警告，CTest 3/3 + 29/29 核心单测全过）
 - **下一步持续迭代方向**：进入 `v3.7.0`（$O(N)$ 二维均匀空间网格加速、5000 点大规模压力测试与标高-方量/费用敏感性曲线）。
+
+---
+
+## Iteration 7 — O(N) 空间网格加速与标高敏感性曲线 (v3.7.0)
+
+### 改动清单
+1. **`O(N)` 二维均匀空间网格 k-NN 加速** (`cpp/src/core/ai_optimizer.cpp`)
+   - 新增内部 `SpatialGrid2D` 空间哈希网格（自适应网格单元宽度，螺旋圈层邻域扩展搜索 k-NN），替代异常点检测 (`detect_survey_anomalies`) 与不确定性重采样推荐 (`analyze_uncertainty_and_recommend`) 中的 $O(N^2)$ 全量距离扫描。
+2. **标高-方量/费用敏感性曲线分析** (`cpp/src/core/ai_optimizer.hpp/.cpp`, `cpp/src/io/io.hpp/.cpp`)
+   - 新增 `SensitivityPoint` / `SensitivityCurveResult` 与 `run_elevation_sensitivity_curve(...)`，围绕平场平衡标高扫描多个候选设计标高，联合计算挖方量、填方量、总土方调配成本、最大/平均运距及平场经济最优标高。
+   - 新增 `export_sensitivity_csv(...)` 导出多标高方案敏感性表。
+3. **UI 与 AI 助手联动** (`cpp/src/core/ai_assistant.hpp/.cpp`, `cpp/src/ui/app.hpp/.cpp`)
+   - `AI智能` 标签页新增敏感性分析按钮与 ImGui DrawList 实时双曲线/成本折线图可视化；命令行支持 `SENSITIVITY` / `敏感性` 指令及导出。
+4. **测试验证** (`cpp/tests/test_core.cpp`, `cpp/tests/test_ui_headless.cpp`)
+   - 新增 Test 30 (`30_spatial_grid_5000pts_stress_and_sensitivity_curve`) 验证 5,041 点大规模场地加速与标高敏感性曲线单调性；无头 UI 测试新增 `SENSITIVITY` 命令校验。
+
+### 门禁验证结果
+- `python3 tools/eval_cpp_goal.py`：**100.00 / 100.00**（`tin_ms=1.85ms`, `haul_ms=0.04ms`, `grade_ms=41.78ms`, `uncertainty_ms=10.56ms`, `anomaly_recall=1.00`, `anomaly_precision=0.9091`, `survey_rec_ratio=208.55x`, `nl_intent_acc=1.00`）
+- Compiler warnings (project `src/` & `tests/`): **0**
+- CTest: **3/3 PASS**
+
+- **下一步持续迭代方向**：进入 `v3.8.0`（双级台阶斜坡平场联合优化 + 土方机械配置与工期造价估算）。

@@ -122,8 +122,12 @@ int main(int argc, char** argv) {
     app.execute_command("SIGNIF");
     app.execute_command("THIN");
     app.execute_command("DRAIN");
-    check_true(app.significance_report() != nullptr && app.thinning_result() != nullptr && app.drainage_report() != nullptr,
-               "significance, thinning, drainage reports populated");
+    app.execute_command("SENSITIVITY");
+    check_true(app.significance_report() != nullptr && app.thinning_result() != nullptr &&
+               app.drainage_report() != nullptr && app.sensitivity_result() != nullptr,
+               "significance, thinning, drainage, sensitivity reports populated");
+    app.set_inspector_tab(6);
+    check_true(render_one_frame(app) > 200, "AI tab with sensitivity curve renders");
     auto comps = tin::suggest_command_completions("AI");
     check_true(comps.size() >= 2, "Tab completion returns AI commands");
 
